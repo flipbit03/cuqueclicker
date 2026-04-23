@@ -1,0 +1,28 @@
+[package]
+name = "cuqueclicker"
+# Hardcoded at 0.0.0; release.yml patches this from the git tag at build time.
+# A 0.0.0 binary reports itself as "(dev)" in the HUD.
+version = "0.0.0"
+edition = "2024"
+description = "A TUI idle clicker where you finger an ASCII ass instead of clicking a cookie."
+repository = "https://github.com/flipbit03/cuqueclicker"
+readme = "README.md"
+license = "MIT"
+keywords = ["game", "tui", "ratatui", "idle", "clicker"]
+categories = ["games", "command-line-utilities"]
+authors = ["Cadu <cadu.coelho@gmail.com>"]
+
+[features]
+# Enabled by release.yml when building binaries for GitHub releases. Controls
+# how `cuqueclicker self update` re-installs itself: ON → re-run the install
+# script; OFF → `cargo install cuqueclicker --force`.
+binary-release = []
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+crossterm = "0.29.0"
+rand = "0.10.1"
+ratatui = "0.30.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"

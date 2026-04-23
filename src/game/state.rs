@@ -1,0 +1,613 @@
+use std::collections::{HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+
+use crate::game::achievement::ACHIEVEMENTS;
+use crate::game::fingerer::{self, FINGERERS};
+use crate::game::golden::GoldenCuque;
+use crate::game::upgrade::{UPGRADES, UpgradeEffect};
+
+pub const TICK_HZ: u32 = 20;
+pub const TICK_DT: f64 = 1.0 / TICK_HZ as f64;
+const CLENCH_TICKS: u32 = 3;
+const PARTICLE_LIFE: u32 = 20;
+const PARTICLE_RISE: f32 = 0.18;
+const GOLDEN_REWARD_SECONDS: f64 = 60.0;
+const GOLDEN_REWARD_FLAT: f64 = 10.0;
+
+#[derive(Clone)]
+pub struct Particle {
+    pub col: u16,
+    pub row: f32,
+    pub life: u32,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum Buff {
+    ClickFrenzy {
+        ticks_remaining: u32,
+        initial_ticks: u32,
+        mult: f64,
+    },
+    /// Fingerer mult buff — applied when a "Buff" golden variant is caught.
+    /// Targets a fingerer by stable id so the buff stays on the right tier
+    /// across catalog changes.
+    FingererBoost {
+        ticks_remaining: u32,
+        initial_ticks: u32,
+        fingerer_id: String,
+        mult: f64,
+    },
+}
+
+impl Buff {
+    pub fn ticks_remaining(&self) -> u32 {
+        match self {
+            Buff::ClickFrenzy {
+                ticks_remaining, ..
+            } => *ticks_remaining,
+            Buff::FingererBoost {
+                ticks_remaining, ..
+            } => *ticks_remaining,
+        }
+    }
+
+    /// Plateau-at-1.0 until the last `BUFF_FADE_TICKS` of the buff, then
+    /// smoothstep-decay to 0. Gives a "stays on, then swift but smooth fade"
+    /// feel rather than a constantly-shrinking linear ramp.
+    pub fn strength(&self) -> f32 {
+        const FADE_TICKS: f32 = 30.0; // ~1.5s at 20Hz
+        let remaining = self.ticks_remaining() as f32;
+        if remaining >= FADE_TICKS {
+            1.0
+        } else {
+            let t = (remaining / FADE_TICKS).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        }
+    }
+
+    fn tick(&mut self) {
+        match self {
+            Buff::ClickFrenzy {
+                ticks_remaining, ..
+            } => {
+                *ticks_remaining = ticks_remaining.saturating_sub(1);
+            }
+            Buff::FingererBoost {
+                ticks_remaining, ..
+            } => {
+                *ticks_remaining = ticks_remaining.saturating_sub(1);
+            }
+        }
+    }
+}
+
+/// Persistent game state. Catalog-addressed state (`fingerers_owned`,
+/// `upgrades_earned`, `achievements_earned`) is keyed by STABLE STRING IDS,
+/// not positional indices, so reordering / inserting / removing entries in
+/// `FINGERERS`, `UPGRADES`, or `ACHIEVEMENTS` never corrupts an old save.
+/// Unknown ids in a save are ignored (forward-compat); missing ids default
+/// to zero / absent (backward-compat).
+#[derive(Serialize, Deserialize)]
+pub struct GameState {
+    #[serde(default)]
+    pub cuques: f64,
+    #[serde(default)]
+    pub total_clicks: u64,
+    #[serde(default)]
+    pub lifetime_cuques: f64,
+    #[serde(default)]
+    pub best_fps: f64,
+    #[serde(default)]
+    pub golden_caught: u64,
+
+    /// Fingerer id → owned count.
+    #[serde(default)]
+    pub fingerers_owned: HashMap<String, u32>,
+    /// Set of earned achievement ids.
+    #[serde(default)]
+    pub achievements_earned: HashSet<String>,
+    /// Set of earned upgrade ids.
+    #[serde(default)]
+    pub upgrades_earned: HashSet<String>,
+
+    #[serde(default)]
+    pub prestige: u64,
+    #[serde(default)]
+    pub total_play_ticks: u64,
+    #[serde(default)]
+    pub buffs: Vec<Buff>,
+
+    #[serde(skip)]
+    pub clench_ticks: u32,
+    #[serde(skip)]
+    pub particles: Vec<Particle>,
+    #[serde(skip)]
+    pub golden: Option<GoldenCuque>,
+    #[serde(skip)]
+    pub golden_cooldown: u32,
+    #[serde(skip)]
+    pub session_ticks: u64,
+    /// Achievement ids that unlocked this session; drained by the UI after
+    /// it shows the "unlocked!" toast.
+    #[serde(skip)]
+    pub newly_unlocked: Vec<String>,
+    #[serde(skip)]
+    pub visual_debt: f64,
+    #[serde(skip)]
+    pub lucky_flash_ticks: u32,
+    #[serde(skip)]
+    pub border_phase: u32,
+    #[serde(skip)]
+    pub purchase_flash_ticks: u32,
+    /// One slot per visible sidebar row; indexed by catalog position because
+    /// it's purely a render-time flash and doesn't need to survive reorders.
+    #[serde(skip)]
+    pub fingerer_flash_ticks: Vec<u32>,
+}
+
+pub const LUCKY_FLASH_TICKS: u32 = 70; // 3.5s at 20Hz
+pub const PURCHASE_FLASH_TICKS: u32 = 20; // 1s at 20Hz
+
+impl Default for GameState {
+    fn default() -> Self {
+        Self {
+            cuques: 0.0,
+            total_clicks: 0,
+            lifetime_cuques: 0.0,
+            best_fps: 0.0,
+            golden_caught: 0,
+            fingerers_owned: HashMap::new(),
+            achievements_earned: HashSet::new(),
+            upgrades_earned: HashSet::new(),
+            prestige: 0,
+            total_play_ticks: 0,
+            buffs: Vec::new(),
+            clench_ticks: 0,
+            particles: Vec::new(),
+            golden: None,
+            golden_cooldown: crate::game::golden::next_cooldown(),
+            session_ticks: 0,
+            newly_unlocked: Vec::new(),
+            visual_debt: 0.0,
+            lucky_flash_ticks: 0,
+            border_phase: 0,
+            purchase_flash_ticks: 0,
+            fingerer_flash_ticks: vec![0; fingerer::count()],
+        }
+    }
+}
+
+impl GameState {
+    /// Initialize ephemeral runtime state that `#[serde(skip)]` left empty
+    /// after deserialization, and normalize any fields that need live values
+    /// rather than the serde default. Hook point for future shape
+    /// transforms — see CLAUDE.md on the stable-id save policy.
+    pub fn migrate(mut self) -> Self {
+        if self.fingerer_flash_ticks.len() != fingerer::count() {
+            self.fingerer_flash_ticks = vec![0; fingerer::count()];
+        }
+        if self.golden_cooldown == 0 {
+            self.golden_cooldown = crate::game::golden::next_cooldown();
+        }
+        self
+    }
+
+    // -- Catalog lookups (stable-id keyed) ---------------------------------
+
+    pub fn fingerer_count(&self, id: &str) -> u32 {
+        self.fingerers_owned.get(id).copied().unwrap_or(0)
+    }
+
+    pub fn fingerer_count_idx(&self, idx: usize) -> u32 {
+        FINGERERS
+            .get(idx)
+            .map(|f| self.fingerer_count(f.id))
+            .unwrap_or(0)
+    }
+
+    pub fn fingerers_owned_total(&self) -> u32 {
+        self.fingerers_owned.values().sum()
+    }
+
+    pub fn has_upgrade(&self, id: &str) -> bool {
+        self.upgrades_earned.contains(id)
+    }
+
+    pub fn has_achievement(&self, id: &str) -> bool {
+        self.achievements_earned.contains(id)
+    }
+
+    pub fn has_achievement_idx(&self, idx: usize) -> bool {
+        ACHIEVEMENTS
+            .get(idx)
+            .is_some_and(|a| self.has_achievement(a.id))
+    }
+
+    // -- Click / tick -------------------------------------------------------
+
+    pub fn click(&mut self, origin: (u16, u16)) {
+        let power = self.click_power();
+        self.add_cuques(power);
+        self.total_clicks += 1;
+        self.clench_ticks = CLENCH_TICKS;
+        let jitter = (self.total_clicks as i32 % 9) - 4;
+        let col = (origin.0 as i32 + jitter).max(0) as u16;
+        let row = (origin.1 as f32) - 1.0;
+        self.particles.push(Particle {
+            col,
+            row,
+            life: PARTICLE_LIFE,
+            text: format!("+{}", crate::format::big(power)),
+        });
+    }
+
+    pub fn click_power(&self) -> f64 {
+        let mut m = 1.0;
+        for u in UPGRADES.iter() {
+            if self.has_upgrade(u.id)
+                && let UpgradeEffect::ClickMult(f) = u.effect
+            {
+                m *= f;
+            }
+        }
+        for b in &self.buffs {
+            if let Buff::ClickFrenzy { mult, .. } = b {
+                m *= *mult;
+            }
+        }
+        m
+    }
+
+    pub fn fingerer_mult(&self, idx: usize) -> f64 {
+        let Some(target) = FINGERERS.get(idx) else {
+            return 1.0;
+        };
+        let mut m = 1.0;
+        for u in UPGRADES.iter() {
+            if !self.has_upgrade(u.id) {
+                continue;
+            }
+            match u.effect {
+                UpgradeEffect::FingererMult(id, f) if id == target.id => m *= f,
+                UpgradeEffect::AllFingerersMult(f) => m *= f,
+                _ => {}
+            }
+        }
+        for b in &self.buffs {
+            if let Buff::FingererBoost {
+                fingerer_id, mult, ..
+            } = b
+                && fingerer_id == target.id
+            {
+                m *= *mult;
+            }
+        }
+        m
+    }
+
+    fn add_cuques(&mut self, amount: f64) {
+        self.cuques += amount;
+        self.lifetime_cuques += amount;
+    }
+
+    /// Dev-build cheat. Bypasses normal flow; not reachable in release builds
+    /// because the F-key that triggers it is gated behind `App::debug`.
+    pub fn dev_add_cuques(&mut self, amount: f64) {
+        self.add_cuques(amount);
+    }
+
+    /// Catch whatever Golden Cuque is currently on screen (any variant:
+    /// Lucky, Frenzy, or Buff). Applies the variant-specific effect,
+    /// increments `golden_caught`, re-rolls the next spawn cooldown, and
+    /// returns the flat reward (0.0 for buff variants).
+    pub fn catch_golden(&mut self) -> f64 {
+        use crate::game::golden::GoldenVariant;
+        let Some(golden) = self.golden.take() else {
+            return 0.0;
+        };
+        self.golden_caught += 1;
+        self.golden_cooldown = crate::game::golden::next_cooldown();
+        let (reward, label) = match golden.variant {
+            GoldenVariant::Lucky => {
+                let fps = self.fps();
+                let r = (fps * GOLDEN_REWARD_SECONDS).max(GOLDEN_REWARD_FLAT);
+                self.add_cuques(r);
+                self.lucky_flash_ticks = LUCKY_FLASH_TICKS;
+                (r, format!("+{}", crate::format::big(r)))
+            }
+            GoldenVariant::Frenzy => {
+                let dur = TICK_HZ * 13;
+                self.buffs.push(Buff::ClickFrenzy {
+                    ticks_remaining: dur,
+                    initial_ticks: dur,
+                    mult: 777.0,
+                });
+                (0.0, "FRENZY x777!".into())
+            }
+            GoldenVariant::Buff => {
+                let active_ids: Vec<&'static str> = FINGERERS
+                    .iter()
+                    .filter(|f| self.fingerer_count(f.id) > 0)
+                    .map(|f| f.id)
+                    .collect();
+                let pick = if active_ids.is_empty() {
+                    FINGERERS[0].id
+                } else {
+                    use rand::RngExt;
+                    active_ids[rand::rng().random_range(0..active_ids.len())]
+                };
+                let dur = TICK_HZ * 60;
+                self.buffs.push(Buff::FingererBoost {
+                    ticks_remaining: dur,
+                    initial_ticks: dur,
+                    fingerer_id: pick.to_string(),
+                    mult: 7.0,
+                });
+                (0.0, "BOOSTED x7!".into())
+            }
+        };
+        self.particles.push(Particle {
+            col: golden.col,
+            row: golden.row as f32,
+            life: PARTICLE_LIFE * 2,
+            text: label,
+        });
+        reward
+    }
+
+    pub fn fps(&self) -> f64 {
+        let base: f64 = FINGERERS
+            .iter()
+            .enumerate()
+            .map(|(i, k)| k.fps_per_unit * self.fingerer_count(k.id) as f64 * self.fingerer_mult(i))
+            .sum();
+        base * self.prestige_mult()
+    }
+
+    pub fn border_speed(&self) -> u32 {
+        let mut s: u32 = 1;
+        for b in &self.buffs {
+            match b {
+                Buff::ClickFrenzy { .. } => s = s.max(3),
+                Buff::FingererBoost { .. } => s = s.max(2),
+            }
+        }
+        if self.lucky_flash_ticks > 0 {
+            s = s.max(4);
+        }
+        if self.purchase_flash_ticks > 0 {
+            s += 2;
+        }
+        s
+    }
+
+    pub fn trigger_purchase_flash(&mut self) {
+        self.purchase_flash_ticks = PURCHASE_FLASH_TICKS;
+    }
+
+    pub fn prestige_mult(&self) -> f64 {
+        1.0 + 0.01 * self.prestige as f64
+    }
+
+    pub fn prestige_earned_total(&self) -> u64 {
+        (self.lifetime_cuques / 1_000_000.0).sqrt().floor() as u64
+    }
+
+    pub fn prestige_available(&self) -> u64 {
+        self.prestige_earned_total().saturating_sub(self.prestige)
+    }
+
+    pub fn prestige_reset(&mut self) -> bool {
+        let available = self.prestige_available();
+        if available == 0 {
+            return false;
+        }
+        self.prestige = self.prestige_earned_total();
+        self.cuques = 0.0;
+        self.fingerers_owned.clear();
+        self.upgrades_earned.clear();
+        self.buffs.clear();
+        self.visual_debt = 0.0;
+        self.particles.clear();
+        self.golden = None;
+        self.clench_ticks = 0;
+        self.golden_cooldown = crate::game::golden::next_cooldown();
+        true
+    }
+
+    pub fn tick(&mut self) {
+        for b in self.buffs.iter_mut() {
+            b.tick();
+        }
+        self.buffs.retain(|b| b.ticks_remaining() > 0);
+
+        self.lucky_flash_ticks = self.lucky_flash_ticks.saturating_sub(1);
+        self.purchase_flash_ticks = self.purchase_flash_ticks.saturating_sub(1);
+        for t in self.fingerer_flash_ticks.iter_mut() {
+            *t = t.saturating_sub(1);
+        }
+        let speed = self.border_speed();
+        self.border_phase = self.border_phase.wrapping_add(speed);
+
+        let fps = self.fps();
+        if fps > self.best_fps {
+            self.best_fps = fps;
+        }
+        let gained = fps * TICK_DT;
+        self.add_cuques(gained);
+        self.visual_debt += gained;
+        self.clench_ticks = self.clench_ticks.saturating_sub(1);
+        for p in self.particles.iter_mut() {
+            p.life = p.life.saturating_sub(1);
+            p.row -= PARTICLE_RISE;
+        }
+        self.particles.retain(|p| p.life > 0);
+        self.session_ticks += 1;
+        self.total_play_ticks += 1;
+        self.tick_achievements();
+    }
+
+    pub fn tick_achievements(&mut self) {
+        for a in ACHIEVEMENTS.iter() {
+            if !self.has_achievement(a.id) && (a.unlocked)(self) {
+                self.achievements_earned.insert(a.id.to_string());
+                self.newly_unlocked.push(a.id.to_string());
+            }
+        }
+    }
+
+    pub fn tick_golden(&mut self) {
+        if let Some(g) = self.golden.as_mut() {
+            if g.life_ticks == 0 {
+                self.golden = None;
+                self.golden_cooldown = crate::game::golden::next_cooldown();
+            } else {
+                g.life_ticks -= 1;
+            }
+        } else if self.golden_cooldown > 0 {
+            self.golden_cooldown -= 1;
+        }
+    }
+
+    pub fn trigger_clench(&mut self) {
+        self.clench_ticks = CLENCH_TICKS;
+    }
+
+    pub fn spawn_auto_particle(&mut self, col: u16, row: u16) {
+        let amount = (self.visual_debt.floor() as u64).max(1);
+        self.visual_debt = (self.visual_debt - amount as f64).max(0.0);
+        self.particles.push(Particle {
+            col,
+            row: row as f32,
+            life: PARTICLE_LIFE,
+            text: format!("+{}", crate::format::big(amount as f64)),
+        });
+    }
+
+    pub fn cost(&self, idx: usize) -> f64 {
+        let k = &FINGERERS[idx];
+        k.base_cost * k.cost_scale.powi(self.fingerer_count_idx(idx) as i32)
+    }
+
+    pub fn can_buy(&self, idx: usize) -> bool {
+        self.cuques >= self.cost(idx)
+    }
+
+    pub fn buy(&mut self, idx: usize) -> bool {
+        let c = self.cost(idx);
+        if self.cuques >= c
+            && let Some(f) = FINGERERS.get(idx)
+        {
+            self.cuques -= c;
+            *self.fingerers_owned.entry(f.id.to_string()).or_insert(0) += 1;
+            self.trigger_purchase_flash();
+            if let Some(slot) = self.fingerer_flash_ticks.get_mut(idx) {
+                *slot = PURCHASE_FLASH_TICKS;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn buy_n(&mut self, idx: usize, n: u32) -> u32 {
+        let mut bought = 0;
+        for _ in 0..n {
+            if !self.buy(idx) {
+                break;
+            }
+            bought += 1;
+        }
+        bought
+    }
+
+    pub fn buy_max(&mut self, idx: usize) -> u32 {
+        let mut bought = 0;
+        while self.buy(idx) {
+            bought += 1;
+        }
+        bought
+    }
+
+    pub fn buy_upgrade(&mut self, idx: usize) -> bool {
+        let Some(u) = UPGRADES.get(idx) else {
+            return false;
+        };
+        if self.has_upgrade(u.id) {
+            return false;
+        }
+        if !u.req.met(self) || self.cuques < u.cost {
+            return false;
+        }
+        self.cuques -= u.cost;
+        self.upgrades_earned.insert(u.id.to_string());
+        self.trigger_purchase_flash();
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_is_idempotent_on_current_shape() {
+        let state = GameState {
+            fingerers_owned: [("index_finger".to_string(), 9)].into_iter().collect(),
+            upgrades_earned: ["click_mult_1".to_string()].into_iter().collect(),
+            achievements_earned: ["first_finger".to_string()].into_iter().collect(),
+            ..GameState::default()
+        };
+
+        let m = state.migrate();
+
+        assert_eq!(m.fingerer_count("index_finger"), 9);
+        assert!(m.has_upgrade("click_mult_1"));
+        assert!(m.has_achievement("first_finger"));
+    }
+
+    #[test]
+    fn unknown_ids_in_save_are_ignored_not_resurrected() {
+        // Forward-compat: a future version adds `"giga_finger"` to the
+        // catalog, player plays, saves. User downgrades to current version.
+        // That unknown id must not crash — it just reads as 0.
+        let state = GameState {
+            fingerers_owned: [("giga_finger_from_the_future".to_string(), 42)]
+                .into_iter()
+                .collect(),
+            ..GameState::default()
+        };
+
+        let m = state.migrate();
+
+        assert_eq!(m.fingerer_count("giga_finger_from_the_future"), 42);
+        assert_eq!(m.fingerer_count("index_finger"), 0);
+        assert!(!m.has_upgrade("click_mult_1"));
+    }
+
+    #[test]
+    fn save_roundtrip_is_stable_through_json() {
+        // Serialize → deserialize → get the same state back. Catches any
+        // accidental rename that would make saves non-idempotent.
+        let state = GameState {
+            cuques: 1234.5,
+            total_clicks: 99,
+            fingerers_owned: [("index_finger".to_string(), 7)].into_iter().collect(),
+            upgrades_earned: ["click_mult_1".to_string()].into_iter().collect(),
+            achievements_earned: ["first_finger".to_string()].into_iter().collect(),
+            ..GameState::default()
+        };
+
+        let json = serde_json::to_string(&state).expect("serialize");
+        let roundtripped: GameState = serde_json::from_str(&json).expect("deserialize");
+        let m = roundtripped.migrate();
+
+        assert_eq!(m.cuques, 1234.5);
+        assert_eq!(m.total_clicks, 99);
+        assert_eq!(m.fingerer_count("index_finger"), 7);
+        assert!(m.has_upgrade("click_mult_1"));
+        assert!(m.has_achievement("first_finger"));
+    }
+}

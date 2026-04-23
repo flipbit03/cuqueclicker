@@ -1,0 +1,142 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Patch version in Cargo.toml
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          sed -i "s/^version = \"0.0.0\"/version = \"${VERSION}\"/" Cargo.toml
+          cargo update
+
+      - name: Publish cuqueclicker
+        run: cargo publish --no-verify --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin: cuqueclicker
+            asset: cuqueclicker_linux_x86_64
+          - name: Linux aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            bin: cuqueclicker
+            asset: cuqueclicker_linux_aarch64
+          - name: macOS aarch64
+            runner: macos-latest
+            target: aarch64-apple-darwin
+            bin: cuqueclicker
+            asset: cuqueclicker_macos_aarch64
+          - name: Windows x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: cuqueclicker.exe
+            asset: cuqueclicker_windows_x86_64.exe
+            # Static-link the MSVC runtime so the .exe runs on any Windows
+            # install without the VC++ Redistributable.
+            rustflags: -C target-feature=+crt-static
+    # All build-related shell steps use bash so sed/cp/grep work uniformly
+    # (bash + coreutils + sed are available on windows-latest via Git Bash).
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools (Linux only)
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: release-${{ matrix.target }}-cargo-
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Patch version in Cargo.toml
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          sed -i'' -e "s/^version = \"0.0.0\"/version = \"${VERSION}\"/" Cargo.toml
+
+      - name: Build binary
+        run: cargo build --release --target ${{ matrix.target }} --features binary-release
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Rename binary
+        run: cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    name: Upload release binaries
+    needs: [publish, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Upload binaries to release
+        run: gh release upload "${{ github.event.release.tag_name }}" artifacts/cuqueclicker_*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,99 @@
+use ratatui::prelude::*;
+
+use crate::game::fingerer::FINGERERS;
+use crate::game::state::GameState;
+
+const PER_TYPE_CAP: usize = 40;
+const PER_RING: usize = 48;
+
+pub fn draw(frame: &mut Frame, play_area: Rect, biscuit: Rect, state: &GameState) {
+    if play_area.width == 0 || play_area.height == 0 {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    let cx = biscuit.x as f32 + biscuit.width as f32 / 2.0;
+    let cy = biscuit.y as f32 + biscuit.height as f32 / 2.0;
+
+    let base_rx = (biscuit.width as f32 / 2.0 + 3.0).max(6.0);
+    let base_ry = (biscuit.height as f32 / 2.0 + 2.0).max(3.0);
+
+    let mut glyphs: Vec<(usize, &str)> = Vec::new();
+    for (idx, f) in FINGERERS.iter().enumerate() {
+        let n = (state.fingerer_count(f.id) as usize).min(PER_TYPE_CAP);
+        for _ in 0..n {
+            glyphs.push((idx, f.icon));
+        }
+    }
+    if glyphs.is_empty() {
+        return;
+    }
+
+    let tick_phase = state.session_ticks / 5;
+    let total = glyphs.len();
+
+    for (i, (type_idx, icon)) in glyphs.iter().enumerate() {
+        let ring = i / PER_RING;
+        let slot = i % PER_RING;
+        let slot_count = ((total - ring * PER_RING).min(PER_RING)) as f32;
+        let angle = (slot as f32 / slot_count) * std::f32::consts::TAU
+            + (ring as f32 * 0.15)
+            + (*type_idx as f32 * 0.07);
+        let poke = if ((i * 7) as u64 + tick_phase).is_multiple_of(23) {
+            1.2
+        } else {
+            0.0
+        };
+        let rx = base_rx + ring as f32 * 4.0 - poke;
+        let ry = base_ry + ring as f32 * 2.0 - poke * 0.5;
+        let px = cx + rx * angle.cos();
+        let py = cy + ry * angle.sin();
+        let col = px.round() as i32;
+        let row = py.round() as i32;
+
+        let icon_w = icon.chars().count() as i32;
+        if col < play_area.x as i32
+            || col + icon_w > (play_area.x + play_area.width) as i32
+            || row < play_area.y as i32
+            || row >= (play_area.y + play_area.height) as i32
+        {
+            continue;
+        }
+        let bx = biscuit.x as i32;
+        let br = bx + biscuit.width as i32;
+        let by = biscuit.y as i32;
+        let bb = by + biscuit.height as i32;
+        if row >= by && row < bb && col < br && col + icon_w > bx {
+            continue;
+        }
+        let color = hand_color(*type_idx, poke > 0.0);
+        buf.set_string(col as u16, row as u16, *icon, Style::default().fg(color));
+    }
+}
+
+fn hand_color(type_idx: usize, poking: bool) -> Color {
+    let palette = [
+        Color::Rgb(220, 170, 130), // Dedo: warm tan
+        Color::Rgb(230, 180, 160), // Mao: pinker
+        Color::Rgb(200, 230, 220), // Luva: mint
+        Color::Rgb(255, 130, 170), // Beijo Grego: rose pink
+        Color::Rgb(180, 200, 230), // Robotico: steel blue
+        Color::Rgb(200, 160, 220), // Tentaculo: purple
+        Color::Rgb(255, 200, 120), // Vortice: amber
+        Color::Rgb(140, 180, 255), // Buraco: cold blue
+        Color::Rgb(255, 180, 255), // Cosmic: magenta
+        Color::Rgb(255, 230, 150), // Deus: divine gold
+    ];
+    let c = palette[type_idx.min(palette.len() - 1)];
+    if poking { brighten(c) } else { c }
+}
+
+fn brighten(c: Color) -> Color {
+    match c {
+        Color::Rgb(r, g, b) => Color::Rgb(
+            (r as u16 + 40).min(255) as u8,
+            (g as u16 + 40).min(255) as u8,
+            (b as u16 + 40).min(255) as u8,
+        ),
+        other => other,
+    }
+}
