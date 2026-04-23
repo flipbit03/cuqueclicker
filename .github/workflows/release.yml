@@ -15,7 +15,7 @@ jobs:
     name: Publish to crates.io
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.release.tag_name }}
 
@@ -75,7 +75,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.release.tag_name }}
 
@@ -89,7 +89,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -118,7 +118,7 @@ jobs:
         run: cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.asset }}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
@@ -128,10 +128,10 @@ jobs:
     needs: [publish, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
