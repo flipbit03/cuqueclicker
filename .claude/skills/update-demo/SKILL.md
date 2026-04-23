@@ -54,11 +54,12 @@ GitHub's README renderer embeds MP4s as playable videos only via `user-attachmen
 3. Render to GIF with a **pitch-black custom theme**:
    ```sh
    agg --fps-cap 30 --font-size 20 \
-     --theme "ffffff,000000,000000,dd3c69,4ebf22,ddaf3c,26b0d7,b954e1,54e1b9,d9d9d9,4d4d4d,dd3c69,4ebf22,ddaf3c,26b0d7,b954e1,54e1b9,ffffff" \
+     --theme "000000,ffffff,000000,dd3c69,4ebf22,ddaf3c,26b0d7,b954e1,54e1b9,d9d9d9,4d4d4d,dd3c69,4ebf22,ddaf3c,26b0d7,b954e1,54e1b9,ffffff" \
      /tmp/cuqueclicker_demo.cast /tmp/demo.gif
    ```
-   - `--theme custom` (the literal word) is rejected by agg. Pass an 18-color comma-separated palette instead: `fg,bg,<8 normal>,<8 bright>` — that's what agg treats as "custom".
-   - `bg = 000000` → pure pitch black (the prior `github-dark` preset was `#0d1117`, visibly grey).
+   - `--theme custom` (the literal word) is rejected by agg. Pass an 18-color comma-separated palette instead: `bg,fg,<8 normal>,<8 bright>` — that's what agg treats as "custom".
+   - **Order is `bg` FIRST, then `fg`** — not `fg,bg`. Flipping it silently gives you an inverted terminal (white bg, black text) and the video is wrong. First slot `000000` = pitch black background; second slot `ffffff` = white text.
+   - Always verify afterwards: `ffmpeg -ss 10 -i docs/demo.mp4 -frames:v 1 /tmp/check.png` then `open /tmp/check.png` (or `Read` the image). Eyeball it before committing.
    - `--font-size 20` keeps the text readable at README width.
 
 4. Convert GIF → MP4 (h264, faststart for browser streaming):
