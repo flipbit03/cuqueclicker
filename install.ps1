@@ -36,12 +36,38 @@ $Url = "https://github.com/$Repo/releases/download/$Tag/$Asset"
 Write-Host "Downloading $Asset..."
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 $BinaryPath = Join-Path $InstallDir 'cuqueclicker.exe'
+$TempPath = "$BinaryPath.new"
+$OldPath = "$BinaryPath.old"
+
+# Clean up any .old left behind by a previous update (may still be locked if
+# its process is somehow alive; silent failure is fine — we'll try again next run).
+if (Test-Path $OldPath) {
+    Remove-Item $OldPath -Force -ErrorAction SilentlyContinue
+}
+
 try {
-    Invoke-WebRequest -Uri $Url -OutFile $BinaryPath -UseBasicParsing
+    Invoke-WebRequest -Uri $Url -OutFile $TempPath -UseBasicParsing
 } catch {
     Write-Host "Failed to download: $_" -ForegroundColor Red
     exit 1
 }
+
+# Windows locks running .exe files against overwrite — but it *does* allow
+# renaming them. So when the target already exists (a previous install, and
+# possibly the exact process that invoked `cuqueclicker self update`), move
+# it aside first, then put the new binary in its place. The still-running
+# old process keeps executing from the renamed `.old` path.
+if (Test-Path $BinaryPath) {
+    try {
+        Move-Item -Path $BinaryPath -Destination $OldPath -Force
+    } catch {
+        Write-Host "Failed to move aside the existing binary: $_" -ForegroundColor Red
+        Write-Host "If another CuqueClicker process is running, quit it and retry." -ForegroundColor Yellow
+        Remove-Item $TempPath -Force -ErrorAction SilentlyContinue
+        exit 1
+    }
+}
+Move-Item -Path $TempPath -Destination $BinaryPath -Force
 
 Write-Host ""
 Write-Host "Installed cuqueclicker $Tag to $BinaryPath" -ForegroundColor Green
