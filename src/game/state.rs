@@ -475,9 +475,19 @@ impl GameState {
         self.clench_ticks = CLENCH_TICKS;
     }
 
+    /// Spawn a "+N" particle representing cuques earned since the last
+    /// auto-particle. Silently skips if there isn't a whole cuque of accrued
+    /// income to show — at low FPS the caller is a rate-based timer that
+    /// fires faster than cuques arrive, and spawning a "+1" in that window
+    /// used to lie (particle flying up while the HUD counter didn't move).
+    /// The shown amount is always real cuques that just accrued into
+    /// `visual_debt`.
     pub fn spawn_auto_particle(&mut self, col: u16, row: u16) {
-        let amount = (self.visual_debt.floor() as u64).max(1);
-        self.visual_debt = (self.visual_debt - amount as f64).max(0.0);
+        let amount = self.visual_debt.floor() as u64;
+        if amount == 0 {
+            return;
+        }
+        self.visual_debt -= amount as f64;
         self.particles.push(Particle {
             col,
             row: row as f32,
