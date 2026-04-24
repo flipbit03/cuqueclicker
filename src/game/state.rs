@@ -89,7 +89,7 @@ impl Buff {
 /// `FINGERERS`, `UPGRADES`, or `ACHIEVEMENTS` never corrupts an old save.
 /// Unknown ids in a save are ignored (forward-compat); missing ids default
 /// to zero / absent (backward-compat).
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct GameState {
     #[serde(default)]
     pub cuques: f64,
