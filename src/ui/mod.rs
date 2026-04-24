@@ -22,7 +22,13 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn hud_title() -> String {
     if VERSION == "0.0.0" {
-        " CuqueClicker v0.0.0 (dev) ".into()
+        // Dev builds include the git branch (or short SHA on detached HEAD)
+        // so two instances built from different branches can be told apart
+        // at a glance — useful for side-by-side comparison.
+        match crate::build_info::GIT_BRANCH {
+            Some(branch) => format!(" CuqueClicker v0.0.0 (dev, {branch}) "),
+            None => " CuqueClicker v0.0.0 (dev) ".into(),
+        }
     } else {
         format!(" CuqueClicker v{VERSION} ")
     }
