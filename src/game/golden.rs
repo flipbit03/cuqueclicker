@@ -1,4 +1,5 @@
 use rand::RngExt;
+use ratatui::layout::Rect;
 
 /// A Golden Cuque variant. The on-screen marker color + label differ per
 /// variant, but all are caught through the same path (mouse click on the
@@ -27,10 +28,14 @@ impl GoldenVariant {
     }
 }
 
+/// Position is stored as a fraction of the biscuit rect ([0.0, 1.0] on each
+/// axis) so the marker stays anchored to its spot on the biscuit when the
+/// terminal resizes or the user zooms (`+`/`-`). The renderer resolves these
+/// fractions against the *current* biscuit rect every frame.
 #[derive(Clone)]
 pub struct GoldenCuque {
-    pub col: u16,
-    pub row: u16,
+    pub frac_x: f32,
+    pub frac_y: f32,
     pub life_ticks: u32,
     pub variant: GoldenVariant,
 }
@@ -38,18 +43,25 @@ pub struct GoldenCuque {
 pub const GOLDEN_LIFE_TICKS: u32 = 220; // ~11s at 20Hz
 pub const GOLDEN_COOLDOWN_MIN: u32 = 400; // 20s
 pub const GOLDEN_COOLDOWN_MAX: u32 = 1600; // 80s
+// Inset (in fractional units) the spawn lottery away from the biscuit edges
+// so the 5x3 marker has room to render without bumping into the border.
+const SPAWN_INSET_X: f32 = 0.08;
+const SPAWN_INSET_Y: f32 = 0.10;
 
 pub fn next_cooldown() -> u32 {
     rand::rng().random_range(GOLDEN_COOLDOWN_MIN..=GOLDEN_COOLDOWN_MAX)
 }
 
-pub fn spawn_in(area_col_range: (u16, u16), area_row_range: (u16, u16)) -> GoldenCuque {
+/// Pick a random fractional position inside the biscuit, away from the edges.
+/// `_biscuit` is taken so the signature documents intent (the spawn area is
+/// "inside this rect"); the actual fractions are rect-independent.
+pub fn spawn_in(_biscuit: Rect) -> GoldenCuque {
     let mut r = rand::rng();
-    let col = r.random_range(area_col_range.0..=area_col_range.1.max(area_col_range.0));
-    let row = r.random_range(area_row_range.0..=area_row_range.1.max(area_row_range.0));
+    let frac_x = r.random_range(SPAWN_INSET_X..=(1.0 - SPAWN_INSET_X));
+    let frac_y = r.random_range(SPAWN_INSET_Y..=(1.0 - SPAWN_INSET_Y));
     GoldenCuque {
-        col,
-        row,
+        frac_x,
+        frac_y,
         life_ticks: GOLDEN_LIFE_TICKS,
         variant: GoldenVariant::random(),
     }

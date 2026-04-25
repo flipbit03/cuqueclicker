@@ -46,8 +46,14 @@ pub enum Mode {
 pub struct DrawOutput {
     pub biscuit_rect: Rect,
     pub golden_rect: Rect,
-    pub visible_upgrades: Vec<usize>,
-    pub visible_fingerers: Vec<usize>,
+    /// `(upgrade_idx, screen_row_rect)` pairs for the Upgrades panel —
+    /// populated only when the active mode renders that panel; empty
+    /// otherwise. The click router hit-tests these for `BuyUpgrade`.
+    /// First element of each tuple is also the digit-shortcut target,
+    /// kept aligned with `visible_upgrades`.
+    pub upgrade_rows: Vec<(usize, Rect)>,
+    /// `(fingerer_idx, screen_row_rect)` for the Game-mode sidebar.
+    pub fingerer_rows: Vec<(usize, Rect)>,
 }
 
 fn wrapped_height(text: &str, width: u16) -> u16 {
@@ -177,7 +183,7 @@ pub fn draw(
 
     let biscuit_rect = biscuit::draw(frame, left[1], state.clench_ticks > 0, zoom_idx);
     hands::draw(frame, left[1], biscuit_rect, state);
-    effects::draw_particles(frame, left[1], &state.particles);
+    effects::draw_particles(frame, biscuit_rect, &state.particles);
     draw_zoom_indicator(
         frame,
         left[1],
@@ -188,7 +194,7 @@ pub fn draw(
         debug_pane::draw(frame, left[1]);
     }
     let golden_rect = match &state.golden {
-        Some(g) => biscuit::draw_golden(frame, g),
+        Some(g) => biscuit::draw_golden(frame, g, biscuit_rect),
         None => Rect::default(),
     };
 
@@ -197,20 +203,20 @@ pub fn draw(
         .wrap(Wrap { trim: false });
     frame.render_widget(help, left[2]);
 
-    let mut visible_upgrades = Vec::new();
-    let mut visible_fingerers = Vec::new();
+    let mut upgrade_rows: Vec<(usize, Rect)> = Vec::new();
+    let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
     match mode {
-        Mode::Game => visible_fingerers = sidebar::draw(frame, cols[1], state),
+        Mode::Game => fingerer_rows = sidebar::draw(frame, cols[1], state),
         Mode::Stats => stats::draw(frame, cols[1], state),
         Mode::Achievements => achievements::draw(frame, cols[1], state),
-        Mode::Upgrades => visible_upgrades = upgrades::draw(frame, cols[1], state),
+        Mode::Upgrades => upgrade_rows = upgrades::draw(frame, cols[1], state),
         Mode::Prestige => prestige::draw(frame, cols[1], state),
     }
 
     DrawOutput {
         biscuit_rect,
         golden_rect,
-        visible_upgrades,
-        visible_fingerers,
+        upgrade_rows,
+        fingerer_rows,
     }
 }

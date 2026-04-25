@@ -183,9 +183,9 @@ pub const EN: Lang = Lang {
     prestige_bonus_label: "FPS bonus",
     prestige_available_label: "Available to claim",
     prestige_lifetime_needed: "Next papel at",
-    prestige_confirm_hint: "Press [Enter] or [r] to reset and claim",
+    prestige_confirm_hint: "Press [r] to reset and claim",
     prestige_not_enough: "Earn more lifetime cuques to claim.\nFormula: sqrt(lifetime / 1,000,000)",
-    help_prestige: "[p/Esc] back  [Enter/r] reset & claim  [q] quit",
+    help_prestige: "[p/Esc] back  [r] reset & claim  [q] quit",
 };
 
 pub const PT_BR: Lang = Lang {
@@ -328,9 +328,9 @@ pub const PT_BR: Lang = Lang {
     prestige_bonus_label: "Bônus de FPS",
     prestige_available_label: "Disponível para resgatar",
     prestige_lifetime_needed: "Próximo papel em",
-    prestige_confirm_hint: "Pressione [Enter] ou [r] para resetar e resgatar",
+    prestige_confirm_hint: "Pressione [r] para resetar e resgatar",
     prestige_not_enough: "Acumule mais cuques totais para resgatar.\nFórmula: raiz(total / 1.000.000)",
-    help_prestige: "[p/Esc] voltar  [Enter/r] resetar & resgatar  [q] sair",
+    help_prestige: "[p/Esc] voltar  [r] resetar & resgatar  [q] sair",
 };
 
 static LANG: OnceLock<&'static Lang> = OnceLock::new();

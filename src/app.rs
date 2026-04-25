@@ -46,7 +46,9 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::game::achievement::ACHIEVEMENTS;
 use crate::game::fingerer;
+use crate::game::fingerer::FINGERERS;
 use crate::game::golden::{self, GoldenVariant};
 use crate::game::state::{GameState, TICK_DT, TICK_HZ};
 use crate::game::upgrade::UPGRADES;
@@ -163,8 +165,8 @@ impl App {
         let mut mode = Mode::Game;
         let mut zoom_idx: usize = 0;
         let mut running = true;
-        let mut visible_upgrades: Vec<usize> = Vec::new();
-        let mut visible_fingerers: Vec<usize> = Vec::new();
+        let mut upgrade_rows: Vec<(usize, Rect)> = Vec::new();
+        let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
         let mut biscuit_rect = Rect::default();
         let mut golden_rect = Rect::default();
 
@@ -183,8 +185,8 @@ impl App {
                 let out = ui::draw(f, &current, mode, zoom_idx, debug);
                 biscuit_rect = out.biscuit_rect;
                 golden_rect = out.golden_rect;
-                visible_upgrades = out.visible_upgrades;
-                visible_fingerers = out.visible_fingerers;
+                upgrade_rows = out.upgrade_rows;
+                fingerer_rows = out.fingerer_rows;
             })?;
 
             // Hand fresh geometry to the sim. Ordering is preserved by mpsc,
@@ -202,8 +204,8 @@ impl App {
                         &mut mode,
                         &mut zoom_idx,
                         &mut running,
-                        &visible_fingerers,
-                        &visible_upgrades,
+                        &fingerer_rows,
+                        &upgrade_rows,
                         debug,
                         &current,
                         biscuit_rect,
@@ -305,13 +307,13 @@ fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometry) {
                 && row >= r.y
                 && row < r.y + r.height
             {
-                state.click((col, row));
+                state.click((col, row), r);
             }
         }
         Action::ClickCenter => {
             let r = geom.biscuit;
             if r.width > 0 && r.height > 0 {
-                state.click((r.x + r.width / 2, r.y + r.height / 2));
+                state.click((r.x + r.width / 2, r.y + r.height / 2), r);
             }
         }
         Action::CatchGolden => {
@@ -399,11 +401,11 @@ fn maybe_spawn_auto_particle(state: &mut GameState, geom: &SimGeometry) {
     if rng.random::<f64>() >= prob {
         return;
     }
-    let col =
-        rng.random_range(geom.biscuit.x + 1..geom.biscuit.x + geom.biscuit.width.saturating_sub(2));
-    let row = rng
-        .random_range(geom.biscuit.y + 1..geom.biscuit.y + geom.biscuit.height.saturating_sub(1));
-    state.spawn_auto_particle(col, row);
+    // Random anchor within the biscuit, with a small inset so the "+N" text
+    // doesn't clip into the border.
+    let frac_x = rng.random_range(0.05_f32..=0.95);
+    let frac_y = rng.random_range(0.10_f32..=0.95);
+    state.spawn_auto_particle(frac_x, frac_y);
 }
 
 fn maybe_spawn_golden(state: &mut GameState, geom: &SimGeometry) {
@@ -413,30 +415,14 @@ fn maybe_spawn_golden(state: &mut GameState, geom: &SimGeometry) {
     if geom.biscuit.width < 8 || geom.biscuit.height < 5 {
         return;
     }
-    let col_range = (
-        geom.biscuit.x + 2,
-        geom.biscuit.x + geom.biscuit.width.saturating_sub(8),
-    );
-    let row_range = (
-        geom.biscuit.y + 1,
-        geom.biscuit.y + geom.biscuit.height.saturating_sub(4),
-    );
-    state.golden = Some(golden::spawn_in(col_range, row_range));
+    state.golden = Some(golden::spawn_in(geom.biscuit));
 }
 
 fn force_spawn_golden(state: &mut GameState, geom: &SimGeometry, variant: GoldenVariant) {
     if geom.biscuit.width < 8 || geom.biscuit.height < 5 {
         return;
     }
-    let col_range = (
-        geom.biscuit.x + 2,
-        geom.biscuit.x + geom.biscuit.width.saturating_sub(8),
-    );
-    let row_range = (
-        geom.biscuit.y + 1,
-        geom.biscuit.y + geom.biscuit.height.saturating_sub(4),
-    );
-    let mut g = golden::spawn_in(col_range, row_range);
+    let mut g = golden::spawn_in(geom.biscuit);
     g.variant = variant;
     state.golden = Some(g);
 }
@@ -460,7 +446,7 @@ fn demo_driver_tick(
     if t.is_multiple_of(13) {
         let r = geom.biscuit;
         if r.width > 0 && r.height > 0 {
-            state.click((r.x + r.width / 2, r.y + r.height / 2));
+            state.click((r.x + r.width / 2, r.y + r.height / 2), r);
         }
     }
 
@@ -548,8 +534,8 @@ fn handle_event(
     mode: &mut Mode,
     zoom_idx: &mut usize,
     running: &mut bool,
-    visible_fingerers: &[usize],
-    visible_upgrades: &[usize],
+    fingerer_rows: &[(usize, Rect)],
+    upgrade_rows: &[(usize, Rect)],
     debug: bool,
     current: &GameState,
     biscuit_rect: Rect,
@@ -562,13 +548,23 @@ fn handle_event(
             mode,
             zoom_idx,
             running,
-            visible_fingerers,
-            visible_upgrades,
+            fingerer_rows,
+            upgrade_rows,
             debug,
             current,
         ),
         Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
-            handle_click(m.column, m.row, tx, *mode, biscuit_rect, golden_rect);
+            handle_click(
+                m.column,
+                m.row,
+                m.modifiers,
+                tx,
+                *mode,
+                biscuit_rect,
+                golden_rect,
+                fingerer_rows,
+                upgrade_rows,
+            );
         }
         Event::Mouse(m) if m.kind == MouseEventKind::ScrollUp => {
             let _ = m;
@@ -582,32 +578,77 @@ fn handle_event(
     }
 }
 
+fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && col >= rect.x
+        && col < rect.x + rect.width
+        && row >= rect.y
+        && row < rect.y + rect.height
+}
+
+fn click_buy_qty(mods: KeyModifiers) -> BuyQty {
+    if mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::CONTROL) {
+        BuyQty::Max
+    } else if mods.contains(KeyModifiers::SHIFT) {
+        BuyQty::Ten
+    } else {
+        BuyQty::One
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_click(
     col: u16,
     row: u16,
+    mods: KeyModifiers,
     tx: &mpsc::Sender<Action>,
     mode: Mode,
     biscuit: Rect,
     golden: Rect,
+    fingerer_rows: &[(usize, Rect)],
+    upgrade_rows: &[(usize, Rect)],
 ) {
-    if mode != Mode::Game {
-        return;
-    }
-    if golden.width > 0
-        && col >= golden.x
-        && col < golden.x + golden.width
-        && row >= golden.y
-        && row < golden.y + golden.height
-    {
+    // Golden cuques are catchable from ANY panel — match the keyboard 'g'
+    // behavior, which has no mode guard. The marker still renders on the
+    // biscuit while a non-Game panel is open, so the user expects clicking
+    // it to work regardless.
+    if rect_contains(golden, col, row) {
         let _ = tx.send(Action::CatchGolden);
         return;
     }
-    if col >= biscuit.x
-        && col < biscuit.x + biscuit.width
-        && row >= biscuit.y
-        && row < biscuit.y + biscuit.height
-    {
+    // Clicking the biscuit itself is also mode-agnostic: the ass is always
+    // visible in the left column, and the user's reasonable expectation is
+    // that fingering works regardless of which panel is open on the right.
+    // (Mode-specific rows in the right column come AFTER, so a panel-row
+    // click is never confused for a biscuit click.)
+    if rect_contains(biscuit, col, row) {
         let _ = tx.send(Action::Click { col, row });
+        return;
+    }
+    // Mouse-buy fingerers from the sidebar in Game mode. Modifiers control
+    // quantity (plain = 1, Shift = 10, Alt/Ctrl = max), matching the
+    // digit-key shortcuts so the two input methods stay symmetric.
+    if mode == Mode::Game {
+        for &(idx, r) in fingerer_rows {
+            if rect_contains(r, col, row) {
+                let _ = tx.send(Action::BuyFingerer {
+                    idx,
+                    qty: click_buy_qty(mods),
+                });
+                return;
+            }
+        }
+    }
+    // Mouse-buy upgrades from the Upgrades panel. Modifiers ignored — each
+    // upgrade is a one-shot purchase.
+    if mode == Mode::Upgrades {
+        for &(idx, r) in upgrade_rows {
+            if rect_contains(r, col, row) {
+                let _ = tx.send(Action::BuyUpgrade(idx));
+                return;
+            }
+        }
     }
 }
 
@@ -618,8 +659,8 @@ fn handle_key(
     mode: &mut Mode,
     zoom_idx: &mut usize,
     running: &mut bool,
-    visible_fingerers: &[usize],
-    visible_upgrades: &[usize],
+    fingerer_rows: &[(usize, Rect)],
+    upgrade_rows: &[(usize, Rect)],
     debug: bool,
     current: &GameState,
 ) {
@@ -696,15 +737,13 @@ fn handle_key(
         KeyCode::Char('-') | KeyCode::Char('_') => {
             *zoom_idx = (*zoom_idx + 1).min(crate::ui::biscuit::level_count() - 1);
         }
-        KeyCode::Char(' ') | KeyCode::Enter => {
-            if *mode == Mode::Prestige {
-                if current.prestige_available() > 0 {
-                    let _ = tx.send(Action::PrestigeReset);
-                    *mode = Mode::Game;
-                }
-            } else if *mode == Mode::Game {
-                let _ = tx.send(Action::ClickCenter);
-            }
+        // Space ALWAYS fingers the cuque, regardless of which panel is open
+        // — same contract as left-click on the biscuit. Enter is reserved
+        // (no-op here) so future menu/dialog work can use it as the global
+        // "accept" key without overloading meaning. The Prestige panel uses
+        // [r] alone to confirm a reset.
+        KeyCode::Char(' ') => {
+            let _ = tx.send(Action::ClickCenter);
         }
         KeyCode::Char(c) => {
             if let Some((slot, shifted_sym)) = digit_slot(c) {
@@ -713,7 +752,7 @@ fn handle_key(
                     mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::CONTROL);
                 match *mode {
                     Mode::Game => {
-                        if let Some(&fid) = visible_fingerers.get(slot) {
+                        if let Some(&(fid, _)) = fingerer_rows.get(slot) {
                             let qty = if buy_max {
                                 BuyQty::Max
                             } else if buy_10 {
@@ -725,7 +764,7 @@ fn handle_key(
                         }
                     }
                     Mode::Upgrades => {
-                        if let Some(&u_idx) = visible_upgrades.get(slot) {
+                        if let Some(&(u_idx, _)) = upgrade_rows.get(slot) {
                             let _ = tx.send(Action::BuyUpgrade(u_idx));
                         }
                     }
@@ -762,46 +801,30 @@ pub fn build_demo_state() -> GameState {
         best_fps: 50_000.0,
         ..GameState::default()
     };
-    // 3+ rings of hands around the biscuit. Per-type cap in `ui/hands.rs`
-    // is 40, so anything over 40 is visually identical. 8 types owned =
-    // thick crust of hands around the ass.
-    for (id, count) in [
-        ("index_finger", 40),
-        ("whole_hand", 40),
-        ("latex_glove", 35),
-        ("greek_kiss", 30),
-        ("robotic_finger", 25),
-        ("tentacle", 20),
-        ("finger_vortex", 15),
-        ("dimensional_hole", 10),
-    ] {
-        s.fingerers_owned.insert(id.into(), count);
+    // Seed counts/flags BY CATALOG INDEX rather than by hardcoded id strings,
+    // so a future rename/reorder/removal of a fingerer or upgrade can never
+    // silently degrade the demo (the live id at that slot is always used).
+    //
+    // Per-tier owned counts ramp down 40→10 across the first 8 fingerers.
+    // The per-type cap in `ui/hands.rs` is 40, so anything beyond that is
+    // visually identical — 8 types owned = thick crust of hands.
+    const DEMO_FINGERER_COUNTS: &[u32] = &[40, 40, 35, 30, 25, 20, 15, 10];
+    for (idx, &count) in DEMO_FINGERER_COUNTS.iter().enumerate() {
+        if let Some(f) = FINGERERS.get(idx)
+            && count > 0
+        {
+            s.fingerers_owned.insert(f.id.to_string(), count);
+        }
     }
-    // A spread of upgrades so the sidebar shows (xN) multipliers on several tiers.
-    for id in [
-        "click_mult_1",
-        "click_mult_2",
-        "index_finger_mult_1",
-        "index_finger_mult_2",
-        "whole_hand_mult_1",
-        "whole_hand_mult_2",
-        "latex_glove_mult_1",
-        "latex_glove_mult_2",
-        "robotic_finger_mult_1",
-        "all_fingerers_boost",
-    ] {
-        s.upgrades_earned.insert(id.into());
+    // Take the first 10 upgrades from the catalog (deterministic regardless
+    // of how UPGRADES is reordered) — gives a spread of click + per-tier
+    // multipliers so the sidebar shows (xN) on several tiers.
+    for u in UPGRADES.iter().take(10) {
+        s.upgrades_earned.insert(u.id.to_string());
     }
-    // A handful of achievements for visual variety in that panel.
-    for id in [
-        "first_finger",
-        "warming_up",
-        "seasoned_fingerer",
-        "automation",
-        "factory_of_fingers",
-        "golden_touch",
-    ] {
-        s.achievements_earned.insert(id.into());
+    // First 6 achievements for visual variety in that panel.
+    for a in ACHIEVEMENTS.iter().take(6) {
+        s.achievements_earned.insert(a.id.to_string());
     }
     s
 }

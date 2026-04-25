@@ -15,7 +15,11 @@ const FLASH_REST: (f32, f32, f32) = (200.0, 200.0, 210.0);
 const FLASH_CARRIER: (f32, f32, f32) = (255.0, 255.0, 255.0);
 const FLASH_CYCLE: f32 = 11.0;
 
-pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<usize> {
+/// Returns one entry per visible fingerer row: the live `FINGERERS` index
+/// and the click-target rect on screen. Aligned 1:1 with the rendered rows
+/// so the click router can map a click coordinate to an
+/// `Action::BuyFingerer` without re-parsing the panel layout.
+pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rect)> {
     let lang = t();
     let mut lines: Vec<Line> = Vec::new();
     let visible: Vec<usize> = (0..FINGERERS.len())
@@ -76,7 +80,35 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<usize> {
 
     paint_flashes(frame, area, state, &visible);
 
-    visible
+    if area.width < 3 || area.height < 3 {
+        return Vec::new();
+    }
+    let inner_x = area.x + 1;
+    let inner_y = area.y + 1;
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2);
+    let mut rows: Vec<(usize, Rect)> = Vec::new();
+    for (slot, &i) in visible.iter().enumerate() {
+        if slot >= 10 {
+            break;
+        }
+        let row_top = slot as u16 * ROWS_PER_FINGERER;
+        if row_top >= inner_h {
+            break;
+        }
+        // Skip the trailing blank separator (3 useful rows out of 4).
+        let height = (ROWS_PER_FINGERER - 1).min(inner_h - row_top);
+        rows.push((
+            i,
+            Rect {
+                x: inner_x,
+                y: inner_y + row_top,
+                width: inner_w,
+                height,
+            },
+        ));
+    }
+    rows
 }
 
 fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[usize]) {

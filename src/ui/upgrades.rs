@@ -5,7 +5,15 @@ use crate::game::state::GameState;
 use crate::game::upgrade::{self, UPGRADES};
 use crate::i18n::t;
 
-pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<usize> {
+/// Per-row block height: hotkey+name, indented description, indented cost,
+/// blank separator. Used to compute click hit-test rects below.
+const ROWS_PER_UPGRADE: u16 = 4;
+
+/// Returns one entry per visible upgrade row: the live `UPGRADES` index
+/// and the click-target rect on screen. Aligned 1:1 with the rendered
+/// rows, so the click router can map a click coordinate to an
+/// `Action::BuyUpgrade(idx)` without re-parsing the panel layout.
+pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rect)> {
     let lang = t();
     let available = upgrade::available_ids(state);
     let visible: Vec<usize> = available.iter().take(10).copied().collect();
@@ -58,5 +66,36 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<usize> {
         .wrap(Wrap { trim: false });
     frame.render_widget(p, area);
 
-    visible
+    // Build per-row click rects. Inside the bordered block: x+1 / y+1 origin,
+    // -2 width / -2 height. Each row block is 3 used lines + 1 blank; clicks
+    // anywhere on those 3 used lines trigger the buy. NB: long descriptions
+    // can wrap, but the headline (hotkey + name + cost block) is always
+    // ROWS_PER_UPGRADE rows in the source `lines`. Using ROWS_PER_UPGRADE-1
+    // (skip the trailing blank) keeps us conservative — clicks on the blank
+    // separator do nothing.
+    if area.width < 3 || area.height < 3 {
+        return Vec::new();
+    }
+    let inner_x = area.x + 1;
+    let inner_y = area.y + 1;
+    let inner_w = area.width.saturating_sub(2);
+    let inner_h = area.height.saturating_sub(2);
+    let mut rows: Vec<(usize, Rect)> = Vec::new();
+    for (slot, &u_idx) in visible.iter().enumerate() {
+        let row_top = slot as u16 * ROWS_PER_UPGRADE;
+        if row_top >= inner_h {
+            break;
+        }
+        let height = (ROWS_PER_UPGRADE - 1).min(inner_h - row_top);
+        rows.push((
+            u_idx,
+            Rect {
+                x: inner_x,
+                y: inner_y + row_top,
+                width: inner_w,
+                height,
+            },
+        ));
+    }
+    rows
 }
