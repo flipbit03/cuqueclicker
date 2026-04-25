@@ -13,10 +13,12 @@ pub const TICK_DT: f64 = 1.0 / TICK_HZ as f64;
 const CLENCH_TICKS: u32 = 3;
 const PARTICLE_LIFE: u32 = 20;
 /// Per-tick upward drift for a particle, expressed as a fraction of the
-/// biscuit's height. ~0.022 ≈ 0.4 cells/tick on a 20-row biscuit, ≈ 0.7
-/// cells/tick on a 32-row biscuit — i.e. particles always rise across roughly
-/// the same proportion of the biscuit, regardless of zoom.
-const PARTICLE_FRAC_RISE: f32 = 0.022;
+/// biscuit's height. Calibrated to match the original feel before the
+/// switch to fractional anchors: the old code rose 0.18 cells/tick on
+/// any biscuit size; on a typical ~30-row biscuit that's 0.006 of height
+/// per tick — slow enough that a "+1" only travels ~10-12% of the biscuit
+/// across its 1-second life, instead of streaking across half of it.
+const PARTICLE_FRAC_RISE: f32 = 0.006;
 const GOLDEN_REWARD_SECONDS: f64 = 60.0;
 const GOLDEN_REWARD_FLAT: f64 = 10.0;
 
