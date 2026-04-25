@@ -612,9 +612,18 @@ fn handle_click(
     // Golden cuques are catchable from ANY panel — match the keyboard 'g'
     // behavior, which has no mode guard. The marker still renders on the
     // biscuit while a non-Game panel is open, so the user expects clicking
-    // it to work regardless. This MUST stay above the mode-gate below.
+    // it to work regardless.
     if rect_contains(golden, col, row) {
         let _ = tx.send(Action::CatchGolden);
+        return;
+    }
+    // Clicking the biscuit itself is also mode-agnostic: the ass is always
+    // visible in the left column, and the user's reasonable expectation is
+    // that fingering works regardless of which panel is open on the right.
+    // (Mode-specific rows in the right column come AFTER, so a panel-row
+    // click is never confused for a biscuit click.)
+    if rect_contains(biscuit, col, row) {
+        let _ = tx.send(Action::Click { col, row });
         return;
     }
     // Mouse-buy fingerers from the sidebar in Game mode. Modifiers control
@@ -630,10 +639,6 @@ fn handle_click(
                 return;
             }
         }
-        if rect_contains(biscuit, col, row) {
-            let _ = tx.send(Action::Click { col, row });
-        }
-        return;
     }
     // Mouse-buy upgrades from the Upgrades panel. Modifiers ignored — each
     // upgrade is a one-shot purchase.
@@ -733,12 +738,15 @@ fn handle_key(
             *zoom_idx = (*zoom_idx + 1).min(crate::ui::biscuit::level_count() - 1);
         }
         KeyCode::Char(' ') | KeyCode::Enter => {
-            if *mode == Mode::Prestige {
-                if current.prestige_available() > 0 {
-                    let _ = tx.send(Action::PrestigeReset);
-                    *mode = Mode::Game;
-                }
-            } else if *mode == Mode::Game {
+            // Inside the Prestige panel Space/Enter confirms the reset
+            // (when one is available). Everywhere else — including any
+            // non-Game panel — Space/Enter fingers the cuque, matching the
+            // mouse-click-anywhere-on-biscuit behavior. The ass is always
+            // clickable.
+            if *mode == Mode::Prestige && current.prestige_available() > 0 {
+                let _ = tx.send(Action::PrestigeReset);
+                *mode = Mode::Game;
+            } else if *mode != Mode::Prestige {
                 let _ = tx.send(Action::ClickCenter);
             }
         }
