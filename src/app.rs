@@ -737,18 +737,13 @@ fn handle_key(
         KeyCode::Char('-') | KeyCode::Char('_') => {
             *zoom_idx = (*zoom_idx + 1).min(crate::ui::biscuit::level_count() - 1);
         }
-        KeyCode::Char(' ') | KeyCode::Enter => {
-            // Inside the Prestige panel Space/Enter confirms the reset
-            // (when one is available). Everywhere else — including any
-            // non-Game panel — Space/Enter fingers the cuque, matching the
-            // mouse-click-anywhere-on-biscuit behavior. The ass is always
-            // clickable.
-            if *mode == Mode::Prestige && current.prestige_available() > 0 {
-                let _ = tx.send(Action::PrestigeReset);
-                *mode = Mode::Game;
-            } else if *mode != Mode::Prestige {
-                let _ = tx.send(Action::ClickCenter);
-            }
+        // Space ALWAYS fingers the cuque, regardless of which panel is open
+        // — same contract as left-click on the biscuit. Enter is reserved
+        // (no-op here) so future menu/dialog work can use it as the global
+        // "accept" key without overloading meaning. The Prestige panel uses
+        // [r] alone to confirm a reset.
+        KeyCode::Char(' ') => {
+            let _ = tx.send(Action::ClickCenter);
         }
         KeyCode::Char(c) => {
             if let Some((slot, shifted_sym)) = digit_slot(c) {
