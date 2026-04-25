@@ -132,7 +132,12 @@ pub fn draw(frame: &mut Frame, area: Rect, clenched: bool, zoom_idx: usize) -> R
     rect
 }
 
-pub fn draw_golden(frame: &mut Frame, golden: &GoldenCuque) -> Rect {
+/// Render the golden cuque marker. Position is resolved against the CURRENT
+/// `biscuit` rect every frame from the golden's stored fractional anchor —
+/// so the marker travels with the biscuit on zoom and resize, instead of
+/// stranding in the old screen position. Returned `Rect` is the actual
+/// drawn rect, used by the click router for hit-testing.
+pub fn draw_golden(frame: &mut Frame, golden: &GoldenCuque, biscuit: Rect) -> Rect {
     let buf = frame.buffer_mut();
     let (center, style) = match golden.variant {
         GoldenVariant::Lucky => (
@@ -167,23 +172,33 @@ pub fn draw_golden(frame: &mut Frame, golden: &GoldenCuque) -> Rect {
     let h: u16 = 3;
 
     let area = buf.area;
-    if area.width == 0 || area.height == 0 {
+    if area.width == 0 || area.height == 0 || biscuit.width < w || biscuit.height < h {
         return Rect::default();
     }
 
-    let mut col = golden.col;
-    let mut row = golden.row;
+    let (anchor_col, anchor_row) =
+        crate::game::state::biscuit_frac_to_screen(golden.frac_x, golden.frac_y, biscuit);
+    let mut col = anchor_col;
+    let mut row = anchor_row;
+    // Keep the 5x3 marker fully inside the biscuit so it never overlaps the
+    // sidebar / HUD chrome, then clamp once more to the screen for safety.
+    if col + w > biscuit.x + biscuit.width {
+        col = (biscuit.x + biscuit.width).saturating_sub(w);
+    }
+    if row + h > biscuit.y + biscuit.height {
+        row = (biscuit.y + biscuit.height).saturating_sub(h);
+    }
+    if col < biscuit.x {
+        col = biscuit.x;
+    }
+    if row < biscuit.y {
+        row = biscuit.y;
+    }
     if col + w > area.x + area.width {
         col = (area.x + area.width).saturating_sub(w);
     }
     if row + h > area.y + area.height {
         row = (area.y + area.height).saturating_sub(h);
-    }
-    if col < area.x {
-        col = area.x;
-    }
-    if row < area.y {
-        row = area.y;
     }
 
     for (dy, line) in lines.iter().enumerate() {

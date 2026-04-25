@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 
 use crate::game::achievement::ACHIEVEMENTS;
@@ -11,16 +12,46 @@ pub const TICK_HZ: u32 = 20;
 pub const TICK_DT: f64 = 1.0 / TICK_HZ as f64;
 const CLENCH_TICKS: u32 = 3;
 const PARTICLE_LIFE: u32 = 20;
-const PARTICLE_RISE: f32 = 0.18;
+/// Per-tick upward drift for a particle, expressed as a fraction of the
+/// biscuit's height. ~0.022 ≈ 0.4 cells/tick on a 20-row biscuit, ≈ 0.7
+/// cells/tick on a 32-row biscuit — i.e. particles always rise across roughly
+/// the same proportion of the biscuit, regardless of zoom.
+const PARTICLE_FRAC_RISE: f32 = 0.022;
 const GOLDEN_REWARD_SECONDS: f64 = 60.0;
 const GOLDEN_REWARD_FLAT: f64 = 10.0;
 
+/// Position is stored as a fraction of the biscuit rect ([0.0, 1.0] on each
+/// axis), matching `GoldenCuque`. The renderer resolves these fractions
+/// against the *current* biscuit rect every frame, so particles travel with
+/// the biscuit when the terminal resizes or the user zooms.
 #[derive(Clone)]
 pub struct Particle {
-    pub col: u16,
-    pub row: f32,
+    pub frac_x: f32,
+    pub frac_y: f32,
     pub life: u32,
     pub text: String,
+}
+
+/// Convert an absolute `(col, row)` screen point into biscuit-fractional
+/// coordinates, clamped to [0.0, 1.0]. Used at click/spawn sites that come
+/// from screen-space input (mouse clicks, RNG within the biscuit rect).
+pub fn screen_to_biscuit_frac(col: u16, row: u16, biscuit: Rect) -> (f32, f32) {
+    if biscuit.width == 0 || biscuit.height == 0 {
+        return (0.5, 0.5);
+    }
+    let fx = ((col as i32 - biscuit.x as i32) as f32) / biscuit.width as f32;
+    let fy = ((row as i32 - biscuit.y as i32) as f32) / biscuit.height as f32;
+    (fx.clamp(0.0, 1.0), fy.clamp(0.0, 1.0))
+}
+
+/// Convert biscuit-fractional coordinates back to an absolute screen point.
+pub fn biscuit_frac_to_screen(frac_x: f32, frac_y: f32, biscuit: Rect) -> (u16, u16) {
+    let col = biscuit.x as f32 + frac_x.clamp(0.0, 1.0) * biscuit.width as f32;
+    let row = biscuit.y as f32 + frac_y.clamp(0.0, 1.0) * biscuit.height as f32;
+    (
+        col.round().clamp(0.0, u16::MAX as f32) as u16,
+        row.round().clamp(0.0, u16::MAX as f32) as u16,
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -227,17 +258,18 @@ impl GameState {
 
     // -- Click / tick -------------------------------------------------------
 
-    pub fn click(&mut self, origin: (u16, u16)) {
+    pub fn click(&mut self, origin: (u16, u16), biscuit: Rect) {
         let power = self.click_power();
         self.add_cuques(power);
         self.total_clicks += 1;
         self.clench_ticks = CLENCH_TICKS;
         let jitter = (self.total_clicks as i32 % 9) - 4;
         let col = (origin.0 as i32 + jitter).max(0) as u16;
-        let row = (origin.1 as f32) - 1.0;
+        let row = origin.1.saturating_sub(1);
+        let (frac_x, frac_y) = screen_to_biscuit_frac(col, row, biscuit);
         self.particles.push(Particle {
-            col,
-            row,
+            frac_x,
+            frac_y,
             life: PARTICLE_LIFE,
             text: format!("+{}", crate::format::big(power)),
         });
@@ -349,8 +381,8 @@ impl GameState {
             }
         };
         self.particles.push(Particle {
-            col: golden.col,
-            row: golden.row as f32,
+            frac_x: golden.frac_x,
+            frac_y: golden.frac_y,
             life: PARTICLE_LIFE * 2,
             text: label,
         });
@@ -441,7 +473,7 @@ impl GameState {
         self.clench_ticks = self.clench_ticks.saturating_sub(1);
         for p in self.particles.iter_mut() {
             p.life = p.life.saturating_sub(1);
-            p.row -= PARTICLE_RISE;
+            p.frac_y -= PARTICLE_FRAC_RISE;
         }
         self.particles.retain(|p| p.life > 0);
         self.session_ticks += 1;
@@ -482,15 +514,15 @@ impl GameState {
     /// used to lie (particle flying up while the HUD counter didn't move).
     /// The shown amount is always real cuques that just accrued into
     /// `visual_debt`.
-    pub fn spawn_auto_particle(&mut self, col: u16, row: u16) {
+    pub fn spawn_auto_particle(&mut self, frac_x: f32, frac_y: f32) {
         let amount = self.visual_debt.floor() as u64;
         if amount == 0 {
             return;
         }
         self.visual_debt -= amount as f64;
         self.particles.push(Particle {
-            col,
-            row: row as f32,
+            frac_x,
+            frac_y,
             life: PARTICLE_LIFE,
             text: format!("+{}", crate::format::big(amount as f64)),
         });
@@ -619,5 +651,59 @@ mod tests {
         assert_eq!(m.fingerer_count("index_finger"), 7);
         assert!(m.has_upgrade("click_mult_1"));
         assert!(m.has_achievement("first_finger"));
+    }
+
+    fn r(x: u16, y: u16, w: u16, h: u16) -> Rect {
+        Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    #[test]
+    fn frac_screen_roundtrip_at_corners() {
+        let biscuit = r(10, 5, 40, 20);
+        // top-left corner
+        let (fx, fy) = screen_to_biscuit_frac(10, 5, biscuit);
+        assert!(fx <= 0.001 && fy <= 0.001);
+        let (col, row) = biscuit_frac_to_screen(fx, fy, biscuit);
+        assert_eq!((col, row), (10, 5));
+
+        // bottom-right (one beyond, clamps)
+        let (fx, fy) = screen_to_biscuit_frac(50, 25, biscuit);
+        assert!(fx >= 0.999 && fy >= 0.999);
+
+        // exact center
+        let (col, row) = biscuit_frac_to_screen(0.5, 0.5, biscuit);
+        assert_eq!(col, 30);
+        assert_eq!(row, 15);
+    }
+
+    #[test]
+    fn frac_position_survives_biscuit_move() {
+        // A point at fraction (0.25, 0.5) of the biscuit must resolve to a
+        // proportionally-shifted absolute coord when the biscuit moves /
+        // grows.
+        let small = r(0, 0, 40, 20);
+        let (col_a, row_a) = biscuit_frac_to_screen(0.25, 0.5, small);
+        let large = r(10, 5, 80, 40);
+        let (col_b, row_b) = biscuit_frac_to_screen(0.25, 0.5, large);
+        // Same fractional spot, very different screen coords.
+        assert_ne!((col_a, row_a), (col_b, row_b));
+        // And the shifted point should still sit at the 25%/50% mark of the
+        // new rect.
+        assert_eq!(col_b, 30); // 10 + 0.25 * 80
+        assert_eq!(row_b, 25); // 5  + 0.5  * 40
+    }
+
+    #[test]
+    fn zero_size_biscuit_doesnt_panic() {
+        let zero = r(0, 0, 0, 0);
+        let (fx, fy) = screen_to_biscuit_frac(5, 5, zero);
+        assert_eq!((fx, fy), (0.5, 0.5));
+        let (col, row) = biscuit_frac_to_screen(0.5, 0.5, zero);
+        assert_eq!((col, row), (0, 0));
     }
 }

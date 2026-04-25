@@ -1,18 +1,24 @@
 use ratatui::prelude::*;
 
-use crate::game::state::Particle;
+use crate::game::state::{Particle, biscuit_frac_to_screen};
 
 const PARTICLE_LIFE_F: f32 = 20.0;
 
-pub fn draw_particles(frame: &mut Frame, area: Rect, particles: &[Particle]) {
+/// Render auto/click particles. Positions are resolved against the CURRENT
+/// `biscuit` rect from each particle's fractional anchor, so they travel
+/// with the biscuit on zoom/resize. `area` (the biscuit rect, same as the
+/// resolution target) is the visual clip.
+pub fn draw_particles(frame: &mut Frame, biscuit: Rect, particles: &[Particle]) {
+    if biscuit.width == 0 || biscuit.height == 0 {
+        return;
+    }
     let buf = frame.buffer_mut();
     for p in particles {
-        let r = p.row.round();
-        if r < area.y as f32 || r >= (area.y + area.height) as f32 {
+        let (col, row) = biscuit_frac_to_screen(p.frac_x, p.frac_y, biscuit);
+        if row < biscuit.y || row >= biscuit.y + biscuit.height {
             continue;
         }
-        let row = r as u16;
-        if p.col < area.x || p.col >= area.x + area.width {
+        if col < biscuit.x || col >= biscuit.x + biscuit.width {
             continue;
         }
         let t = (p.life as f32 / PARTICLE_LIFE_F).clamp(0.0, 1.0);
@@ -20,6 +26,6 @@ pub fn draw_particles(frame: &mut Frame, area: Rect, particles: &[Particle]) {
         let style = Style::default()
             .fg(Color::Rgb(255, dim, dim))
             .add_modifier(Modifier::BOLD);
-        buf.set_string(p.col, row, &p.text, style);
+        buf.set_string(col, row, &p.text, style);
     }
 }
