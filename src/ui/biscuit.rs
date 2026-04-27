@@ -3,6 +3,13 @@ use ratatui::{prelude::*, widgets::*};
 use crate::game::golden::{GOLDEN_LIFE_TICKS, GoldenCuque, GoldenVariant};
 use crate::game::state::{Buff, CLENCH_SQUASH_TICKS, CLENCH_TICKS, GameState};
 
+/// Asshole-spin animation frames. Cycled by `total_clicks % 4` while clenched
+/// so spamming the spacebar makes the cuque rotate `\ | / -`. The default
+/// idle glyph is `O`; clenched-but-not-spinning is rendered by selecting
+/// the spin frame anyway, so every press swaps the glyph and the rotation
+/// reads as motion rather than a flicker.
+const SPIN_FRAMES: [char; 4] = ['\\', '|', '/', '-'];
+
 const BISCUIT_FULL: &[&str] = &[
     r"                    ____________________                    ",
     r"              __,-~~                    ~~-,__              ",
@@ -83,20 +90,50 @@ const BISCUIT_TINY: &[&str] = &[
     r"   `-,____,-'   ",
 ];
 
-const BISCUIT_LEVELS: &[&[&str]] = &[BISCUIT_FULL, BISCUIT_MEDIUM, BISCUIT_SMALL, BISCUIT_TINY];
+/// One zoom level. `asshole_col` is the column inside `rows` where the
+/// focal glyph (`O`/`*`/spin frame) lives — declared at author time, not
+/// searched for at draw time. Anchoring placement to this constant means
+/// (a) we don't depend on which character occupies that cell (so spin
+/// frames `\ | / -` don't break centering) and (b) the asshole sits at
+/// exactly the same screen column on every zoom level (no drift).
+struct BiscuitArt {
+    rows: &'static [&'static str],
+    asshole_col: u16,
+    label: Option<&'static str>,
+}
+
+const BISCUIT_LEVELS: &[BiscuitArt] = &[
+    // Asshole columns counted by hand from the source rows above. Each art
+    // is the widest line in its slice; the asshole is placed at the column
+    // recorded here. Authors of new levels MUST update this when adding art.
+    BiscuitArt {
+        rows: BISCUIT_FULL,
+        asshole_col: 31,
+        label: None,
+    },
+    BiscuitArt {
+        rows: BISCUIT_MEDIUM,
+        asshole_col: 20,
+        label: Some("70%"),
+    },
+    BiscuitArt {
+        rows: BISCUIT_SMALL,
+        asshole_col: 13,
+        label: Some("45%"),
+    },
+    BiscuitArt {
+        rows: BISCUIT_TINY,
+        asshole_col: 7,
+        label: Some("25%"),
+    },
+];
 
 pub fn level_count() -> usize {
     BISCUIT_LEVELS.len()
 }
 
 pub fn level_label(idx: usize) -> Option<&'static str> {
-    match idx {
-        0 => None,
-        1 => Some("70%"),
-        2 => Some("45%"),
-        3 => Some("25%"),
-        _ => None,
-    }
+    BISCUIT_LEVELS.get(idx).and_then(|a| a.label)
 }
 
 /// Draw the biscuit. Reads:
@@ -110,7 +147,8 @@ pub fn level_label(idx: usize) -> Option<&'static str> {
 /// - `state.session_ticks` — drives a slow ambient breathing color cycle
 ///   so the biscuit isn't completely static at idle.
 pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -> Rect {
-    let art = BISCUIT_LEVELS[zoom_idx.min(BISCUIT_LEVELS.len() - 1)];
+    let level = &BISCUIT_LEVELS[zoom_idx.min(BISCUIT_LEVELS.len() - 1)];
+    let art = level.rows;
     let clenched = state.clench_ticks > 0;
     // First CLENCH_SQUASH_TICKS frames of the clench: render a vertically
     // squashed variant of the art so the cuque visibly contracts, then
@@ -139,19 +177,18 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
         .max()
         .unwrap_or(0) as u16;
     let h = render_art.len() as u16;
-    // Anchor placement to the EYE column rather than the art's bounding box.
-    // Each zoom level has a different art width and a different in-art eye
-    // column, so centering by `(area.width - w) / 2` (integer truncation)
-    // makes the eye drift left/right across zoom changes. Anchoring the eye
-    // to a fixed screen column instead keeps the asshole stationary on every
-    // zoom level — the surrounding art shifts; the focus point doesn't.
-    let target_eye_col = area.x + area.width / 2;
-    let eye_col_in_art = render_art
-        .iter()
-        .find_map(|s| s.chars().position(|c| c == 'O' || c == '*'))
-        .unwrap_or(w as usize / 2) as u16;
-    let x_base = target_eye_col
-        .saturating_sub(eye_col_in_art)
+    // Anchor placement to the ASSHOLE column declared on the art level.
+    // Centering the bounding box by `(area.width - w) / 2` integer-truncates
+    // and combines with each art's different in-art asshole column, so the
+    // asshole drifts left/right as the player zooms. Anchoring the asshole
+    // itself to a fixed screen column keeps the focal point stationary on
+    // every zoom — the surrounding cuque shifts; the asshole doesn't. The
+    // declared column is independent of which glyph happens to live in
+    // that cell, so spin animation frames (`\ | / -`) work without breaking
+    // alignment.
+    let target_asshole_col = area.x + area.width / 2;
+    let x_base = target_asshole_col
+        .saturating_sub(level.asshole_col)
         .max(area.x)
         .min((area.x + area.width).saturating_sub(w));
     let y_base = area.y + area.height.saturating_sub(h) / 2;
@@ -191,11 +228,20 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
         height: stable_rect.height,
     };
 
+    // Spin animation: while clenched, swap the `O` for one of `\ | / -`
+    // picked by `total_clicks % 4`. Spamming spacebar makes the asshole
+    // visibly rotate — every press advances the frame by one step. When
+    // not clenched, the resting `O` is shown.
+    let spin_glyph = if clenched {
+        SPIN_FRAMES[(state.total_clicks as usize) % SPIN_FRAMES.len()]
+    } else {
+        'O'
+    };
     let lines: Vec<Line> = render_art
         .iter()
         .map(|s| {
             if clenched {
-                Line::from(s.replace('O', "*"))
+                Line::from(s.replace('O', &spin_glyph.to_string()))
             } else {
                 Line::from(s.to_string())
             }
