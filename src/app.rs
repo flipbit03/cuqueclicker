@@ -53,7 +53,7 @@ use crate::game::golden::{self, GoldenVariant};
 use crate::game::state::{GameState, TICK_DT, TICK_HZ};
 use crate::game::upgrade::UPGRADES;
 use crate::save;
-use crate::ui::{self, Mode};
+use crate::ui::{self, HelpAction, Mode};
 
 const SAVE_INTERVAL_TICKS: u64 = TICK_HZ as u64 * 10;
 // Golden cooldown override used only during demo recording so the viewer
@@ -177,6 +177,12 @@ impl App {
         let mut biscuit_rect = Rect::default();
         let mut golden_rect = Rect::default();
         let mut play_area = Rect::default();
+        // M1+M2: help-bar hint click rects + prestige-reset confirm rect.
+        // Both are recomputed every frame and consumed by the click router
+        // so the mouse-first player has equivalents for `[u]`, `[p]`,
+        // `[s]`, `[a]`, `[g]`, `[q]`, and the `[r] reset` confirm.
+        let mut help_hits: Vec<(HelpAction, Rect)> = Vec::new();
+        let mut prestige_reset_rect = Rect::default();
         // K5: latest mouse position seen via crossterm's `MouseEventKind::Moved`.
         // Lives on main only — render-time transient, not persisted, never sent
         // to the sim. `ui::draw` consumes it to highlight the hovered row.
@@ -200,6 +206,8 @@ impl App {
                 play_area = out.play_area;
                 upgrade_rows = out.upgrade_rows;
                 fingerer_rows = out.fingerer_rows;
+                help_hits = out.help_hits;
+                prestige_reset_rect = out.prestige_reset_rect;
             })?;
 
             // Hand fresh geometry to the sim. Ordering is preserved by mpsc,
@@ -225,6 +233,8 @@ impl App {
                         golden_rect,
                         play_area,
                         &mut last_mouse_pos,
+                        &help_hits,
+                        prestige_reset_rect,
                     );
                     if !event::poll(Duration::ZERO)? {
                         break;
@@ -565,6 +575,8 @@ fn handle_event(
     golden_rect: Rect,
     play_area: Rect,
     last_mouse_pos: &mut Option<(u16, u16)>,
+    help_hits: &[(HelpAction, Rect)],
+    prestige_reset_rect: Rect,
 ) {
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(
@@ -580,6 +592,22 @@ fn handle_event(
         ),
         Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
             *last_mouse_pos = Some((m.column, m.row));
+            // M1+M2: try help-bar / prestige-reset hits first. These give
+            // the mouse-only player parity with `[u]/[p]/[s]/[a]/[g]/[q]/[r]`
+            // shortcuts. Consumed hits short-circuit the rest of the click
+            // pipeline so we don't also fire a misclick particle.
+            if try_help_click(
+                m.column,
+                m.row,
+                help_hits,
+                prestige_reset_rect,
+                mode,
+                running,
+                tx,
+                current,
+            ) {
+                return;
+            }
             handle_click(
                 m.column,
                 m.row,
@@ -591,6 +619,7 @@ fn handle_event(
                 golden_rect,
                 fingerer_rows,
                 upgrade_rows,
+                play_area,
                 current,
             );
         }
@@ -600,6 +629,18 @@ fn handle_event(
         // don't fire and confuse the user.
         Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Right) => {
             *last_mouse_pos = Some((m.column, m.row));
+            if try_help_click(
+                m.column,
+                m.row,
+                help_hits,
+                prestige_reset_rect,
+                mode,
+                running,
+                tx,
+                current,
+            ) {
+                return;
+            }
             handle_click(
                 m.column,
                 m.row,
@@ -611,6 +652,7 @@ fn handle_event(
                 golden_rect,
                 fingerer_rows,
                 upgrade_rows,
+                play_area,
                 current,
             );
         }
@@ -679,6 +721,61 @@ fn click_buy_qty(mods: KeyModifiers) -> BuyQty {
     }
 }
 
+/// Try to consume a click on a help-bar hint or the prestige-reset
+/// confirm line. Returns true when the click was handled — caller should
+/// short-circuit the rest of the pipeline (no biscuit/row/misclick path).
+///
+/// The keyboard shortcuts and the corresponding clickable hints share the
+/// same dispatch logic so behavior is identical across input methods.
+#[allow(clippy::too_many_arguments)]
+fn try_help_click(
+    col: u16,
+    row: u16,
+    help_hits: &[(HelpAction, Rect)],
+    prestige_reset_rect: Rect,
+    mode: &mut Mode,
+    running: &mut bool,
+    tx: &mpsc::Sender<Action>,
+    current: &GameState,
+) -> bool {
+    // Prestige-reset confirm: in-panel button. Match BEFORE help-bar so
+    // the confirm "wins" if the help bar happens to overlap it (it
+    // shouldn't, but defensive).
+    if rect_contains(prestige_reset_rect, col, row) && current.prestige_available() > 0 {
+        let _ = tx.send(Action::PrestigeReset);
+        *mode = Mode::Game;
+        return true;
+    }
+    for &(action, rect) in help_hits {
+        if !rect_contains(rect, col, row) {
+            continue;
+        }
+        match action {
+            HelpAction::OpenMode(target) => {
+                // Same toggle semantics the keyboard uses: tapping the
+                // hint for the active mode returns to Game.
+                *mode = if *mode == target { Mode::Game } else { target };
+            }
+            HelpAction::GrabGolden => {
+                if current.golden.is_some() {
+                    let _ = tx.send(Action::CatchGolden);
+                }
+            }
+            HelpAction::PrestigeReset => {
+                if current.prestige_available() > 0 {
+                    let _ = tx.send(Action::PrestigeReset);
+                    *mode = Mode::Game;
+                }
+            }
+            HelpAction::Quit => {
+                *running = false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_click(
     col: u16,
@@ -691,6 +788,7 @@ fn handle_click(
     golden: Rect,
     fingerer_rows: &[(usize, Rect)],
     upgrade_rows: &[(usize, Rect)],
+    play_area: Rect,
     current: &GameState,
 ) {
     // Golden cuques are catchable from ANY panel — match the keyboard 'g'
@@ -749,7 +847,14 @@ fn handle_click(
     //   - the click landed on an orbital hand glyph — those are decoration,
     //     not click targets, but they're visually present, so a misclick
     //     "·" replacing part of `[]` / `:*` / `>>` reads as flicker.
+    //   - M3: the click landed OUTSIDE the play area (HUD title, sidebar,
+    //     debug pane, help bar). Inert UI chrome shouldn't get a "·"
+    //     overpainted into it — that visibly damages the title text and
+    //     reads as a bug.
     if button != MouseButton::Left {
+        return;
+    }
+    if !rect_contains(play_area, col, row) {
         return;
     }
     if crate::ui::hands::occupied_at(col, row, biscuit, current) {
