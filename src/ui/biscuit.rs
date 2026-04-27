@@ -139,7 +139,21 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
         .max()
         .unwrap_or(0) as u16;
     let h = render_art.len() as u16;
-    let x_base = area.x + area.width.saturating_sub(w) / 2;
+    // Anchor placement to the EYE column rather than the art's bounding box.
+    // Each zoom level has a different art width and a different in-art eye
+    // column, so centering by `(area.width - w) / 2` (integer truncation)
+    // makes the eye drift left/right across zoom changes. Anchoring the eye
+    // to a fixed screen column instead keeps the asshole stationary on every
+    // zoom level — the surrounding art shifts; the focus point doesn't.
+    let target_eye_col = area.x + area.width / 2;
+    let eye_col_in_art = render_art
+        .iter()
+        .find_map(|s| s.chars().position(|c| c == 'O' || c == '*'))
+        .unwrap_or(w as usize / 2) as u16;
+    let x_base = target_eye_col
+        .saturating_sub(eye_col_in_art)
+        .max(area.x)
+        .min((area.x + area.width).saturating_sub(w));
     let y_base = area.y + area.height.saturating_sub(h) / 2;
 
     // The stable rect is what we RETURN to callers (hands, particles,
