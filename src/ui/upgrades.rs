@@ -96,8 +96,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
         .filter_map(|&i| state.upgrade_unaffordable_flash.get(i).copied())
         .max()
         .unwrap_or(0);
-    let purchase_strength = border::plateau_fade(any_purchase, PURCHASE_FLASH_TICKS)
-        * (state.purchase_flash_strength.max(1.0) / 3.0).clamp(0.34, 1.0);
+    // Carrier-strength is timing-only — bulk-buy scaling is applied as a
+    // wave-amplitude bonus inside `paint_border_flash`, not as a carrier
+    // dampener — so the panel border reaches full white on every flash.
+    let purchase_strength = border::plateau_fade(any_purchase, PURCHASE_FLASH_TICKS);
     let unaff_strength = border::plateau_fade(any_unaff, PURCHASE_FLASH_TICKS / 2);
     if purchase_strength > 0.001 {
         border::paint_border_flash(
@@ -191,7 +193,9 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
     let inner_y = area.y + 1;
     let inner_right = area.x + area.width - 1;
     let inner_bottom = area.y + area.height - 1;
-    let bulk_mult = state.purchase_flash_strength.clamp(1.0, 3.0);
+    // Bulk-buy boosts wave amplitude only; carrier-strength is timing-only
+    // so the row reaches full white-↔-tint contrast on every flash.
+    let bulk_amp = state.purchase_flash_strength.clamp(1.0, 3.0);
     let buf = frame.buffer_mut();
 
     for (slot, &u_idx) in visible.iter().enumerate() {
@@ -204,15 +208,17 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
             .get(u_idx)
             .copied()
             .unwrap_or(0);
-        let (strength, tint) = if purchase_ticks > 0 {
+        let (strength, tint, amp) = if purchase_ticks > 0 {
             (
-                smoothstep(purchase_ticks as f32 / PURCHASE_FLASH_TICKS as f32) * bulk_mult / 3.0,
+                smoothstep(purchase_ticks as f32 / PURCHASE_FLASH_TICKS as f32),
                 FLASH_TINT,
+                bulk_amp,
             )
         } else if unaff_ticks > 0 {
             (
                 smoothstep(unaff_ticks as f32 / (PURCHASE_FLASH_TICKS as f32 / 2.0)),
                 UNAFFORDABLE_TINT,
+                1.0,
             )
         } else {
             continue;
@@ -233,7 +239,7 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
                 let rel = (col - area.x) as f32;
                 let wave01 =
                     (((rel + phase) * std::f32::consts::TAU / FLASH_CYCLE).sin() + 1.0) * 0.5;
-                let contribution = wave01 * strength;
+                let contribution = (wave01 * strength * amp).min(1.0);
                 let r = carrier_r + (tint.0 - carrier_r) * contribution;
                 let g = carrier_g + (tint.1 - carrier_g) * contribution;
                 let b = carrier_b + (tint.2 - carrier_b) * contribution;

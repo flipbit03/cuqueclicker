@@ -95,8 +95,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
         .filter_map(|&i| state.fingerer_unaffordable_flash.get(i).copied())
         .max()
         .unwrap_or(0);
-    let purchase_strength = border::plateau_fade(any_purchase, PURCHASE_FLASH_TICKS)
-        * (state.purchase_flash_strength.max(1.0) / 3.0).clamp(0.34, 1.0);
+    // Carrier-strength is timing-only — no bulk-buy scaling — so the
+    // panel border reaches full white on every flash. The wave amplitude
+    // booster (bulk-buy intensity) is handled inside `paint_border_flash`.
+    let purchase_strength = border::plateau_fade(any_purchase, PURCHASE_FLASH_TICKS);
     let unaff_strength = border::plateau_fade(any_unaff, PURCHASE_FLASH_TICKS / 2);
     if purchase_strength > 0.001 {
         border::paint_border_flash(
@@ -158,10 +160,11 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
     let inner_y = area.y + 1;
     let inner_right = area.x + area.width - 1;
     let inner_bottom = area.y + area.height - 1;
-    // Bulk-buy intensifier: a single +1 buy plays at strength~1.0; max-buy
-    // multiplies up to 3.0 so the row's wave is louder. Capped to avoid
-    // saturating the carrier in extreme bulk cases.
-    let bulk_mult = state.purchase_flash_strength.clamp(1.0, 3.0);
+    // Bulk-buy intensifier: 1.0..3.0 multiplier on the WAVE AMPLITUDE only
+    // (not the carrier brightness). A single buy already pulses fully white
+    // ↔ tint with maximum contrast; bulk-buy just pushes the tint peaks
+    // harder so a max-buy reads louder without dimming the white carrier.
+    let bulk_amp = state.purchase_flash_strength.clamp(1.0, 3.0);
     let buf = frame.buffer_mut();
 
     for (slot, &fingerer_idx) in visible.iter().enumerate() {
@@ -181,16 +184,20 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
         // Per-row tint priority: green purchase wins over red unaffordable
         // when both happen to be running (e.g. user clicked unaffordable,
         // then bought 1 of an affordable adjacent fingerer that aliased on
-        // index — defensive only).
-        let (strength, tint) = if purchase_ticks > 0 {
+        // index — defensive only). `strength` here is the carrier blend
+        // factor (timing only, 0..1); `amp` boosts the wave's tint
+        // contribution for bulk buys.
+        let (strength, tint, amp) = if purchase_ticks > 0 {
             (
-                smoothstep(purchase_ticks as f32 / PURCHASE_FLASH_TICKS as f32) * bulk_mult / 3.0,
+                smoothstep(purchase_ticks as f32 / PURCHASE_FLASH_TICKS as f32),
                 FLASH_TINT,
+                bulk_amp,
             )
         } else if unaff_ticks > 0 {
             (
                 smoothstep(unaff_ticks as f32 / (PURCHASE_FLASH_TICKS as f32 / 2.0)),
                 UNAFFORDABLE_TINT,
+                1.0,
             )
         } else {
             continue;
@@ -199,8 +206,8 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
             continue;
         }
         let row_start = inner_y + slot as u16 * ROWS_PER_FINGERER;
-        // Carrier eases from the resting gray up to pure white as the flash
-        // strength rises, then back to gray as it fades — no jarring cut.
+        // Carrier eases from resting gray to pure WHITE on full strength —
+        // never washed out by bulk-buy. The wave below paints tint on top.
         let carrier_r = FLASH_REST.0 + (FLASH_CARRIER.0 - FLASH_REST.0) * strength;
         let carrier_g = FLASH_REST.1 + (FLASH_CARRIER.1 - FLASH_REST.1) * strength;
         let carrier_b = FLASH_REST.2 + (FLASH_CARRIER.2 - FLASH_REST.2) * strength;
@@ -215,7 +222,7 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
                 let rel = (col - area.x) as f32;
                 let wave01 =
                     (((rel + phase) * std::f32::consts::TAU / FLASH_CYCLE).sin() + 1.0) * 0.5;
-                let contribution = wave01 * strength;
+                let contribution = (wave01 * strength * amp).min(1.0);
                 let r = carrier_r + (tint.0 - carrier_r) * contribution;
                 let g = carrier_g + (tint.1 - carrier_g) * contribution;
                 let b = carrier_b + (tint.2 - carrier_b) * contribution;

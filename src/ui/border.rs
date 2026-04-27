@@ -81,13 +81,12 @@ fn cell_color(i: usize, state: &GameState) -> Color {
     let phase = state.border_phase as f32;
 
     // Flashes plateau at full strength for most of their duration, then
-    // smoothstep-fade over the last fraction. Keeps the "white + tint"
-    // contrast visible for most of the flash, then eases back to baseline.
-    // Purchase strength is multiplied by the bulk-buy multiplier (1.0..3.0)
-    // so a max-buy lands harder than a single click, but capped at 1.0 in
-    // the channel composition so we don't blow out the carrier blend.
-    let purchase_s = plateau_fade(state.purchase_flash_ticks, PURCHASE_FLASH_TICKS)
-        * (state.purchase_flash_strength.max(1.0) / 3.0).clamp(0.34, 1.0);
+    // smoothstep-fade over the last fraction. Pure timing — no bulk-buy
+    // scaling here. The carrier path needs to reach 1.0 (full white) on
+    // every flash so the pulse swings WHITE↔tint with maximum contrast.
+    // Bulk-buy intensity is folded in below as a wave-amplitude bonus,
+    // not as a carrier dampener.
+    let purchase_s = plateau_fade(state.purchase_flash_ticks, PURCHASE_FLASH_TICKS);
     let lucky_s = plateau_fade(state.lucky_flash_ticks, LUCKY_FLASH_TICKS);
     let achievement_s = plateau_fade(state.achievement_flash_ticks, ACHIEVEMENT_FLASH_TICKS);
     let frenzy_s = state
@@ -128,16 +127,21 @@ fn cell_color(i: usize, state: &GameState) -> Color {
     // toward its tint. Channels are summed independently and clamped, so
     // simultaneous events produce chromatic combinations (red+blue → hot
     // magenta, red+gold → orange, etc.) rather than a muddy average.
-    for (tint, cycle, strength) in [
-        (PURCHASE_TINT, PURCHASE_CYCLE, purchase_s),
-        (LUCKY_TINT, LUCKY_CYCLE, lucky_s),
-        (ACHIEVEMENT_TINT, ACHIEVEMENT_CYCLE, achievement_s),
-        (BUFF_TINT, BUFF_CYCLE, buff_s),
-        (FRENZY_TINT, FRENZY_CYCLE, frenzy_s),
+    //
+    // Bulk-buy boosts the wave amplitude on the purchase channel only —
+    // a max-buy paints louder green peaks without dimming the white
+    // carrier (which gives us the contrast).
+    let purchase_amp = state.purchase_flash_strength.clamp(1.0, 3.0);
+    for (tint, cycle, strength, amp) in [
+        (PURCHASE_TINT, PURCHASE_CYCLE, purchase_s, purchase_amp),
+        (LUCKY_TINT, LUCKY_CYCLE, lucky_s, 1.0),
+        (ACHIEVEMENT_TINT, ACHIEVEMENT_CYCLE, achievement_s, 1.0),
+        (BUFF_TINT, BUFF_CYCLE, buff_s, 1.0),
+        (FRENZY_TINT, FRENZY_CYCLE, frenzy_s, 1.0),
     ] {
         if strength > 0.001 {
             let wave01 = (((i as f32 + phase) * std::f32::consts::TAU / cycle).sin() + 1.0) * 0.5;
-            let contribution = wave01 * strength;
+            let contribution = (wave01 * strength * amp).min(1.0);
             r += (tint.0 - carrier_r) * contribution;
             g += (tint.1 - carrier_g) * contribution;
             b += (tint.2 - carrier_b) * contribution;
