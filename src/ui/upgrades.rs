@@ -101,16 +101,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
     // dampener — so the panel border reaches full white on every flash.
     let purchase_strength = border::plateau_fade(any_purchase, PURCHASE_FLASH_TICKS);
     let unaff_strength = border::plateau_fade(any_unaff, PURCHASE_FLASH_TICKS / 2);
-    if purchase_strength > 0.001 {
-        border::paint_border_flash(
-            frame,
-            area,
-            state,
-            border::PANEL_PURCHASE_TINT,
-            border::PANEL_PURCHASE_CYCLE,
-            purchase_strength,
-        );
-    } else if unaff_strength > 0.001 {
+    // Unaffordable wins when active — see the matching comment in
+    // sidebar.rs. Ensures a click on an unaffordable upgrade always lights
+    // the panel border red, even if a recent successful purchase's green
+    // hasn't fully decayed yet.
+    if unaff_strength > 0.001 {
         border::paint_border_flash(
             frame,
             area,
@@ -118,6 +113,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
             border::PANEL_UNAFFORDABLE_TINT,
             border::PANEL_UNAFFORDABLE_CYCLE,
             unaff_strength,
+        );
+    } else if purchase_strength > 0.001 {
+        border::paint_border_flash(
+            frame,
+            area,
+            state,
+            border::PANEL_PURCHASE_TINT,
+            border::PANEL_PURCHASE_CYCLE,
+            purchase_strength,
         );
     }
 

@@ -100,16 +100,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
     // booster (bulk-buy intensity) is handled inside `paint_border_flash`.
     let purchase_strength = border::plateau_fade(any_purchase, PURCHASE_FLASH_TICKS);
     let unaff_strength = border::plateau_fade(any_unaff, PURCHASE_FLASH_TICKS / 2);
-    if purchase_strength > 0.001 {
-        border::paint_border_flash(
-            frame,
-            area,
-            state,
-            border::PANEL_PURCHASE_TINT,
-            border::PANEL_PURCHASE_CYCLE,
-            purchase_strength,
-        );
-    } else if unaff_strength > 0.001 {
+    // Unaffordable wins when active. The unaff flash lasts half as long
+    // as purchase (10 vs 20 ticks), so any active unaff IS the most
+    // recent action — clicking unaffordable while a previous buy's green
+    // is still decaying must immediately show red, not get suppressed.
+    // After ~0.5s the unaff fades and green resumes until it expires too.
+    if unaff_strength > 0.001 {
         border::paint_border_flash(
             frame,
             area,
@@ -117,6 +113,15 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
             border::PANEL_UNAFFORDABLE_TINT,
             border::PANEL_UNAFFORDABLE_CYCLE,
             unaff_strength,
+        );
+    } else if purchase_strength > 0.001 {
+        border::paint_border_flash(
+            frame,
+            area,
+            state,
+            border::PANEL_PURCHASE_TINT,
+            border::PANEL_PURCHASE_CYCLE,
+            purchase_strength,
         );
     }
 
