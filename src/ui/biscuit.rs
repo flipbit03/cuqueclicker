@@ -10,6 +10,14 @@ use crate::game::state::{Buff, CLENCH_SQUASH_TICKS, CLENCH_TICKS, GameState};
 /// rather than four indistinguishable line strokes.
 const SPIN_FRAMES: [char; 5] = ['\\', '|', '/', '-', '*'];
 
+// IMPORTANT: the focal cell (asshole) is intentionally a SPACE in each
+// art slice below. The renderer overpaints that cell with the live glyph
+// (`O` / `*` / spin frame `\ | / - *`) at draw time, using the
+// `asshole_col` / `asshole_row` declared on each `BiscuitArt`. We do NOT
+// substitute glyphs into the strings — that ran into the obvious trap of
+// `replace('O', '|')` collateral-damaging the `|` walls on rows 9-21,
+// and the burning-pulse overpaint also got fooled into picking the
+// wrong row when searching for a stand-in glyph.
 const BISCUIT_FULL: &[&str] = &[
     r"                    ____________________                    ",
     r"              __,-~~                    ~~-,__              ",
@@ -26,7 +34,7 @@ const BISCUIT_FULL: &[&str] = &[
     r" |                  \\\\\\\\   |   ////////                |",
     r" |                   \\\\\\\\  |  ////////                 |",
     r" |                    \\\\\\\\\|/////////                  |",
-    r" |         ~ - - - - -         O         - - - - - ~       |",
+    r" |         ~ - - - - -                   - - - - - ~       |",
     r" |                    /////////|\\\\\\\\\                  |",
     r" |                   ////////  |  \\\\\\\\                 |",
     r" |                  ////////   |   \\\\\\\\                |",
@@ -53,7 +61,7 @@ const BISCUIT_MEDIUM: &[&str] = &[
     r" |          \\\\\   |   /////           |",
     r" |           \\\\\  |  /////            |",
     r" |            \\\\\\|//////             |",
-    r" |    ~ - - -       O       - - - ~     |",
+    r" |    ~ - - -               - - - ~     |",
     r" |            //////|\\\\\\             |",
     r" |           /////  |  \\\\\            |",
     r" |          /////   |   \\\\\           |",
@@ -71,7 +79,7 @@ const BISCUIT_SMALL: &[&str] = &[
     r"  /    -~-~-  -~-~-    \  ",
     r" |       \\\ | ///       | ",
     r" |        \\\|///        | ",
-    r" | ~ - -     O     - - ~ | ",
+    r" | ~ - -           - - ~ | ",
     r" |        ///|\\\        | ",
     r" |       /// | \\\       | ",
     r"  \    -~-~-  -~-~-    /  ",
@@ -84,46 +92,56 @@ const BISCUIT_TINY: &[&str] = &[
     r"   ,~      ~,   ",
     r"  /          \  ",
     r" |    \|/     | ",
-    r" | -   O   -  | ",
+    r" | -       -  | ",
     r" |    /|\     | ",
     r"  \          /  ",
     r"   `-,____,-'   ",
 ];
 
-/// One zoom level. `asshole_col` is the column inside `rows` where the
-/// focal glyph (`O`/`*`/spin frame) lives — declared at author time, not
-/// searched for at draw time. Anchoring placement to this constant means
-/// (a) we don't depend on which character occupies that cell (so spin
-/// frames `\ | / -` don't break centering) and (b) the asshole sits at
-/// exactly the same screen column on every zoom level (no drift).
+/// One zoom level. `(asshole_col, asshole_row)` are the exact in-art
+/// coordinates of the focal cell — declared at author time, never searched
+/// for at draw time. The renderer prints the static `rows` verbatim (the
+/// focal cell is a SPACE in the source) and then paints exactly one cell
+/// at that coordinate with the live glyph (`O` / `*` / spin frame). Pros:
+///   - centering doesn't depend on the glyph (spin frames are ASCII chars
+///     that also appear elsewhere in the cuque outline; substitution
+///     would either miss or hit-too-many cells);
+///   - the burning-pulse overpaint targets exactly one cell, every frame,
+///     with no string search to mis-fire on outline `|` walls;
+///   - reorganizing or extending the art is a localized edit — bump the
+///     coords here and the renderer follows.
+///
+/// Authors of new levels MUST update both coords when adding art.
 struct BiscuitArt {
     rows: &'static [&'static str],
     asshole_col: u16,
+    asshole_row: u16,
     label: Option<&'static str>,
 }
 
 const BISCUIT_LEVELS: &[BiscuitArt] = &[
-    // Asshole columns counted by hand from the source rows above. Each art
-    // is the widest line in its slice; the asshole is placed at the column
-    // recorded here. Authors of new levels MUST update this when adding art.
     BiscuitArt {
         rows: BISCUIT_FULL,
         asshole_col: 31,
+        asshole_row: 15,
         label: None,
     },
     BiscuitArt {
         rows: BISCUIT_MEDIUM,
         asshole_col: 20,
+        asshole_row: 9,
         label: Some("70%"),
     },
     BiscuitArt {
         rows: BISCUIT_SMALL,
         asshole_col: 13,
+        asshole_row: 6,
         label: Some("45%"),
     },
     BiscuitArt {
         rows: BISCUIT_TINY,
         asshole_col: 7,
+        asshole_row: 4,
         label: Some("25%"),
     },
 ];
@@ -165,7 +183,7 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
     // same screen y, outer outline contracts inward toward the eye, hands
     // around the biscuit don't move.
     let render_art_owned: Vec<String> = if squash {
-        squashed_art(art)
+        squashed_art(art, level.asshole_row as usize)
     } else {
         art.iter().map(|s| s.to_string()).collect()
     };
@@ -228,36 +246,12 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
         height: stable_rect.height,
     };
 
-    // Asshole glyph picker:
-    //  - not clenched              → resting `O`
-    //  - clenched, space NOT held  → burning `*` (overpainted with a
-    //                                pulsing red glow further down)
-    //  - clenched, space HELD ≥ 1s → spin frame `\ | / -`, advanced by
-    //                                `total_clicks % 4` so each repeat tick
-    //                                rotates one step.
-    //
-    // The hold gate (`state.space_held()`) is driven by sim-side tracking
-    // of consecutive ClickCenter actions across ticks — terminal key-repeat
-    // produces a Press event ~30Hz, so a held key reliably bumps a streak
-    // counter every 50ms tick. Spamming-and-releasing taps stays at low
-    // streak values and never crosses the 1-second threshold.
-    let space_held = state.space_held();
-    let asshole_glyph: char = if !clenched {
-        'O'
-    } else if space_held {
-        SPIN_FRAMES[(state.total_clicks as usize) % SPIN_FRAMES.len()]
-    } else {
-        '*'
-    };
+    // Render the static art lines as-is — the focal cell is a literal SPACE
+    // in the source. The asshole glyph is painted directly into its
+    // declared (asshole_col, asshole_row) cell after the body draw.
     let lines: Vec<Line> = render_art
         .iter()
-        .map(|s| {
-            if clenched {
-                Line::from(s.replace('O', &asshole_glyph.to_string()))
-            } else {
-                Line::from(s.to_string())
-            }
-        })
+        .map(|s| Line::from(s.to_string()))
         .collect();
 
     // Color blend:
@@ -288,42 +282,48 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
     let p = Paragraph::new(lines).style(Style::default().fg(color));
     frame.render_widget(p, render_rect);
 
-    // "Burning asshole" overpaint: while clenched, repaint the asshole cell
-    // itself with a hot, pulsing red tone so the `*` (or spin frame) reads
-    // as actually-on-fire, distinct from the rest of the cuque body. The
-    // cuque body color (the `base` above) only goes mildly pink on clench;
-    // this overpaint takes the focal cell all the way to red+orange and
-    // pulses fast (~5Hz) so it reads as aggressive heat.
-    if clenched {
-        let buf = frame.buffer_mut();
-        // Find the asshole row inside the rendered art (it can move when
-        // the squash transform pads with a blank top row, so we can't just
-        // read level metadata).
-        let glyph_str = asshole_glyph.to_string();
-        let asshole_row_in_art = render_art
-            .iter()
-            .position(|s| s.contains('O') || s.contains(&glyph_str));
-        if let Some(art_row) = asshole_row_in_art {
-            let cx = render_rect.x + level.asshole_col;
-            let cy = render_rect.y + art_row as u16;
-            if cx < buf.area.x + buf.area.width && cy < buf.area.y + buf.area.height {
-                // Pulse: ~5Hz at 20Hz tick rate (period ~4 ticks).
-                let phase = (state.session_ticks as f32) * 0.8;
-                let pulse = (phase.sin() + 1.0) * 0.5; // 0..1
-                // Sweep r:255 (peak) → r:200 (trough); g sweeps 30→90 to add
-                // an orange highlight on the peaks rather than dimming red.
-                let r = (200.0 + 55.0 * pulse) as u8;
-                let g = (30.0 + 60.0 * pulse) as u8;
-                let b = 0;
-                let cell = &mut buf[(cx, cy)];
-                cell.set_char(asshole_glyph);
-                cell.set_style(
-                    Style::default()
-                        .fg(Color::Rgb(r, g, b))
-                        .add_modifier(Modifier::BOLD),
-                );
-            }
-        }
+    // Asshole glyph picker:
+    //  - not clenched              → resting `O` (cuque body color)
+    //  - clenched, space NOT held  → burning `*` with a hot pulsing red
+    //  - clenched, space HELD ≥ 1s → spin frame `\ | / - *`, advanced by
+    //                                `total_clicks % 5` so each repeat tick
+    //                                rotates one step (`*` is the flash
+    //                                frame in the cycle).
+    //
+    // Painted directly into the declared (asshole_col, asshole_row) cell —
+    // no string substitution, no row search. The squash transform
+    // preserves the asshole row index, so this works in both calm and
+    // squashed states.
+    let space_held = state.space_held();
+    let asshole_glyph: char = if !clenched {
+        'O'
+    } else if space_held {
+        SPIN_FRAMES[(state.total_clicks as usize) % SPIN_FRAMES.len()]
+    } else {
+        '*'
+    };
+    let buf = frame.buffer_mut();
+    let cx = render_rect.x + level.asshole_col;
+    let cy = render_rect.y + level.asshole_row;
+    if cx < buf.area.x + buf.area.width && cy < buf.area.y + buf.area.height {
+        let style = if clenched {
+            // Pulse the focal cell at ~5Hz (period ~4 ticks at 20Hz) so the
+            // asshole reads as actively burning, distinct from the merely
+            // pink cuque body.
+            let phase = (state.session_ticks as f32) * 0.8;
+            let pulse = (phase.sin() + 1.0) * 0.5;
+            let r = (200.0 + 55.0 * pulse) as u8;
+            let g = (30.0 + 60.0 * pulse) as u8;
+            Style::default()
+                .fg(Color::Rgb(r, g, 0))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            // Resting `O` matches the cuque body color so it doesn't pop.
+            Style::default().fg(color)
+        };
+        let cell = &mut buf[(cx, cy)];
+        cell.set_char(asshole_glyph);
+        cell.set_style(style);
     }
     // Return the STABLE rect so hands / particles / golden see a steady
     // biscuit position even when render_rect was shifted by the Frenzy
@@ -338,13 +338,13 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
 /// drawn rect, used by the click router for hit-testing.
 ///
 /// Build the "squashed" frame of a biscuit ASCII level by removing the rows
-/// immediately above and below the eye row (the one containing 'O') and
-/// padding with a blank row at top and bottom.
+/// immediately above and below the asshole row and padding with a blank
+/// row at top and bottom.
 ///
-/// Why this shape: a real squash needs the centerline (eye) to stay anchored
-/// while the upper and lower halves contract toward it — that's what reads
-/// as a flattened ellipsoid. Just shrinking from the top makes the cuque
-/// look like the topmost row is flickering, not pulsing.
+/// Why this shape: a real squash needs the centerline (asshole) to stay
+/// anchored while the upper and lower halves contract toward it — that's
+/// what reads as a flattened ellipsoid. Just shrinking from the top makes
+/// the cuque look like the topmost row is flickering, not pulsing.
 ///
 /// Why the blank padding: total row count MUST be preserved. The biscuit
 /// rect that this function feeds is read by `hands::draw` to place the
@@ -352,41 +352,30 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
 /// recentering) would shift every hand around the cuque on every click.
 /// Padding keeps the rect identical between calm and squashed states.
 ///
+/// Critical invariant: the asshole row's index in the output is the same
+/// as `asshole_row` in the input, so the renderer can use the level's
+/// declared `asshole_row` regardless of squash state.
+///
 /// Falls back to a plain copy if the art is too short to safely drop two
-/// rows or doesn't contain an eye 'O' — neither case exists in the
-/// shipped catalog but defensive against future zoom levels.
-fn squashed_art(art: &[&str]) -> Vec<String> {
+/// rows around the asshole row.
+fn squashed_art(art: &[&str], asshole_row: usize) -> Vec<String> {
     let n = art.len();
-    if n < 5 {
+    if n < 5 || asshole_row == 0 || asshole_row + 1 >= n {
         return art.iter().map(|s| s.to_string()).collect();
     }
-    let Some(eye_row) = art.iter().position(|s| s.contains('O')) else {
-        return art.iter().map(|s| s.to_string()).collect();
-    };
-    if eye_row == 0 || eye_row + 1 >= n {
-        return art.iter().map(|s| s.to_string()).collect();
-    }
-    // Build a blank line the same width as the widest art row so the rect
-    // dimensions don't shift.
     let width = art.iter().map(|s| s.chars().count()).max().unwrap_or(0);
     let blank: String = " ".repeat(width);
 
     let mut out: Vec<String> = Vec::with_capacity(n);
-    // Top blank pad — replaces the row we'd otherwise lose by dropping
-    // (eye_row - 1).
-    out.push(blank.clone());
-    // Original rows 0..=eye_row-2 (skipping eye_row-1).
-    for s in art.iter().take(eye_row - 1) {
+    out.push(blank.clone()); // top pad replaces the dropped (asshole_row - 1)
+    for s in art.iter().take(asshole_row - 1) {
         out.push((*s).to_string());
     }
-    // The eye row itself.
-    out.push(art[eye_row].to_string());
-    // Original rows eye_row+2..n (skipping eye_row+1).
-    for s in art.iter().skip(eye_row + 2) {
+    out.push(art[asshole_row].to_string());
+    for s in art.iter().skip(asshole_row + 2) {
         out.push((*s).to_string());
     }
-    // Bottom blank pad to match the top pad.
-    out.push(blank);
+    out.push(blank); // bottom pad replaces the dropped (asshole_row + 1)
     debug_assert_eq!(out.len(), n);
     out
 }
