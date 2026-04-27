@@ -176,6 +176,7 @@ impl App {
         let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
         let mut biscuit_rect = Rect::default();
         let mut golden_rect = Rect::default();
+        let mut play_area = Rect::default();
 
         while running && !shutdown.load(Ordering::Relaxed) {
             // Drain any panel/quit requests from the demo driver before we draw,
@@ -192,6 +193,7 @@ impl App {
                 let out = ui::draw(f, &current, mode, zoom_idx, debug);
                 biscuit_rect = out.biscuit_rect;
                 golden_rect = out.golden_rect;
+                play_area = out.play_area;
                 upgrade_rows = out.upgrade_rows;
                 fingerer_rows = out.fingerer_rows;
             })?;
@@ -217,6 +219,7 @@ impl App {
                         &current,
                         biscuit_rect,
                         golden_rect,
+                        play_area,
                     );
                     if !event::poll(Duration::ZERO)? {
                         break;
@@ -550,6 +553,7 @@ fn handle_event(
     current: &GameState,
     biscuit_rect: Rect,
     golden_rect: Rect,
+    play_area: Rect,
 ) {
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(
@@ -597,19 +601,18 @@ fn handle_event(
                 current,
             );
         }
-        // Scroll wheel zooms the biscuit ONLY when the cursor is over the
-        // left/biscuit column. Inside the sidebar we ignore it so a player
-        // who reflex-scrolls a long fingerer/upgrade list doesn't
-        // accidentally zoom out their view of the cuque.
+        // Scroll wheel zooms the biscuit anywhere in the play area — the
+        // whole left column where the biscuit lives, including the void
+        // around a small biscuit at low zoom. Only the right-hand sidebar
+        // ignores scroll, so a player reflex-scrolling a long fingerer /
+        // upgrade list doesn't accidentally zoom out their cuque.
         Event::Mouse(m)
-            if m.kind == MouseEventKind::ScrollUp
-                && scroll_target_is_biscuit(m.column, biscuit_rect) =>
+            if m.kind == MouseEventKind::ScrollUp && in_play_area(m.column, m.row, play_area) =>
         {
             *zoom_idx = zoom_idx.saturating_sub(1);
         }
         Event::Mouse(m)
-            if m.kind == MouseEventKind::ScrollDown
-                && scroll_target_is_biscuit(m.column, biscuit_rect) =>
+            if m.kind == MouseEventKind::ScrollDown && in_play_area(m.column, m.row, play_area) =>
         {
             *zoom_idx = (*zoom_idx + 1).min(crate::ui::biscuit::level_count() - 1);
         }
@@ -617,24 +620,18 @@ fn handle_event(
     }
 }
 
-/// True when a scroll event happened in the left (biscuit) column. We use
-/// the biscuit's drawn rect's column range as a reasonable proxy — the left
-/// column the biscuit lives in always extends from x=0 to the start of the
-/// sidebar. If we don't have a biscuit rect yet (cold frame) we conservatively
-/// allow the zoom to fire.
-fn scroll_target_is_biscuit(col: u16, biscuit: Rect) -> bool {
-    if biscuit.width == 0 {
+/// True when the scroll happened anywhere inside the play-area rect — the
+/// whole left column the biscuit lives in (HUD-and-help-excluded). Cold
+/// frames (no rect yet) conservatively allow zoom so the very first scroll
+/// after launch isn't dropped.
+fn in_play_area(col: u16, row: u16, play_area: Rect) -> bool {
+    if play_area.width == 0 || play_area.height == 0 {
         return true;
     }
-    // Left column ends just before the sidebar starts. The fixed sidebar is
-    // 38 cols wide; mirror that here so any scroll on the right-hand panel
-    // is ignored.
-    const SIDEBAR_WIDTH: u16 = 38;
-    // Use the biscuit's frame's column extent: anything to the left of the
-    // sidebar start counts as the biscuit column.
-    let area_width = biscuit.x + biscuit.width + SIDEBAR_WIDTH;
-    let sidebar_left = area_width.saturating_sub(SIDEBAR_WIDTH);
-    col < sidebar_left
+    col >= play_area.x
+        && col < play_area.x + play_area.width
+        && row >= play_area.y
+        && row < play_area.y + play_area.height
 }
 
 fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {

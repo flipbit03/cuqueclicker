@@ -47,6 +47,12 @@ pub enum Mode {
 pub struct DrawOutput {
     pub biscuit_rect: Rect,
     pub golden_rect: Rect,
+    /// The whole left column where the biscuit + hands + particles live —
+    /// i.e. "the box that displays the ass." Used by the input router so
+    /// the scroll-wheel zoom fires anywhere in this region (including the
+    /// vast empty space around a small biscuit at low zoom), and only the
+    /// right-hand sidebar opts out of zoom.
+    pub play_area: Rect,
     /// `(upgrade_idx, screen_row_rect)` pairs for the Upgrades panel —
     /// populated only when the active mode renders that panel; empty
     /// otherwise. The click router hit-tests these for `BuyUpgrade`.
@@ -240,6 +246,7 @@ pub fn draw(
     DrawOutput {
         biscuit_rect,
         golden_rect,
+        play_area: left[1],
         upgrade_rows,
         fingerer_rows,
     }
