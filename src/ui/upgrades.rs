@@ -1,13 +1,22 @@
 use ratatui::{prelude::*, widgets::*};
 
 use crate::format;
-use crate::game::state::GameState;
+use crate::game::state::{GameState, PURCHASE_FLASH_TICKS};
 use crate::game::upgrade::{self, UPGRADES};
 use crate::i18n::t;
+use crate::ui::border;
 
 /// Per-row block height: hotkey+name, indented description, indented cost,
 /// blank separator. Used to compute click hit-test rects below.
 const ROWS_PER_UPGRADE: u16 = 4;
+/// Indent applied to wrapped continuation lines so a long description hangs
+/// under the title indent instead of falling back to col 0.
+const HANGING_INDENT: &str = "    ";
+const FLASH_TINT: (f32, f32, f32) = (40.0, 230.0, 80.0);
+const UNAFFORDABLE_TINT: (f32, f32, f32) = (255.0, 60.0, 60.0);
+const FLASH_REST: (f32, f32, f32) = (200.0, 200.0, 210.0);
+const FLASH_CARRIER: (f32, f32, f32) = (255.0, 255.0, 255.0);
+const FLASH_CYCLE: f32 = 11.0;
 
 /// Returns one entry per visible upgrade row: the live `UPGRADES` index
 /// and the click-target rect on screen. Aligned 1:1 with the rendered
@@ -17,6 +26,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
     let lang = t();
     let available = upgrade::available_ids(state);
     let visible: Vec<usize> = available.iter().take(10).copied().collect();
+    // Inner content width (panel width minus the bordered block's chrome) —
+    // used to pre-wrap descriptions with a hanging indent so continuation
+    // lines line up under the title text instead of falling back to col 0.
+    let desc_width = area.width.saturating_sub(2 + HANGING_INDENT.len() as u16) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -49,22 +62,62 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
             ]));
+            // J13: pre-wrap with a hanging indent so wrapped lines align
+            // under the title text. The panel renders with `Wrap { trim }`
+            // disabled below, so each entry here is a finished line.
+            for desc_line in wrap_hanging(desc, desc_width) {
+                lines.push(Line::from(vec![Span::styled(
+                    desc_line,
+                    Style::default().fg(Color::DarkGray),
+                )]));
+            }
             lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled(desc.to_string(), Style::default().fg(Color::DarkGray)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::raw("    "),
+                Span::raw(HANGING_INDENT),
                 Span::styled(format!("{} {}", lang.cost, format::big(u.cost)), cost_style),
             ]));
             lines.push(Line::raw(""));
         }
     }
 
-    let p = Paragraph::new(lines)
-        .block(Block::bordered().title(lang.upgrades_title))
-        .wrap(Wrap { trim: false });
+    let p = Paragraph::new(lines).block(Block::bordered().title(lang.upgrades_title));
     frame.render_widget(p, area);
+
+    paint_flashes(frame, area, state, &visible);
+
+    // Panel-border flash mirrors sidebar.rs: green on any active purchase
+    // flash for visible upgrades, red on any active unaffordable flash.
+    let any_purchase = visible
+        .iter()
+        .filter_map(|&i| state.upgrade_flash_ticks.get(i).copied())
+        .max()
+        .unwrap_or(0);
+    let any_unaff = visible
+        .iter()
+        .filter_map(|&i| state.upgrade_unaffordable_flash.get(i).copied())
+        .max()
+        .unwrap_or(0);
+    let purchase_strength = border::plateau_fade(any_purchase, PURCHASE_FLASH_TICKS)
+        * (state.purchase_flash_strength.max(1.0) / 3.0).clamp(0.34, 1.0);
+    let unaff_strength = border::plateau_fade(any_unaff, PURCHASE_FLASH_TICKS / 2);
+    if purchase_strength > 0.001 {
+        border::paint_border_flash(
+            frame,
+            area,
+            state,
+            border::PANEL_PURCHASE_TINT,
+            border::PANEL_PURCHASE_CYCLE,
+            purchase_strength,
+        );
+    } else if unaff_strength > 0.001 {
+        border::paint_border_flash(
+            frame,
+            area,
+            state,
+            border::PANEL_UNAFFORDABLE_TINT,
+            border::PANEL_UNAFFORDABLE_CYCLE,
+            unaff_strength,
+        );
+    }
 
     // Build per-row click rects. Inside the bordered block: x+1 / y+1 origin,
     // -2 width / -2 height. Each row block is 3 used lines + 1 blank; clicks
@@ -98,4 +151,101 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
         ));
     }
     rows
+}
+
+/// Word-wrap `text` at `width` columns, prepending `HANGING_INDENT` to every
+/// produced line. Returns at least one line (the indent + first word) so a
+/// caller never has to special-case empty input.
+fn wrap_hanging(text: &str, width: usize) -> Vec<String> {
+    let indent = HANGING_INDENT;
+    if width <= indent.len() {
+        return vec![format!("{indent}{text}")];
+    }
+    let avail = width - indent.len();
+    let mut out: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for word in text.split_whitespace() {
+        if row.is_empty() {
+            row.push_str(word);
+        } else if row.len() + 1 + word.len() <= avail {
+            row.push(' ');
+            row.push_str(word);
+        } else {
+            out.push(format!("{indent}{row}"));
+            row.clear();
+            row.push_str(word);
+        }
+    }
+    if !row.is_empty() || out.is_empty() {
+        out.push(format!("{indent}{row}"));
+    }
+    out
+}
+
+fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[usize]) {
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let phase = state.border_phase as f32;
+    let inner_x = area.x + 1;
+    let inner_y = area.y + 1;
+    let inner_right = area.x + area.width - 1;
+    let inner_bottom = area.y + area.height - 1;
+    let bulk_mult = state.purchase_flash_strength.clamp(1.0, 3.0);
+    let buf = frame.buffer_mut();
+
+    for (slot, &u_idx) in visible.iter().enumerate() {
+        if slot >= 10 {
+            break;
+        }
+        let purchase_ticks = state.upgrade_flash_ticks.get(u_idx).copied().unwrap_or(0);
+        let unaff_ticks = state
+            .upgrade_unaffordable_flash
+            .get(u_idx)
+            .copied()
+            .unwrap_or(0);
+        let (strength, tint) = if purchase_ticks > 0 {
+            (
+                smoothstep(purchase_ticks as f32 / PURCHASE_FLASH_TICKS as f32) * bulk_mult / 3.0,
+                FLASH_TINT,
+            )
+        } else if unaff_ticks > 0 {
+            (
+                smoothstep(unaff_ticks as f32 / (PURCHASE_FLASH_TICKS as f32 / 2.0)),
+                UNAFFORDABLE_TINT,
+            )
+        } else {
+            continue;
+        };
+        if strength <= 0.001 {
+            continue;
+        }
+        let row_start = inner_y + slot as u16 * ROWS_PER_UPGRADE;
+        let carrier_r = FLASH_REST.0 + (FLASH_CARRIER.0 - FLASH_REST.0) * strength;
+        let carrier_g = FLASH_REST.1 + (FLASH_CARRIER.1 - FLASH_REST.1) * strength;
+        let carrier_b = FLASH_REST.2 + (FLASH_CARRIER.2 - FLASH_REST.2) * strength;
+        for dy in 0..3u16 {
+            let row = row_start + dy;
+            if row >= inner_bottom {
+                break;
+            }
+            for col in inner_x..inner_right {
+                let rel = (col - area.x) as f32;
+                let wave01 =
+                    (((rel + phase) * std::f32::consts::TAU / FLASH_CYCLE).sin() + 1.0) * 0.5;
+                let contribution = wave01 * strength;
+                let r = carrier_r + (tint.0 - carrier_r) * contribution;
+                let g = carrier_g + (tint.1 - carrier_g) * contribution;
+                let b = carrier_b + (tint.2 - carrier_b) * contribution;
+                let cell = &mut buf[(col, row)];
+                cell.set_fg(Color::Rgb(r as u8, g as u8, b as u8));
+                cell.modifier.insert(Modifier::BOLD);
+            }
+        }
+    }
+}
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }

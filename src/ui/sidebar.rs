@@ -4,9 +4,11 @@ use crate::format;
 use crate::game::fingerer::{self, FINGERERS};
 use crate::game::state::{GameState, PURCHASE_FLASH_TICKS};
 use crate::i18n::t;
+use crate::ui::border;
 
 const ROWS_PER_FINGERER: u16 = 4;
 const FLASH_TINT: (f32, f32, f32) = (40.0, 230.0, 80.0);
+const UNAFFORDABLE_TINT: (f32, f32, f32) = (255.0, 60.0, 60.0);
 // Resting color the flash starts from / returns to (neutral gray similar to
 // default terminal text, so the transition in and out is gentle).
 const FLASH_REST: (f32, f32, f32) = (200.0, 200.0, 210.0);
@@ -80,6 +82,42 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
 
     paint_flashes(frame, area, state, &visible);
 
+    // Panel-border flash on purchase: green if any fingerer's row flash is
+    // burning, red if any unaffordable click was just rejected. Mirrors the
+    // HUD title's behavior so the whole panel pulses, not just the row.
+    let any_purchase = visible
+        .iter()
+        .filter_map(|&i| state.fingerer_flash_ticks.get(i).copied())
+        .max()
+        .unwrap_or(0);
+    let any_unaff = visible
+        .iter()
+        .filter_map(|&i| state.fingerer_unaffordable_flash.get(i).copied())
+        .max()
+        .unwrap_or(0);
+    let purchase_strength = border::plateau_fade(any_purchase, PURCHASE_FLASH_TICKS)
+        * (state.purchase_flash_strength.max(1.0) / 3.0).clamp(0.34, 1.0);
+    let unaff_strength = border::plateau_fade(any_unaff, PURCHASE_FLASH_TICKS / 2);
+    if purchase_strength > 0.001 {
+        border::paint_border_flash(
+            frame,
+            area,
+            state,
+            border::PANEL_PURCHASE_TINT,
+            border::PANEL_PURCHASE_CYCLE,
+            purchase_strength,
+        );
+    } else if unaff_strength > 0.001 {
+        border::paint_border_flash(
+            frame,
+            area,
+            state,
+            border::PANEL_UNAFFORDABLE_TINT,
+            border::PANEL_UNAFFORDABLE_CYCLE,
+            unaff_strength,
+        );
+    }
+
     if area.width < 3 || area.height < 3 {
         return Vec::new();
     }
@@ -120,21 +158,46 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
     let inner_y = area.y + 1;
     let inner_right = area.x + area.width - 1;
     let inner_bottom = area.y + area.height - 1;
+    // Bulk-buy intensifier: a single +1 buy plays at strength~1.0; max-buy
+    // multiplies up to 3.0 so the row's wave is louder. Capped to avoid
+    // saturating the carrier in extreme bulk cases.
+    let bulk_mult = state.purchase_flash_strength.clamp(1.0, 3.0);
     let buf = frame.buffer_mut();
 
     for (slot, &fingerer_idx) in visible.iter().enumerate() {
         if slot >= 10 {
             break;
         }
-        let flash_ticks = state
+        let purchase_ticks = state
             .fingerer_flash_ticks
             .get(fingerer_idx)
             .copied()
             .unwrap_or(0);
-        if flash_ticks == 0 {
+        let unaff_ticks = state
+            .fingerer_unaffordable_flash
+            .get(fingerer_idx)
+            .copied()
+            .unwrap_or(0);
+        // Per-row tint priority: green purchase wins over red unaffordable
+        // when both happen to be running (e.g. user clicked unaffordable,
+        // then bought 1 of an affordable adjacent fingerer that aliased on
+        // index — defensive only).
+        let (strength, tint) = if purchase_ticks > 0 {
+            (
+                smoothstep(purchase_ticks as f32 / PURCHASE_FLASH_TICKS as f32) * bulk_mult / 3.0,
+                FLASH_TINT,
+            )
+        } else if unaff_ticks > 0 {
+            (
+                smoothstep(unaff_ticks as f32 / (PURCHASE_FLASH_TICKS as f32 / 2.0)),
+                UNAFFORDABLE_TINT,
+            )
+        } else {
+            continue;
+        };
+        if strength <= 0.001 {
             continue;
         }
-        let strength = smoothstep(flash_ticks as f32 / PURCHASE_FLASH_TICKS as f32);
         let row_start = inner_y + slot as u16 * ROWS_PER_FINGERER;
         // Carrier eases from the resting gray up to pure white as the flash
         // strength rises, then back to gray as it fades — no jarring cut.
@@ -153,9 +216,9 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
                 let wave01 =
                     (((rel + phase) * std::f32::consts::TAU / FLASH_CYCLE).sin() + 1.0) * 0.5;
                 let contribution = wave01 * strength;
-                let r = carrier_r + (FLASH_TINT.0 - carrier_r) * contribution;
-                let g = carrier_g + (FLASH_TINT.1 - carrier_g) * contribution;
-                let b = carrier_b + (FLASH_TINT.2 - carrier_b) * contribution;
+                let r = carrier_r + (tint.0 - carrier_r) * contribution;
+                let g = carrier_g + (tint.1 - carrier_g) * contribution;
+                let b = carrier_b + (tint.2 - carrier_b) * contribution;
                 let cell = &mut buf[(col, row)];
                 cell.set_fg(Color::Rgb(r as u8, g as u8, b as u8));
                 cell.modifier.insert(Modifier::BOLD);

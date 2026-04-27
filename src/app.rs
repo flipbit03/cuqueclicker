@@ -102,6 +102,13 @@ enum Action {
     /// `debug`; the sim trusts whatever arrives.
     DevAddCuques(f64),
     DevForceGolden(GoldenVariant),
+    /// J10: a click that didn't hit anything actionable. Sim spawns a
+    /// short-lived "·" misclick particle at the screen point so dead-zone
+    /// clicks visibly register.
+    Misclick {
+        col: u16,
+        row: u16,
+    },
 }
 
 /// Messages the sim thread sends back to main. Used exclusively by the
@@ -345,6 +352,9 @@ fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometry) {
         Action::DevForceGolden(variant) => {
             force_spawn_golden(state, geom, variant);
         }
+        Action::Misclick { col, row } => {
+            state.spawn_misclick(col, row);
+        }
     }
 }
 
@@ -558,6 +568,7 @@ fn handle_event(
                 m.column,
                 m.row,
                 m.modifiers,
+                MouseButton::Left,
                 tx,
                 *mode,
                 biscuit_rect,
@@ -566,16 +577,62 @@ fn handle_event(
                 upgrade_rows,
             );
         }
-        Event::Mouse(m) if m.kind == MouseEventKind::ScrollUp => {
-            let _ = m;
+        // J15: right-click is a "buy max" affordance for fingerer/upgrade
+        // rows (saves a modifier on macOS where Alt is awkward). On the
+        // biscuit / golden / dead zone it's a no-op so misclick acks
+        // don't fire and confuse the user.
+        Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Right) => {
+            handle_click(
+                m.column,
+                m.row,
+                m.modifiers,
+                MouseButton::Right,
+                tx,
+                *mode,
+                biscuit_rect,
+                golden_rect,
+                fingerer_rows,
+                upgrade_rows,
+            );
+        }
+        // Scroll wheel zooms the biscuit ONLY when the cursor is over the
+        // left/biscuit column. Inside the sidebar we ignore it so a player
+        // who reflex-scrolls a long fingerer/upgrade list doesn't
+        // accidentally zoom out their view of the cuque.
+        Event::Mouse(m)
+            if m.kind == MouseEventKind::ScrollUp
+                && scroll_target_is_biscuit(m.column, biscuit_rect) =>
+        {
             *zoom_idx = zoom_idx.saturating_sub(1);
         }
-        Event::Mouse(m) if m.kind == MouseEventKind::ScrollDown => {
-            let _ = m;
+        Event::Mouse(m)
+            if m.kind == MouseEventKind::ScrollDown
+                && scroll_target_is_biscuit(m.column, biscuit_rect) =>
+        {
             *zoom_idx = (*zoom_idx + 1).min(crate::ui::biscuit::level_count() - 1);
         }
         _ => {}
     }
+}
+
+/// True when a scroll event happened in the left (biscuit) column. We use
+/// the biscuit's drawn rect's column range as a reasonable proxy — the left
+/// column the biscuit lives in always extends from x=0 to the start of the
+/// sidebar. If we don't have a biscuit rect yet (cold frame) we conservatively
+/// allow the zoom to fire.
+fn scroll_target_is_biscuit(col: u16, biscuit: Rect) -> bool {
+    if biscuit.width == 0 {
+        return true;
+    }
+    // Left column ends just before the sidebar starts. The fixed sidebar is
+    // 38 cols wide; mirror that here so any scroll on the right-hand panel
+    // is ignored.
+    const SIDEBAR_WIDTH: u16 = 38;
+    // Use the biscuit's frame's column extent: anything to the left of the
+    // sidebar start counts as the biscuit column.
+    let area_width = biscuit.x + biscuit.width + SIDEBAR_WIDTH;
+    let sidebar_left = area_width.saturating_sub(SIDEBAR_WIDTH);
+    col < sidebar_left
 }
 
 fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
@@ -602,6 +659,7 @@ fn handle_click(
     col: u16,
     row: u16,
     mods: KeyModifiers,
+    button: MouseButton,
     tx: &mpsc::Sender<Action>,
     mode: Mode,
     biscuit: Rect,
@@ -612,36 +670,43 @@ fn handle_click(
     // Golden cuques are catchable from ANY panel — match the keyboard 'g'
     // behavior, which has no mode guard. The marker still renders on the
     // biscuit while a non-Game panel is open, so the user expects clicking
-    // it to work regardless.
+    // it to work regardless. Right-click on a golden also catches (matches
+    // every other "click anywhere on the marker" affordance).
     if rect_contains(golden, col, row) {
         let _ = tx.send(Action::CatchGolden);
         return;
     }
-    // Clicking the biscuit itself is also mode-agnostic: the ass is always
-    // visible in the left column, and the user's reasonable expectation is
-    // that fingering works regardless of which panel is open on the right.
-    // (Mode-specific rows in the right column come AFTER, so a panel-row
-    // click is never confused for a biscuit click.)
+    // Clicking the biscuit itself is also mode-agnostic. Right-click on
+    // the biscuit is a no-op so a player can't accidentally finger the
+    // cuque with the wrong button. (We could overload it for "extra
+    // power" but that changes game behavior, which juice rules say no.)
     if rect_contains(biscuit, col, row) {
-        let _ = tx.send(Action::Click { col, row });
+        if button == MouseButton::Left {
+            let _ = tx.send(Action::Click { col, row });
+        }
         return;
     }
     // Mouse-buy fingerers from the sidebar in Game mode. Modifiers control
     // quantity (plain = 1, Shift = 10, Alt/Ctrl = max), matching the
-    // digit-key shortcuts so the two input methods stay symmetric.
+    // digit-key shortcuts so the two input methods stay symmetric. Right-
+    // click is the always-Max affordance regardless of modifiers.
     if mode == Mode::Game {
         for &(idx, r) in fingerer_rows {
             if rect_contains(r, col, row) {
-                let _ = tx.send(Action::BuyFingerer {
-                    idx,
-                    qty: click_buy_qty(mods),
-                });
+                let qty = if button == MouseButton::Right {
+                    BuyQty::Max
+                } else {
+                    click_buy_qty(mods)
+                };
+                let _ = tx.send(Action::BuyFingerer { idx, qty });
                 return;
             }
         }
     }
     // Mouse-buy upgrades from the Upgrades panel. Modifiers ignored — each
-    // upgrade is a one-shot purchase.
+    // upgrade is a one-shot purchase. Right-click also buys (no "max" for
+    // single-shot purchases — but accept the click so right-click feels
+    // active everywhere it makes sense).
     if mode == Mode::Upgrades {
         for &(idx, r) in upgrade_rows {
             if rect_contains(r, col, row) {
@@ -649,6 +714,13 @@ fn handle_click(
                 return;
             }
         }
+    }
+    // J10: nothing actionable under the click. Acknowledge it visually with
+    // a brief "·" so the dead-zone (e.g. the air around a 25%-zoom biscuit)
+    // doesn't feel inert. Skip when the click was right-button on a
+    // non-row area — right-click without a target is a true no-op.
+    if button == MouseButton::Left {
+        let _ = tx.send(Action::Misclick { col, row });
     }
 }
 
@@ -668,8 +740,12 @@ fn handle_key(
     let mods = k.modifiers;
     match code {
         KeyCode::Char('q') => *running = false,
+        // J12: Esc dismisses panels back to Game mode but is a NO-OP from
+        // Game itself. Quit is `q` only — Esc-to-quit was an aggressive
+        // default that surprised playtesters who reflex-pressed it to
+        // "deselect" with no panel open.
         KeyCode::Esc => match *mode {
-            Mode::Game => *running = false,
+            Mode::Game => {}
             _ => *mode = Mode::Game,
         },
         KeyCode::Char('s') | KeyCode::Char('S') => {

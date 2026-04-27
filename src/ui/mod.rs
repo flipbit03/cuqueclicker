@@ -7,12 +7,13 @@ pub mod hands;
 pub mod prestige;
 pub mod sidebar;
 pub mod stats;
+pub mod toast;
 pub mod upgrades;
 
 use ratatui::{prelude::*, widgets::*};
 
 use crate::format;
-use crate::game::state::{Buff, GameState, TICK_HZ};
+use crate::game::state::{Buff, GameState, HUD_FLASH_TICKS, TICK_HZ};
 use crate::i18n::t;
 
 // Hardcoded as "0.0.0" in source; release.yml patches Cargo.toml before
@@ -123,13 +124,29 @@ pub fn draw(
     ])
     .split(cols[0]);
 
-    let mut hud_spans: Vec<Span> = vec![Span::raw(format!(
-        "{}: {}   {}: {}",
-        lang.hud_cuques,
-        format::big(state.cuques),
-        lang.hud_fps,
-        format::rate(state.fps())
-    ))];
+    // J5 count-up: render the smoothed `displayed_*` values rather than the
+    // raw current values. Big jumps (golden, max-buy, F4) ease in instead of
+    // snapping. Tween itself runs in `state.tick()`.
+    let cuques_flash = (state.cuques_flash_ticks as f32 / HUD_FLASH_TICKS as f32).clamp(0.0, 1.0);
+    let cuques_style = if cuques_flash > 0.001 {
+        // Pulse digits toward green during the flash, ease back to white.
+        let g = 80.0 + 175.0 * cuques_flash;
+        let rb = (255.0 - 175.0 * cuques_flash) as u8;
+        Style::default()
+            .fg(Color::Rgb(rb, g.clamp(0.0, 255.0) as u8, rb))
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    let mut hud_spans: Vec<Span> = vec![
+        Span::raw(format!("{}: ", lang.hud_cuques)),
+        Span::styled(format::big(state.displayed_cuques), cuques_style),
+        Span::raw(format!(
+            "   {}: {}",
+            lang.hud_fps,
+            format::rate(state.displayed_fps)
+        )),
+    ];
     if state.prestige > 0 {
         hud_spans.push(Span::styled(
             format!(
@@ -181,9 +198,10 @@ pub fn draw(
     let hud = Paragraph::new(Line::from(hud_spans));
     frame.render_widget(hud, hud_inner);
 
-    let biscuit_rect = biscuit::draw(frame, left[1], state.clench_ticks > 0, zoom_idx);
+    let biscuit_rect = biscuit::draw(frame, left[1], state, zoom_idx);
     hands::draw(frame, left[1], biscuit_rect, state);
     effects::draw_particles(frame, biscuit_rect, &state.particles);
+    effects::draw_misclicks(frame, &state.misclick_particles);
     draw_zoom_indicator(
         frame,
         left[1],
@@ -197,6 +215,12 @@ pub fn draw(
         Some(g) => biscuit::draw_golden(frame, g, biscuit_rect),
         None => Rect::default(),
     };
+
+    // J1: achievement toast overlay. Lives in `left[1]` (biscuit/main area)
+    // so it covers nothing important on the right; auto-dismisses after
+    // TOAST_TICKS via the sim. We render *after* biscuit/golden so it
+    // always sits on top.
+    toast::draw(frame, left[1], state);
 
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::DarkGray))
