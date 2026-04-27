@@ -201,7 +201,11 @@ pub fn paint_border_flash(
         return;
     }
     let buf = frame.buffer_mut();
-    let phase = state.border_phase as f32;
+    // Use the steady phase clock so an active HUD-border event (Frenzy,
+    // Lucky, Achievement) accelerating the global `border_phase` doesn't
+    // also accelerate this panel border's wave. Each shimmer surface
+    // marches to its own beat.
+    let phase = state.steady_phase as f32;
     let last_x = area.x + area.width - 1;
     let last_y = area.y + area.height - 1;
 

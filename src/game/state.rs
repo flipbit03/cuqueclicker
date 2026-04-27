@@ -234,8 +234,21 @@ pub struct GameState {
     pub lucky_flash_ticks: u32,
     #[serde(skip)]
     pub achievement_flash_ticks: u32,
+    /// HUD title border phase clock. Advances by `border_speed()` each
+    /// tick, so the title border visibly speeds up under Frenzy / Lucky /
+    /// purchase events. INTENTIONALLY NOT shared with secondary shimmers
+    /// (panel borders, sidebar / upgrade rows) — they need a constant-rate
+    /// clock so a global speed-up on the HUD doesn't drag them along.
     #[serde(skip)]
     pub border_phase: u32,
+    /// Constant-rate phase clock for secondary shimmers — sidebar row,
+    /// upgrade row, and panel-border flashes. Advances by exactly 1 per
+    /// tick regardless of game state, so e.g. an Achievement / Frenzy
+    /// event accelerating `border_phase` doesn't accelerate the
+    /// "can't-buy" shimmer that happens to be running on a fingerer
+    /// row at the same time.
+    #[serde(skip)]
+    pub steady_phase: u32,
     #[serde(skip)]
     pub purchase_flash_ticks: u32,
     /// Strength multiplier (1.0..=3.0) for the most recent purchase flash,
@@ -320,6 +333,7 @@ impl Default for GameState {
             lucky_flash_ticks: 0,
             achievement_flash_ticks: 0,
             border_phase: 0,
+            steady_phase: 0,
             purchase_flash_ticks: 0,
             purchase_flash_strength: 1.0,
             fingerer_flash_ticks: vec![0; fingerer::count()],
@@ -742,6 +756,7 @@ impl GameState {
         }
         let speed = self.border_speed();
         self.border_phase = self.border_phase.wrapping_add(speed);
+        self.steady_phase = self.steady_phase.wrapping_add(1);
 
         let fps = self.fps();
         if fps > self.best_fps {

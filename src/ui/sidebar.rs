@@ -160,7 +160,10 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
     if area.width < 3 || area.height < 3 {
         return;
     }
-    let phase = state.border_phase as f32;
+    // Steady phase clock — independent of HUD-border speed-ups so an
+    // achievement / frenzy / lucky event firing on the title border
+    // doesn't drag the sidebar's "can't-buy" or "purchase" shimmer along.
+    let phase = state.steady_phase as f32;
     let inner_x = area.x + 1;
     let inner_y = area.y + 1;
     let inner_right = area.x + area.width - 1;
