@@ -979,11 +979,30 @@ impl GameState {
 
     pub fn cost(&self, idx: usize) -> f64 {
         let k = &FINGERERS[idx];
-        k.base_cost * k.cost_scale.powi(self.fingerer_count_idx(idx) as i32)
+        // Floor the result so the cost ALWAYS equals what `format::big`
+        // shows the player. The price formula scales by 1.15× per owned
+        // unit and produces fractional cuques (e.g. 15 × 1.15⁶ = 34.69).
+        // Without flooring, the HUD says "Cuques: 34, cost 34" but the
+        // affordability check `cuques >= 34.69` rejects — the player sees
+        // a lie. Floor here keeps display, gate, and spend consistent at
+        // the integer grain the player actually sees.
+        let raw = k.base_cost * k.cost_scale.powi(self.fingerer_count_idx(idx) as i32);
+        raw.floor()
     }
 
+    /// Affordability gate. Compares the DISPLAYED (count-up-tweened, then
+    /// floored) cuques against the cost so the row's red/green color and
+    /// the click-buy result both align with the value the player can
+    /// actually see on the HUD. Without this, a counter still ramping up
+    /// from "8" toward 17 would either:
+    ///
+    /// - show the row green prematurely (gate uses real >= cost while
+    ///   counter still says 8), or
+    /// - show the row red but a click would succeed anyway.
+    ///
+    /// Both confused playtesters; gating on displayed_cuques is honest.
     pub fn can_buy(&self, idx: usize) -> bool {
-        self.cuques >= self.cost(idx)
+        self.displayed_cuques.floor() >= self.cost(idx)
     }
 
     /// Buy a single unit. Bare mutation only — flash side-effects are
@@ -991,10 +1010,15 @@ impl GameState {
     /// bulk buy produce visually distinct feedback.
     fn buy_one_quiet(&mut self, idx: usize) -> bool {
         let c = self.cost(idx);
-        if self.cuques >= c
+        // Gate on displayed (matches `can_buy` and the cost color) so
+        // clicking a row only succeeds when it visibly looks affordable.
+        // Spend the cost from real cuques, then snap displayed = real so
+        // the post-buy HUD doesn't keep tweening into a stale value.
+        if self.displayed_cuques.floor() >= c
             && let Some(f) = FINGERERS.get(idx)
         {
             self.cuques -= c;
+            self.displayed_cuques = self.cuques;
             *self.fingerers_owned.entry(f.id.to_string()).or_insert(0) += 1;
             true
         } else {
@@ -1092,11 +1116,16 @@ impl GameState {
         if self.has_upgrade(u.id) {
             return false;
         }
-        if !u.req.met(self) || self.cuques < u.cost {
+        // Gate on displayed_cuques so visual and behavior match (see
+        // `can_buy` rationale). Snap displayed = real after a successful
+        // spend so the post-buy HUD doesn't keep ramping toward a stale
+        // pre-spend value.
+        if !u.req.met(self) || self.displayed_cuques.floor() < u.cost {
             self.flash_unaffordable_upgrade(idx);
             return false;
         }
         self.cuques -= u.cost;
+        self.displayed_cuques = self.cuques;
         self.upgrades_earned.insert(u.id.to_string());
         self.flash_purchase(idx, 1, PurchaseSlot::Upgrade);
         true
@@ -1260,8 +1289,13 @@ mod tests {
     fn bulk_buy_scales_purchase_flash_strength() {
         // J8: max-buy is louder than a +1. We don't pin exact values (clamp
         // boundaries are tuning), only the relative ordering and bounds.
+        // `displayed_cuques` must mirror `cuques` here because buy()'s
+        // affordability gate now reads displayed (matches the visible
+        // counter on the HUD) — a default-constructed test state has
+        // displayed=0 and would otherwise reject every buy.
         let mut s = GameState {
             cuques: 1_000_000.0,
+            displayed_cuques: 1_000_000.0,
             ..Default::default()
         };
         s.buy(0);
@@ -1270,6 +1304,7 @@ mod tests {
 
         let mut s = GameState {
             cuques: 1_000_000.0,
+            displayed_cuques: 1_000_000.0,
             ..Default::default()
         };
         s.buy_n(0, 50);

@@ -6,9 +6,6 @@ use crate::game::upgrade::{self, UPGRADES};
 use crate::i18n::t;
 use crate::ui::border;
 
-/// Per-row block height: hotkey+name, indented description, indented cost,
-/// blank separator. Used to compute click hit-test rects below.
-const ROWS_PER_UPGRADE: u16 = 4;
 /// Indent applied to wrapped continuation lines so a long description hangs
 /// under the title indent instead of falling back to col 0.
 const HANGING_INDENT: &str = "    ";
@@ -38,6 +35,14 @@ pub fn draw(
     let desc_width = area.width.saturating_sub(2 + HANGING_INDENT.len() as u16) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
+    // Track each rendered upgrade's row span as we go: (slot, content_start,
+    // content_height_excl_blank). Descriptions wrap to a variable line
+    // count via `wrap_hanging`, so the old `slot * ROWS_PER_UPGRADE`
+    // assumption was off-by-one whenever any earlier desc wrapped — the
+    // click hit-test would attribute the click to the next slot down.
+    // We compute exact starts here once and feed them to both the click
+    // router AND `paint_flashes`.
+    let mut row_spans: Vec<UpgradeRowSpan> = Vec::new();
 
     if visible.is_empty() {
         for l in lang.upgrades_none.lines() {
@@ -51,7 +56,9 @@ pub fn draw(
                 (b'1' + slot as u8) as char
             };
             let u = &UPGRADES[u_idx];
-            let affordable = state.cuques >= u.cost;
+            // Match `state::buy_upgrade`'s gate so the cost color and the
+            // click-buy outcome agree on what "affordable" means.
+            let affordable = state.displayed_cuques.floor() >= u.cost;
             let name = lang.upgrade_names.get(u_idx).copied().unwrap_or("?");
             let desc = lang.upgrade_descs.get(u_idx).copied().unwrap_or("");
             let cost_style = if affordable {
@@ -61,6 +68,8 @@ pub fn draw(
             } else {
                 Style::default().fg(Color::Rgb(220, 70, 70))
             };
+            // Record the line index where THIS upgrade's title starts.
+            let content_start = lines.len() as u16;
             lines.push(Line::from(vec![
                 Span::styled(format!("[{}] ", hotkey), Style::default().fg(Color::Yellow)),
                 Span::styled(
@@ -71,9 +80,10 @@ pub fn draw(
             // J13: pre-wrap with a hanging indent so wrapped lines align
             // under the title text. The panel renders with `Wrap { trim }`
             // disabled below, so each entry here is a finished line.
-            for desc_line in wrap_hanging(desc, desc_width) {
+            let wrapped = wrap_hanging(desc, desc_width);
+            for desc_line in &wrapped {
                 lines.push(Line::from(vec![Span::styled(
-                    desc_line,
+                    desc_line.clone(),
                     Style::default().fg(Color::DarkGray),
                 )]));
             }
@@ -81,14 +91,21 @@ pub fn draw(
                 Span::raw(HANGING_INDENT),
                 Span::styled(format!("{} {}", lang.cost, format::big(u.cost)), cost_style),
             ]));
-            lines.push(Line::raw(""));
+            // Content (clickable) height = title + N wrapped desc + cost.
+            let content_height = (1 + wrapped.len() as u16 + 1).max(1);
+            row_spans.push(UpgradeRowSpan {
+                u_idx,
+                content_start,
+                content_height,
+            });
+            lines.push(Line::raw("")); // blank separator (NOT clickable)
         }
     }
 
     let p = Paragraph::new(lines).block(Block::bordered().title(lang.upgrades_title));
     frame.render_widget(p, area);
 
-    paint_flashes(frame, area, state, &visible);
+    paint_flashes(frame, area, state, &row_spans);
 
     // Panel-border flash mirrors sidebar.rs: green on any active purchase
     // flash for visible upgrades, red on any active unaffordable flash.
@@ -131,13 +148,10 @@ pub fn draw(
         );
     }
 
-    // Build per-row click rects. Inside the bordered block: x+1 / y+1 origin,
-    // -2 width / -2 height. Each row block is 3 used lines + 1 blank; clicks
-    // anywhere on those 3 used lines trigger the buy. NB: long descriptions
-    // can wrap, but the headline (hotkey + name + cost block) is always
-    // ROWS_PER_UPGRADE rows in the source `lines`. Using ROWS_PER_UPGRADE-1
-    // (skip the trailing blank) keeps us conservative — clicks on the blank
-    // separator do nothing.
+    // Build per-row click rects from the SAME `row_spans` we collected
+    // during render — guarantees a click on row Y is attributed to the
+    // upgrade that actually drew at row Y, even when a previous upgrade's
+    // description wrapped to multiple lines.
     if area.width < 3 || area.height < 3 {
         return Vec::new();
     }
@@ -146,17 +160,16 @@ pub fn draw(
     let inner_w = area.width.saturating_sub(2);
     let inner_h = area.height.saturating_sub(2);
     let mut rows: Vec<(usize, Rect)> = Vec::new();
-    for (slot, &u_idx) in visible.iter().enumerate() {
-        let row_top = slot as u16 * ROWS_PER_UPGRADE;
-        if row_top >= inner_h {
+    for span in &row_spans {
+        if span.content_start >= inner_h {
             break;
         }
-        let height = (ROWS_PER_UPGRADE - 1).min(inner_h - row_top);
+        let height = span.content_height.min(inner_h - span.content_start);
         rows.push((
-            u_idx,
+            span.u_idx,
             Rect {
                 x: inner_x,
-                y: inner_y + row_top,
+                y: inner_y + span.content_start,
                 width: inner_w,
                 height,
             },
@@ -164,6 +177,17 @@ pub fn draw(
     }
     paint_hover(frame, &rows, mouse_pos);
     rows
+}
+
+/// Layout span for one rendered upgrade entry: the line index where its
+/// content starts (relative to the bordered block's interior), and how
+/// many lines the content covers (excluding the trailing blank separator).
+/// Computed per-frame from the actual rendered line count so wrapped
+/// descriptions don't desync the click hit-test from the visual layout.
+struct UpgradeRowSpan {
+    u_idx: usize,
+    content_start: u16,
+    content_height: u16,
 }
 
 /// Same hover-paint pattern as `sidebar::paint_hover`.
@@ -229,7 +253,7 @@ fn wrap_hanging(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[usize]) {
+fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, row_spans: &[UpgradeRowSpan]) {
     if area.width < 3 || area.height < 3 {
         return;
     }
@@ -245,17 +269,22 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
     let bulk_amp = state.purchase_flash_strength.clamp(1.0, 3.0);
     let buf = frame.buffer_mut();
 
-    for (slot, &u_idx) in visible.iter().enumerate() {
-        if slot >= 10 {
-            break;
-        }
-        let purchase_ticks = state.upgrade_flash_ticks.get(u_idx).copied().unwrap_or(0);
-        let unaff_ticks = state
-            .upgrade_unaffordable_flash
-            .get(u_idx)
+    for span in row_spans {
+        let purchase_ticks = state
+            .upgrade_flash_ticks
+            .get(span.u_idx)
             .copied()
             .unwrap_or(0);
-        let unlock_ticks = state.upgrade_unlock_flash.get(u_idx).copied().unwrap_or(0);
+        let unaff_ticks = state
+            .upgrade_unaffordable_flash
+            .get(span.u_idx)
+            .copied()
+            .unwrap_or(0);
+        let unlock_ticks = state
+            .upgrade_unlock_flash
+            .get(span.u_idx)
+            .copied()
+            .unwrap_or(0);
         let (strength, tint, amp) = if purchase_ticks > 0 {
             (
                 smoothstep(purchase_ticks as f32 / PURCHASE_FLASH_TICKS as f32),
@@ -280,11 +309,11 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
         if strength <= 0.001 {
             continue;
         }
-        let row_start = inner_y + slot as u16 * ROWS_PER_UPGRADE;
+        let row_start = inner_y + span.content_start;
         let carrier_r = FLASH_REST.0 + (FLASH_CARRIER.0 - FLASH_REST.0) * strength;
         let carrier_g = FLASH_REST.1 + (FLASH_CARRIER.1 - FLASH_REST.1) * strength;
         let carrier_b = FLASH_REST.2 + (FLASH_CARRIER.2 - FLASH_REST.2) * strength;
-        for dy in 0..3u16 {
+        for dy in 0..span.content_height {
             let row = row_start + dy;
             if row >= inner_bottom {
                 break;
