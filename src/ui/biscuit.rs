@@ -3,12 +3,12 @@ use ratatui::{prelude::*, widgets::*};
 use crate::game::golden::{GOLDEN_LIFE_TICKS, GoldenCuque, GoldenVariant};
 use crate::game::state::{Buff, CLENCH_SQUASH_TICKS, CLENCH_TICKS, GameState};
 
-/// Asshole-spin animation frames. Cycled by `total_clicks % 4` while clenched
-/// so spamming the spacebar makes the cuque rotate `\ | / -`. The default
-/// idle glyph is `O`; clenched-but-not-spinning is rendered by selecting
-/// the spin frame anyway, so every press swaps the glyph and the rotation
-/// reads as motion rather than a flicker.
-const SPIN_FRAMES: [char; 4] = ['\\', '|', '/', '-'];
+/// Asshole-spin animation frames. Cycled by `total_clicks % N` while a
+/// spacebar hold has been detected (≥1s of continuous repeat). `*` lands
+/// every 5th frame as a "flash" sparkle in the rotation so the cycle reads
+/// as an actually-spinning asshole occasionally bursting into a star,
+/// rather than four indistinguishable line strokes.
+const SPIN_FRAMES: [char; 5] = ['\\', '|', '/', '-', '*'];
 
 const BISCUIT_FULL: &[&str] = &[
     r"                    ____________________                    ",
