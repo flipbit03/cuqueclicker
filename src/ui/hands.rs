@@ -35,7 +35,6 @@ pub fn occupied_at(col: u16, row: u16, biscuit: Rect, state: &GameState) -> bool
         return false;
     }
 
-    let tick_phase = state.session_ticks / 5;
     let total = glyphs.len();
     let bx = biscuit.x as i32;
     let br = bx + biscuit.width as i32;
@@ -49,7 +48,17 @@ pub fn occupied_at(col: u16, row: u16, biscuit: Rect, state: &GameState) -> bool
         let angle = (slot as f32 / slot_count) * std::f32::consts::TAU
             + (ring as f32 * 0.15)
             + (*type_idx as f32 * 0.07);
-        let poke = if ((i * 7) as u64 + tick_phase).is_multiple_of(23) {
+        // Mirror the per-tier poke math from `draw()` exactly so a click
+        // landing on a hand-glyph cell at this frame is detected
+        // identically (otherwise the hit-test could drop just as the
+        // pulse pops the glyph inward).
+        let speed = FINGERERS
+            .get(*type_idx)
+            .map(|f| f.poke_speed.max(0.1))
+            .unwrap_or(1.0);
+        let tier_divisor = (5.0 / speed).max(1.0) as u64;
+        let tier_phase = state.session_ticks / tier_divisor;
+        let poke = if ((i * 7) as u64 + tier_phase).is_multiple_of(23) {
             1.2
         } else {
             0.0
@@ -97,7 +106,6 @@ pub fn draw(frame: &mut Frame, play_area: Rect, biscuit: Rect, state: &GameState
         return;
     }
 
-    let tick_phase = state.session_ticks / 5;
     let total = glyphs.len();
 
     for (i, (type_idx, icon)) in glyphs.iter().enumerate() {
@@ -107,7 +115,20 @@ pub fn draw(frame: &mut Frame, play_area: Rect, biscuit: Rect, state: &GameState
         let angle = (slot as f32 / slot_count) * std::f32::consts::TAU
             + (ring as f32 * 0.15)
             + (*type_idx as f32 * 0.07);
-        let poke = if ((i * 7) as u64 + tick_phase).is_multiple_of(23) {
+        // Per-tier poke timing: each fingerer tier carries its own
+        // `poke_speed` (1.0 = baseline). Tier-aware tick_phase = ticks
+        // divided by a per-tier divisor — high speed = small divisor =
+        // fast pulse; low speed = big divisor = slow majestic pulse.
+        // Hand of God ends up ~10× slower than Index Finger, so a heavy
+        // crust of HoG pulses with statelier authority while finger-tier
+        // hands twitch fast.
+        let speed = FINGERERS
+            .get(*type_idx)
+            .map(|f| f.poke_speed.max(0.1))
+            .unwrap_or(1.0);
+        let tier_divisor = (5.0 / speed).max(1.0) as u64;
+        let tier_phase = state.session_ticks / tier_divisor;
+        let poke = if ((i * 7) as u64 + tier_phase).is_multiple_of(23) {
             1.2
         } else {
             0.0
