@@ -1,7 +1,7 @@
 use ratatui::{prelude::*, widgets::*};
 
 use crate::format;
-use crate::game::state::{GameState, PURCHASE_FLASH_TICKS};
+use crate::game::state::{GameState, PURCHASE_FLASH_TICKS, UNLOCK_FLASH_TICKS};
 use crate::game::upgrade::{self, UPGRADES};
 use crate::i18n::t;
 use crate::ui::border;
@@ -14,6 +14,7 @@ const ROWS_PER_UPGRADE: u16 = 4;
 const HANGING_INDENT: &str = "    ";
 const FLASH_TINT: (f32, f32, f32) = (40.0, 230.0, 80.0);
 const UNAFFORDABLE_TINT: (f32, f32, f32) = (255.0, 60.0, 60.0);
+const UNLOCK_TINT: (f32, f32, f32) = (120.0, 255.0, 140.0);
 const FLASH_REST: (f32, f32, f32) = (200.0, 200.0, 210.0);
 const FLASH_CARRIER: (f32, f32, f32) = (255.0, 255.0, 255.0);
 const FLASH_CYCLE: f32 = 11.0;
@@ -22,7 +23,12 @@ const FLASH_CYCLE: f32 = 11.0;
 /// and the click-target rect on screen. Aligned 1:1 with the rendered
 /// rows, so the click router can map a click coordinate to an
 /// `Action::BuyUpgrade(idx)` without re-parsing the panel layout.
-pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rect)> {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    state: &GameState,
+    mouse_pos: Option<(u16, u16)>,
+) -> Vec<(usize, Rect)> {
     let lang = t();
     let available = upgrade::available_ids(state);
     let visible: Vec<usize> = available.iter().take(10).copied().collect();
@@ -156,7 +162,42 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
             },
         ));
     }
+    paint_hover(frame, &rows, mouse_pos);
     rows
+}
+
+/// Same hover-paint pattern as `sidebar::paint_hover`.
+fn paint_hover(frame: &mut Frame, rows: &[(usize, Rect)], mouse_pos: Option<(u16, u16)>) {
+    let Some((mx, my)) = mouse_pos else { return };
+    let Some(&(_, r)) = rows
+        .iter()
+        .find(|&&(_, r)| mx >= r.x && mx < r.x + r.width && my >= r.y && my < r.y + r.height)
+    else {
+        return;
+    };
+    let buf = frame.buffer_mut();
+    for dy in 0..r.height {
+        let y = r.y + dy;
+        if y >= buf.area.y + buf.area.height {
+            break;
+        }
+        for dx in 0..r.width {
+            let x = r.x + dx;
+            if x >= buf.area.x + buf.area.width {
+                break;
+            }
+            let cell = &mut buf[(x, y)];
+            if let Color::Rgb(r, g, b) = cell.fg {
+                cell.set_fg(Color::Rgb(
+                    (r as u16 + 30).min(255) as u8,
+                    (g as u16 + 30).min(255) as u8,
+                    (b as u16 + 30).min(255) as u8,
+                ));
+            }
+            cell.modifier.insert(Modifier::BOLD);
+            cell.set_bg(Color::Rgb(28, 28, 36));
+        }
+    }
 }
 
 /// Word-wrap `text` at `width` columns, prepending `HANGING_INDENT` to every
@@ -214,6 +255,7 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
             .get(u_idx)
             .copied()
             .unwrap_or(0);
+        let unlock_ticks = state.upgrade_unlock_flash.get(u_idx).copied().unwrap_or(0);
         let (strength, tint, amp) = if purchase_ticks > 0 {
             (
                 smoothstep(purchase_ticks as f32 / PURCHASE_FLASH_TICKS as f32),
@@ -224,6 +266,12 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
             (
                 smoothstep(unaff_ticks as f32 / (PURCHASE_FLASH_TICKS as f32 / 2.0)),
                 UNAFFORDABLE_TINT,
+                1.0,
+            )
+        } else if unlock_ticks > 0 {
+            (
+                smoothstep(unlock_ticks as f32 / UNLOCK_FLASH_TICKS as f32),
+                UNLOCK_TINT,
                 1.0,
             )
         } else {

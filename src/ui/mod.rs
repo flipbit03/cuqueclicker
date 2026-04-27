@@ -110,6 +110,7 @@ pub fn draw(
     mode: Mode,
     zoom_idx: usize,
     debug: bool,
+    mouse_pos: Option<(u16, u16)>,
 ) -> DrawOutput {
     let lang = t();
     let area = frame.area();
@@ -236,10 +237,10 @@ pub fn draw(
     let mut upgrade_rows: Vec<(usize, Rect)> = Vec::new();
     let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
     match mode {
-        Mode::Game => fingerer_rows = sidebar::draw(frame, cols[1], state),
+        Mode::Game => fingerer_rows = sidebar::draw(frame, cols[1], state, mouse_pos),
         Mode::Stats => stats::draw(frame, cols[1], state),
         Mode::Achievements => achievements::draw(frame, cols[1], state),
-        Mode::Upgrades => upgrade_rows = upgrades::draw(frame, cols[1], state),
+        Mode::Upgrades => upgrade_rows = upgrades::draw(frame, cols[1], state, mouse_pos),
         Mode::Prestige => prestige::draw(frame, cols[1], state),
     }
 

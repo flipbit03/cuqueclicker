@@ -177,6 +177,10 @@ impl App {
         let mut biscuit_rect = Rect::default();
         let mut golden_rect = Rect::default();
         let mut play_area = Rect::default();
+        // K5: latest mouse position seen via crossterm's `MouseEventKind::Moved`.
+        // Lives on main only — render-time transient, not persisted, never sent
+        // to the sim. `ui::draw` consumes it to highlight the hovered row.
+        let mut last_mouse_pos: Option<(u16, u16)> = None;
 
         while running && !shutdown.load(Ordering::Relaxed) {
             // Drain any panel/quit requests from the demo driver before we draw,
@@ -190,7 +194,7 @@ impl App {
 
             let current = snapshot.load_full();
             terminal.draw(|f| {
-                let out = ui::draw(f, &current, mode, zoom_idx, debug);
+                let out = ui::draw(f, &current, mode, zoom_idx, debug, last_mouse_pos);
                 biscuit_rect = out.biscuit_rect;
                 golden_rect = out.golden_rect;
                 play_area = out.play_area;
@@ -220,6 +224,7 @@ impl App {
                         biscuit_rect,
                         golden_rect,
                         play_area,
+                        &mut last_mouse_pos,
                     );
                     if !event::poll(Duration::ZERO)? {
                         break;
@@ -559,6 +564,7 @@ fn handle_event(
     biscuit_rect: Rect,
     golden_rect: Rect,
     play_area: Rect,
+    last_mouse_pos: &mut Option<(u16, u16)>,
 ) {
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(
@@ -573,6 +579,7 @@ fn handle_event(
             current,
         ),
         Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+            *last_mouse_pos = Some((m.column, m.row));
             handle_click(
                 m.column,
                 m.row,
@@ -592,6 +599,7 @@ fn handle_event(
         // biscuit / golden / dead zone it's a no-op so misclick acks
         // don't fire and confuse the user.
         Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Right) => {
+            *last_mouse_pos = Some((m.column, m.row));
             handle_click(
                 m.column,
                 m.row,
@@ -620,6 +628,19 @@ fn handle_event(
             if m.kind == MouseEventKind::ScrollDown && in_play_area(m.column, m.row, play_area) =>
         {
             *zoom_idx = (*zoom_idx + 1).min(crate::ui::biscuit::level_count() - 1);
+        }
+        // K5: track mouse position for hover highlighting. Crossterm only
+        // emits Moved/Drag events when AnyMotion mouse mode is enabled
+        // (it is). The renderer reads `last_mouse_pos` to highlight the
+        // hovered row in sidebar/upgrades; missing or stale positions
+        // simply don't highlight anything.
+        Event::Mouse(m)
+            if matches!(
+                m.kind,
+                MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left)
+            ) =>
+        {
+            *last_mouse_pos = Some((m.column, m.row));
         }
         _ => {}
     }

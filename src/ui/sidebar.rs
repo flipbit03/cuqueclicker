@@ -2,13 +2,17 @@ use ratatui::{prelude::*, widgets::*};
 
 use crate::format;
 use crate::game::fingerer::{self, FINGERERS};
-use crate::game::state::{GameState, PURCHASE_FLASH_TICKS};
+use crate::game::state::{GameState, PURCHASE_FLASH_TICKS, UNLOCK_FLASH_TICKS};
 use crate::i18n::t;
 use crate::ui::border;
 
 const ROWS_PER_FINGERER: u16 = 4;
 const FLASH_TINT: (f32, f32, f32) = (40.0, 230.0, 80.0);
 const UNAFFORDABLE_TINT: (f32, f32, f32) = (255.0, 60.0, 60.0);
+/// Brighter, more saturated green for the "now affordable!" one-shot —
+/// sits a notch above the regular purchase flash hue so the player can
+/// tell the two events apart on glance.
+const UNLOCK_TINT: (f32, f32, f32) = (120.0, 255.0, 140.0);
 // Resting color the flash starts from / returns to (neutral gray similar to
 // default terminal text, so the transition in and out is gentle).
 const FLASH_REST: (f32, f32, f32) = (200.0, 200.0, 210.0);
@@ -21,7 +25,12 @@ const FLASH_CYCLE: f32 = 11.0;
 /// and the click-target rect on screen. Aligned 1:1 with the rendered rows
 /// so the click router can map a click coordinate to an
 /// `Action::BuyFingerer` without re-parsing the panel layout.
-pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rect)> {
+pub fn draw(
+    frame: &mut Frame,
+    area: Rect,
+    state: &GameState,
+    mouse_pos: Option<(u16, u16)>,
+) -> Vec<(usize, Rect)> {
     let lang = t();
     let mut lines: Vec<Line> = Vec::new();
     let visible: Vec<usize> = (0..FINGERERS.len())
@@ -153,7 +162,50 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) -> Vec<(usize, Rec
             },
         ));
     }
+    paint_hover(frame, &rows, mouse_pos);
     rows
+}
+
+/// Paint a subtle brightness lift on whichever row the mouse is currently
+/// over. Only the cells that already have content keep their styled
+/// foreground; this just bumps brightness, so a hovered row reads as
+/// "live" without changing the underlying color hierarchy. Cheap: at
+/// most 10 rows × ~36 cols × 3 lines = ~1k cells per hover frame.
+fn paint_hover(frame: &mut Frame, rows: &[(usize, Rect)], mouse_pos: Option<(u16, u16)>) {
+    let Some((mx, my)) = mouse_pos else { return };
+    let Some(&(_, r)) = rows
+        .iter()
+        .find(|&&(_, r)| mx >= r.x && mx < r.x + r.width && my >= r.y && my < r.y + r.height)
+    else {
+        return;
+    };
+    let buf = frame.buffer_mut();
+    for dy in 0..r.height {
+        let y = r.y + dy;
+        if y >= buf.area.y + buf.area.height {
+            break;
+        }
+        for dx in 0..r.width {
+            let x = r.x + dx;
+            if x >= buf.area.x + buf.area.width {
+                break;
+            }
+            let cell = &mut buf[(x, y)];
+            // Lift the existing fg by a fixed amount and ensure BOLD.
+            // The cell's fg may already be tinted (cost-color, flash, etc) —
+            // brightening it preserves hue but makes the row pop.
+            if let Color::Rgb(r, g, b) = cell.fg {
+                cell.set_fg(Color::Rgb(
+                    (r as u16 + 30).min(255) as u8,
+                    (g as u16 + 30).min(255) as u8,
+                    (b as u16 + 30).min(255) as u8,
+                ));
+            }
+            cell.modifier.insert(Modifier::BOLD);
+            // Subtle bg tint so even blank cells in the row signal "hover."
+            cell.set_bg(Color::Rgb(28, 28, 36));
+        }
+    }
 }
 
 fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[usize]) {
@@ -189,12 +241,17 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
             .get(fingerer_idx)
             .copied()
             .unwrap_or(0);
-        // Per-row tint priority: green purchase wins over red unaffordable
-        // when both happen to be running (e.g. user clicked unaffordable,
-        // then bought 1 of an affordable adjacent fingerer that aliased on
-        // index — defensive only). `strength` here is the carrier blend
-        // factor (timing only, 0..1); `amp` boosts the wave's tint
-        // contribution for bulk buys.
+        let unlock_ticks = state
+            .fingerer_unlock_flash
+            .get(fingerer_idx)
+            .copied()
+            .unwrap_or(0);
+        // Per-row tint priority:
+        //   purchase    (you just bought)        — wins, longest, with bulk amp
+        //   unaffordable (you tried + failed)    — wins over unlock
+        //   unlock      (just became affordable) — quietly announces the row
+        // `strength` is the carrier blend (timing only, 0..1); `amp`
+        // boosts the wave's tint contribution for bulk buys.
         let (strength, tint, amp) = if purchase_ticks > 0 {
             (
                 smoothstep(purchase_ticks as f32 / PURCHASE_FLASH_TICKS as f32),
@@ -205,6 +262,12 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
             (
                 smoothstep(unaff_ticks as f32 / (PURCHASE_FLASH_TICKS as f32 / 2.0)),
                 UNAFFORDABLE_TINT,
+                1.0,
+            )
+        } else if unlock_ticks > 0 {
+            (
+                smoothstep(unlock_ticks as f32 / UNLOCK_FLASH_TICKS as f32),
+                UNLOCK_TINT,
                 1.0,
             )
         } else {

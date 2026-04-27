@@ -29,6 +29,11 @@ pub const HUD_FLASH_TICKS: u32 = TICK_HZ; // 1s
 /// Achievement-unlock border channel duration (gold pulse like Lucky but
 /// shorter — celebratory, not lingering).
 pub const ACHIEVEMENT_FLASH_TICKS: u32 = TICK_HZ * 2;
+/// "You can afford this now!" row flash — fires the moment a fingerer or
+/// upgrade transitions from unaffordable to affordable. Brief on purpose:
+/// short enough that it's clearly an "announcement," not the longer
+/// purchase flash that fires on actual buy.
+pub const UNLOCK_FLASH_TICKS: u32 = TICK_HZ / 2; // 0.5s
 /// Per-tick upward drift for a particle, expressed as a fraction of the
 /// biscuit's height. Calibrated to match the original feel before the
 /// switch to fractional anchors: the old code rose 0.18 cells/tick on
@@ -270,6 +275,24 @@ pub struct GameState {
     pub fingerer_unaffordable_flash: Vec<u32>,
     #[serde(skip)]
     pub upgrade_unaffordable_flash: Vec<u32>,
+    /// "Just became affordable" flash: a brief one-shot green shimmer
+    /// fired the tick a row's affordability flips false → true. Distinct
+    /// from `*_flash_ticks` (purchase) — shorter duration, no panel
+    /// border bleed — so the player can tell "now buyable" apart from
+    /// "you just bought."
+    #[serde(skip)]
+    pub fingerer_unlock_flash: Vec<u32>,
+    #[serde(skip)]
+    pub upgrade_unlock_flash: Vec<u32>,
+    /// Previous-tick affordability per row, used to detect the
+    /// false→true edge that triggers `*_unlock_flash`. Sized to catalog
+    /// length by `migrate()` and seeded at init from the live state, so a
+    /// freshly-loaded save with rows already affordable doesn't fire a
+    /// fake unlock flash on tick 1.
+    #[serde(skip)]
+    pub prev_fingerer_affordable: Vec<bool>,
+    #[serde(skip)]
+    pub prev_upgrade_affordable: Vec<bool>,
     /// Held-spacebar tracking.
     ///
     /// `space_pressed_this_tick` is set whenever `Action::ClickCenter`
@@ -340,6 +363,10 @@ impl Default for GameState {
             upgrade_flash_ticks: vec![0; UPGRADES.len()],
             fingerer_unaffordable_flash: vec![0; fingerer::count()],
             upgrade_unaffordable_flash: vec![0; UPGRADES.len()],
+            fingerer_unlock_flash: vec![0; fingerer::count()],
+            upgrade_unlock_flash: vec![0; UPGRADES.len()],
+            prev_fingerer_affordable: vec![false; fingerer::count()],
+            prev_upgrade_affordable: vec![false; UPGRADES.len()],
             space_pressed_this_tick: false,
             ticks_since_last_press: u32::MAX,
             space_hold_ticks: 0,
@@ -369,6 +396,27 @@ impl GameState {
         }
         if self.upgrade_unaffordable_flash.len() != UPGRADES.len() {
             self.upgrade_unaffordable_flash = vec![0; UPGRADES.len()];
+        }
+        if self.fingerer_unlock_flash.len() != fingerer::count() {
+            self.fingerer_unlock_flash = vec![0; fingerer::count()];
+        }
+        if self.upgrade_unlock_flash.len() != UPGRADES.len() {
+            self.upgrade_unlock_flash = vec![0; UPGRADES.len()];
+        }
+        // Seed `prev_affordable` from the LIVE state so a freshly-loaded
+        // save with rows already affordable doesn't fire spurious unlock
+        // flashes on tick 1. Resize if catalog grew/shrank.
+        if self.prev_fingerer_affordable.len() != fingerer::count() {
+            self.prev_fingerer_affordable =
+                (0..fingerer::count()).map(|i| self.can_buy(i)).collect();
+        }
+        if self.prev_upgrade_affordable.len() != UPGRADES.len() {
+            self.prev_upgrade_affordable = (0..UPGRADES.len())
+                .map(|i| {
+                    let u = &UPGRADES[i];
+                    !self.has_upgrade(u.id) && u.req.met(&self) && self.cuques >= u.cost
+                })
+                .collect();
         }
         if self.golden_cooldown == 0 {
             self.golden_cooldown = crate::game::golden::next_cooldown();
@@ -733,6 +781,12 @@ impl GameState {
         for t in self.upgrade_unaffordable_flash.iter_mut() {
             *t = t.saturating_sub(1);
         }
+        for t in self.fingerer_unlock_flash.iter_mut() {
+            *t = t.saturating_sub(1);
+        }
+        for t in self.upgrade_unlock_flash.iter_mut() {
+            *t = t.saturating_sub(1);
+        }
         // Held-spacebar streak with a small grace window. Real key-repeat
         // is bursty (~30Hz nominal but with OS-level jitter), so a strict
         // "every tick must see a press" test breaks on a single missed
@@ -778,6 +832,49 @@ impl GameState {
             m.life = m.life.saturating_sub(1);
         }
         self.misclick_particles.retain(|m| m.life > 0);
+
+        // K7: edge-detect false→true affordability flips and fire a brief
+        // unlock flash on the row. Detection runs AFTER `add_cuques(gained)`
+        // so an income-driven crossover lights up immediately. Two-pass to
+        // keep the immutable reads (`can_buy`, `req.met`, etc.) cleanly
+        // separated from the mutable writes to the flash + prev vecs.
+        let fingerer_now: Vec<bool> = (0..fingerer::count()).map(|i| self.can_buy(i)).collect();
+        let upgrade_now: Vec<bool> = UPGRADES
+            .iter()
+            .map(|u| !self.has_upgrade(u.id) && u.req.met(self) && self.cuques >= u.cost)
+            .collect();
+        for (i, &now) in fingerer_now.iter().enumerate() {
+            let was = self
+                .prev_fingerer_affordable
+                .get(i)
+                .copied()
+                .unwrap_or(false);
+            if now
+                && !was
+                && let Some(slot) = self.fingerer_unlock_flash.get_mut(i)
+            {
+                *slot = UNLOCK_FLASH_TICKS;
+            }
+            if let Some(slot) = self.prev_fingerer_affordable.get_mut(i) {
+                *slot = now;
+            }
+        }
+        for (i, &now) in upgrade_now.iter().enumerate() {
+            let was = self
+                .prev_upgrade_affordable
+                .get(i)
+                .copied()
+                .unwrap_or(false);
+            if now
+                && !was
+                && let Some(slot) = self.upgrade_unlock_flash.get_mut(i)
+            {
+                *slot = UNLOCK_FLASH_TICKS;
+            }
+            if let Some(slot) = self.prev_upgrade_affordable.get_mut(i) {
+                *slot = now;
+            }
+        }
 
         // Count-up tween: rendered numbers chase the real ones with
         // ease-out. Big jumps (golden, F4, max-buy) take ~10-12 frames
