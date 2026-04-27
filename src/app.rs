@@ -575,6 +575,7 @@ fn handle_event(
                 golden_rect,
                 fingerer_rows,
                 upgrade_rows,
+                current,
             );
         }
         // J15: right-click is a "buy max" affordance for fingerer/upgrade
@@ -593,6 +594,7 @@ fn handle_event(
                 golden_rect,
                 fingerer_rows,
                 upgrade_rows,
+                current,
             );
         }
         // Scroll wheel zooms the biscuit ONLY when the cursor is over the
@@ -666,6 +668,7 @@ fn handle_click(
     golden: Rect,
     fingerer_rows: &[(usize, Rect)],
     upgrade_rows: &[(usize, Rect)],
+    current: &GameState,
 ) {
     // Golden cuques are catchable from ANY panel — match the keyboard 'g'
     // behavior, which has no mode guard. The marker still renders on the
@@ -717,11 +720,19 @@ fn handle_click(
     }
     // J10: nothing actionable under the click. Acknowledge it visually with
     // a brief "·" so the dead-zone (e.g. the air around a 25%-zoom biscuit)
-    // doesn't feel inert. Skip when the click was right-button on a
-    // non-row area — right-click without a target is a true no-op.
-    if button == MouseButton::Left {
-        let _ = tx.send(Action::Misclick { col, row });
+    // doesn't feel inert. Skip when:
+    //   - the click was right-button (right-click without a target is a
+    //     true no-op);
+    //   - the click landed on an orbital hand glyph — those are decoration,
+    //     not click targets, but they're visually present, so a misclick
+    //     "·" replacing part of `[]` / `:*` / `>>` reads as flicker.
+    if button != MouseButton::Left {
+        return;
     }
+    if crate::ui::hands::occupied_at(col, row, biscuit, current) {
+        return;
+    }
+    let _ = tx.send(Action::Misclick { col, row });
 }
 
 #[allow(clippy::too_many_arguments)]

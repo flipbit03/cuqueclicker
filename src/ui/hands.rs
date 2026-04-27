@@ -6,6 +6,75 @@ use crate::game::state::GameState;
 const PER_TYPE_CAP: usize = 40;
 const PER_RING: usize = 48;
 
+/// True when `(col, row)` falls on a cell currently occupied by an orbital
+/// hand glyph. Used by the click router so a click landing on a `[]` or
+/// `:*` decoration outside the biscuit is treated as a no-op rather than a
+/// misclick (otherwise the misclick "·" briefly replaces the glyph and
+/// reads as flicker).
+///
+/// Mirrors the placement math in `draw()` exactly — keep in sync if either
+/// changes. Cheap: at most `PER_TYPE_CAP * FINGERERS.len()` hand
+/// candidates, and we early-return on the first match.
+pub fn occupied_at(col: u16, row: u16, biscuit: Rect, state: &GameState) -> bool {
+    if biscuit.width == 0 || biscuit.height == 0 {
+        return false;
+    }
+    let cx = biscuit.x as f32 + biscuit.width as f32 / 2.0;
+    let cy = biscuit.y as f32 + biscuit.height as f32 / 2.0;
+    let base_rx = (biscuit.width as f32 / 2.0 + 3.0).max(6.0);
+    let base_ry = (biscuit.height as f32 / 2.0 + 2.0).max(3.0);
+
+    let mut glyphs: Vec<(usize, &str)> = Vec::new();
+    for (idx, f) in FINGERERS.iter().enumerate() {
+        let n = (state.fingerer_count(f.id) as usize).min(PER_TYPE_CAP);
+        for _ in 0..n {
+            glyphs.push((idx, f.icon));
+        }
+    }
+    if glyphs.is_empty() {
+        return false;
+    }
+
+    let tick_phase = state.session_ticks / 5;
+    let total = glyphs.len();
+    let bx = biscuit.x as i32;
+    let br = bx + biscuit.width as i32;
+    let by = biscuit.y as i32;
+    let bb = by + biscuit.height as i32;
+
+    for (i, (type_idx, icon)) in glyphs.iter().enumerate() {
+        let ring = i / PER_RING;
+        let slot = i % PER_RING;
+        let slot_count = ((total - ring * PER_RING).min(PER_RING)) as f32;
+        let angle = (slot as f32 / slot_count) * std::f32::consts::TAU
+            + (ring as f32 * 0.15)
+            + (*type_idx as f32 * 0.07);
+        let poke = if ((i * 7) as u64 + tick_phase).is_multiple_of(23) {
+            1.2
+        } else {
+            0.0
+        };
+        let rx = base_rx + ring as f32 * 4.0 - poke;
+        let ry = base_ry + ring as f32 * 2.0 - poke * 0.5;
+        let px = cx + rx * angle.cos();
+        let py = cy + ry * angle.sin();
+        let g_col = px.round() as i32;
+        let g_row = py.round() as i32;
+
+        let icon_w = icon.chars().count() as i32;
+        // Hands inside the biscuit footprint aren't drawn (they get
+        // suppressed in `draw`) — don't count them as occupied.
+        if g_row >= by && g_row < bb && g_col < br && g_col + icon_w > bx {
+            continue;
+        }
+        // The glyph occupies cells [g_col, g_col + icon_w) on row g_row.
+        if (row as i32) == g_row && (col as i32) >= g_col && (col as i32) < g_col + icon_w {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn draw(frame: &mut Frame, play_area: Rect, biscuit: Rect, state: &GameState) {
     if play_area.width == 0 || play_area.height == 0 {
         return;
