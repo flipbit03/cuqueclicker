@@ -416,10 +416,14 @@ pub fn draw_golden(frame: &mut Frame, golden: &GoldenCuque, biscuit: Rect) -> Re
         ),
     };
 
-    // Wave speed (rad/tick) and trough depth both bump in alarm mode.
+    // Wave speed (rad/tick) and trough depth both bump in alarm mode. The
+    // normal phase pulses at ~1.9 Hz (0.6 rad/tick × 20 ticks/s ÷ TAU);
+    // the alarm phase doubles to ~4.8 Hz so a soon-to-expire golden
+    // visibly speeds up. Earlier values (0.22 / 0.55) read as too sleepy
+    // — easy to miss the marker pulsing at all on a single playthrough.
     let life_frac = (golden.life_ticks as f32 / GOLDEN_LIFE_TICKS as f32).clamp(0.0, 1.0);
     let alarm = life_frac < 0.20;
-    let speed = if alarm { 0.55 } else { 0.22 };
+    let speed = if alarm { 1.5 } else { 0.6 };
     let dim_pull = if alarm { 1.0 } else { 0.6 };
     // Phase advances every tick; per-cell offset shifts the wave across the
     // 5-cell width so neighbors land at different points of the gradient.
