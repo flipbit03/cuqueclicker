@@ -325,6 +325,11 @@ fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometry) {
             if r.width > 0 && r.height > 0 {
                 state.click((r.x + r.width / 2, r.y + r.height / 2), r);
             }
+            // Mark this tick as "saw a spacebar press." `tick()` reads the
+            // flag, advances the held-streak counter, and clears it. A
+            // single tap → 1 tick of streak → resets immediately. A held
+            // key (terminal repeat) → streak climbs over time.
+            state.space_pressed_this_tick = true;
         }
         Action::CatchGolden => {
             state.catch_golden();

@@ -228,20 +228,32 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
         height: stable_rect.height,
     };
 
-    // Spin animation: while clenched, swap the `O` for one of `\ | / -`
-    // picked by `total_clicks % 4`. Spamming spacebar makes the asshole
-    // visibly rotate — every press advances the frame by one step. When
-    // not clenched, the resting `O` is shown.
-    let spin_glyph = if clenched {
+    // Asshole glyph picker:
+    //  - not clenched              → resting `O`
+    //  - clenched, space NOT held  → burning `*` (overpainted with a
+    //                                pulsing red glow further down)
+    //  - clenched, space HELD ≥ 1s → spin frame `\ | / -`, advanced by
+    //                                `total_clicks % 4` so each repeat tick
+    //                                rotates one step.
+    //
+    // The hold gate (`state.space_held()`) is driven by sim-side tracking
+    // of consecutive ClickCenter actions across ticks — terminal key-repeat
+    // produces a Press event ~30Hz, so a held key reliably bumps a streak
+    // counter every 50ms tick. Spamming-and-releasing taps stays at low
+    // streak values and never crosses the 1-second threshold.
+    let space_held = state.space_held();
+    let asshole_glyph: char = if !clenched {
+        'O'
+    } else if space_held {
         SPIN_FRAMES[(state.total_clicks as usize) % SPIN_FRAMES.len()]
     } else {
-        'O'
+        '*'
     };
     let lines: Vec<Line> = render_art
         .iter()
         .map(|s| {
             if clenched {
-                Line::from(s.replace('O', &spin_glyph.to_string()))
+                Line::from(s.replace('O', &asshole_glyph.to_string()))
             } else {
                 Line::from(s.to_string())
             }
@@ -275,6 +287,44 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
     let color = Color::Rgb(base.0 as u8, base.1 as u8, base.2 as u8);
     let p = Paragraph::new(lines).style(Style::default().fg(color));
     frame.render_widget(p, render_rect);
+
+    // "Burning asshole" overpaint: while clenched, repaint the asshole cell
+    // itself with a hot, pulsing red tone so the `*` (or spin frame) reads
+    // as actually-on-fire, distinct from the rest of the cuque body. The
+    // cuque body color (the `base` above) only goes mildly pink on clench;
+    // this overpaint takes the focal cell all the way to red+orange and
+    // pulses fast (~5Hz) so it reads as aggressive heat.
+    if clenched {
+        let buf = frame.buffer_mut();
+        // Find the asshole row inside the rendered art (it can move when
+        // the squash transform pads with a blank top row, so we can't just
+        // read level metadata).
+        let glyph_str = asshole_glyph.to_string();
+        let asshole_row_in_art = render_art
+            .iter()
+            .position(|s| s.contains('O') || s.contains(&glyph_str));
+        if let Some(art_row) = asshole_row_in_art {
+            let cx = render_rect.x + level.asshole_col;
+            let cy = render_rect.y + art_row as u16;
+            if cx < buf.area.x + buf.area.width && cy < buf.area.y + buf.area.height {
+                // Pulse: ~5Hz at 20Hz tick rate (period ~4 ticks).
+                let phase = (state.session_ticks as f32) * 0.8;
+                let pulse = (phase.sin() + 1.0) * 0.5; // 0..1
+                // Sweep r:255 (peak) → r:200 (trough); g sweeps 30→90 to add
+                // an orange highlight on the peaks rather than dimming red.
+                let r = (200.0 + 55.0 * pulse) as u8;
+                let g = (30.0 + 60.0 * pulse) as u8;
+                let b = 0;
+                let cell = &mut buf[(cx, cy)];
+                cell.set_char(asshole_glyph);
+                cell.set_style(
+                    Style::default()
+                        .fg(Color::Rgb(r, g, b))
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+        }
+    }
     // Return the STABLE rect so hands / particles / golden see a steady
     // biscuit position even when render_rect was shifted by the Frenzy
     // shake or vertically squeezed by the squash padding.

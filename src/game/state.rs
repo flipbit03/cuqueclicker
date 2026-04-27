@@ -257,6 +257,26 @@ pub struct GameState {
     pub fingerer_unaffordable_flash: Vec<u32>,
     #[serde(skip)]
     pub upgrade_unaffordable_flash: Vec<u32>,
+    /// Held-spacebar tracking.
+    ///
+    /// `space_pressed_this_tick` is set whenever `Action::ClickCenter`
+    /// arrives (terminal key-repeat fires Press events at ~30Hz, easily
+    /// hitting every 50ms tick when a key is genuinely held).
+    /// `ticks_since_last_press` is a small countdown that allows up to 3
+    /// missed ticks (~150ms) before declaring the key released — handles
+    /// real keyboard-repeat jitter so a 1-tick gap doesn't kill the
+    /// streak. `space_hold_ticks` is the consecutive "active" tick streak;
+    /// `space_held()` is true once it crosses 1 second.
+    ///
+    /// Net result: spamming spacebar at human speed (≥150ms between
+    /// presses) never triggers held; actually holding the key climbs the
+    /// streak past 20 ticks within ~1s.
+    #[serde(skip)]
+    pub space_pressed_this_tick: bool,
+    #[serde(skip)]
+    pub ticks_since_last_press: u32,
+    #[serde(skip)]
+    pub space_hold_ticks: u32,
     /// HUD count-up tween: rendered numbers smoothly chase the real ones.
     /// Initialized to the live values on load so the first frame doesn't
     /// look like a count-up from zero.
@@ -306,6 +326,9 @@ impl Default for GameState {
             upgrade_flash_ticks: vec![0; UPGRADES.len()],
             fingerer_unaffordable_flash: vec![0; fingerer::count()],
             upgrade_unaffordable_flash: vec![0; UPGRADES.len()],
+            space_pressed_this_tick: false,
+            ticks_since_last_press: u32::MAX,
+            space_hold_ticks: 0,
             displayed_cuques: 0.0,
             displayed_fps: 0.0,
             cuques_flash_ticks: 0,
@@ -696,6 +719,27 @@ impl GameState {
         for t in self.upgrade_unaffordable_flash.iter_mut() {
             *t = t.saturating_sub(1);
         }
+        // Held-spacebar streak with a small grace window. Real key-repeat
+        // is bursty (~30Hz nominal but with OS-level jitter), so a strict
+        // "every tick must see a press" test breaks on a single missed
+        // tick. Instead: a press resets `ticks_since_last_press` to 0;
+        // each tick increments it; the streak counts ticks that arrived
+        // within the last ~150ms (3 ticks). Spamming with ≥150ms gaps
+        // (human tap speed) never builds a streak. Genuine holding (key
+        // repeat) keeps `ticks_since_last_press ≤ 1` and the streak
+        // climbs by 1 every tick.
+        if self.space_pressed_this_tick {
+            self.ticks_since_last_press = 0;
+        } else {
+            self.ticks_since_last_press = self.ticks_since_last_press.saturating_add(1);
+        }
+        self.space_pressed_this_tick = false;
+        const HOLD_GRACE_TICKS: u32 = 3; // ~150ms at 20Hz
+        if self.ticks_since_last_press <= HOLD_GRACE_TICKS {
+            self.space_hold_ticks = self.space_hold_ticks.saturating_add(1);
+        } else {
+            self.space_hold_ticks = 0;
+        }
         let speed = self.border_speed();
         self.border_phase = self.border_phase.wrapping_add(speed);
 
@@ -786,6 +830,15 @@ impl GameState {
 
     pub fn trigger_clench(&mut self) {
         self.clench_ticks = CLENCH_TICKS;
+    }
+
+    /// True when the spacebar has been held continuously for ≥ 1 second.
+    /// Driven by `space_hold_ticks` (a streak counter that increments on
+    /// every tick where at least one ClickCenter arrived, resets the
+    /// instant a tick passes without one). Switches the biscuit's clench
+    /// animation from a burning `*` to the spin frames `\ | / -`.
+    pub fn space_held(&self) -> bool {
+        self.space_hold_ticks >= TICK_HZ
     }
 
     /// Spawn a "+N" particle representing cuques earned since the last
