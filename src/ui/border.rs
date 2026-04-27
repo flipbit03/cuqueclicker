@@ -255,9 +255,13 @@ pub fn paint_border_flash(
     }
 }
 
-/// Tint constants exported so callers (sidebar, upgrades) can request a
-/// matching panel-border flash without redefining the palette.
+/// Tint constants exported so callers (sidebar, upgrades, achievements)
+/// can request a matching panel-border flash without redefining the
+/// palette. Same values the HUD title border uses for those events, so
+/// HUD + panel always pulse in the same hue.
 pub const PANEL_PURCHASE_TINT: (f32, f32, f32) = PURCHASE_TINT;
 pub const PANEL_PURCHASE_CYCLE: f32 = PURCHASE_CYCLE;
 pub const PANEL_UNAFFORDABLE_TINT: (f32, f32, f32) = (255.0, 70.0, 70.0);
 pub const PANEL_UNAFFORDABLE_CYCLE: f32 = 7.0;
+pub const PANEL_ACHIEVEMENT_TINT: (f32, f32, f32) = ACHIEVEMENT_TINT;
+pub const PANEL_ACHIEVEMENT_CYCLE: f32 = ACHIEVEMENT_CYCLE;

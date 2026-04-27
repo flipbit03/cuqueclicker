@@ -1,7 +1,8 @@
 use ratatui::{prelude::*, widgets::*};
 
-use crate::game::state::GameState;
+use crate::game::state::{ACHIEVEMENT_FLASH_TICKS, GameState};
 use crate::i18n::t;
+use crate::ui::border;
 
 const HANGING_INDENT: &str = "    ";
 
@@ -53,6 +54,25 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) {
 
     let p = Paragraph::new(lines).block(Block::bordered().title(lang.achievements_title));
     frame.render_widget(p, area);
+
+    // When the player is looking at this panel AND an achievement just
+    // unlocked, mirror the HUD title border's gold pulse on this panel's
+    // border so the celebration lands on whatever they're staring at —
+    // not just the bar at the top. Uses `steady_phase` (timing-only) so
+    // it never entrains with other concurrent shimmers, and the same
+    // gold tint/cycle the HUD title uses so the visual reads as "the
+    // same event."
+    let strength = border::plateau_fade(state.achievement_flash_ticks, ACHIEVEMENT_FLASH_TICKS);
+    if strength > 0.001 {
+        border::paint_border_flash(
+            frame,
+            area,
+            state,
+            border::PANEL_ACHIEVEMENT_TINT,
+            border::PANEL_ACHIEVEMENT_CYCLE,
+            strength,
+        );
+    }
 }
 
 /// Word-wrap with a leading hanging indent applied to every line, so wrapped
