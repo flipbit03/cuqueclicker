@@ -112,19 +112,26 @@ pub fn level_label(idx: usize) -> Option<&'static str> {
 pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -> Rect {
     let art = BISCUIT_LEVELS[zoom_idx.min(BISCUIT_LEVELS.len() - 1)];
     let clenched = state.clench_ticks > 0;
-    // First CLENCH_SQUASH_TICKS frames of the clench: drop the top blank
-    // row so the biscuit visibly compresses, then springs back. clench_ticks
-    // counts down from CLENCH_TICKS so "early in the clench" means
-    // clench_ticks is large.
+    // First CLENCH_SQUASH_TICKS frames of the clench: render a vertically
+    // squashed variant of the art so the cuque visibly contracts, then
+    // springs back. clench_ticks counts down from CLENCH_TICKS so "early in
+    // the clench" means clench_ticks is large.
     let squash = clenched && state.clench_ticks + CLENCH_SQUASH_TICKS > CLENCH_TICKS;
 
-    // Squash: drop the top row of the art for the first frames of clench so
-    // the biscuit visibly compresses before springing back.
-    let render_art: Vec<&str> = if squash {
-        art.iter().skip(1).copied().collect()
+    // CRITICAL: the squash transformation MUST preserve total row count.
+    // `hands::draw` reads `biscuit.height` and `biscuit.y` to compute the
+    // orbital center + radii — if either changes per-frame, every hand
+    // around the cuque jitters on each click. The squash is built by
+    // dropping the rows immediately above + below the eye and padding with
+    // a blank row at top and bottom. Net: same height, eye stays at the
+    // same screen y, outer outline contracts inward toward the eye, hands
+    // around the biscuit don't move.
+    let render_art_owned: Vec<String> = if squash {
+        squashed_art(art)
     } else {
-        art.to_vec()
+        art.iter().map(|s| s.to_string()).collect()
     };
+    let render_art: Vec<&str> = render_art_owned.iter().map(|s| s.as_str()).collect();
 
     let w = render_art
         .iter()
@@ -135,6 +142,18 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
     let x_base = area.x + area.width.saturating_sub(w) / 2;
     let y_base = area.y + area.height.saturating_sub(h) / 2;
 
+    // The stable rect is what we RETURN to callers (hands, particles,
+    // golden). It must NOT depend on per-frame transients like the Frenzy
+    // shake — otherwise the orbital hands and floating particles jitter on
+    // every clench. Frenzy shake is applied only to the render position
+    // below.
+    let stable_rect = Rect {
+        x: x_base,
+        y: y_base,
+        width: w.min(area.width),
+        height: h.min(area.height.saturating_sub(y_base - area.y)),
+    };
+
     // Frenzy shake: ±1 col jitter while clenched and frenzied. Drives off
     // session_ticks so successive frames pick different offsets without
     // needing per-render RNG state.
@@ -143,19 +162,19 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
         .iter()
         .any(|b| matches!(b, Buff::ClickFrenzy { .. }));
     let shake = if frenzy_active && clenched {
-        let s = (state.session_ticks % 3) as i32 - 1;
-        s as i16
+        (state.session_ticks % 3) as i32 - 1
     } else {
         0
     };
-    let x = (x_base as i32 + shake as i32).max(area.x as i32) as u16;
-    let y = y_base;
-
-    let rect = Rect {
-        x,
-        y,
-        width: w.min(area.width),
-        height: h.min(area.height.saturating_sub(y - area.y)),
+    let render_x = ((x_base as i32 + shake)
+        .max(area.x as i32)
+        .min((area.x + area.width).saturating_sub(stable_rect.width) as i32))
+        as u16;
+    let render_rect = Rect {
+        x: render_x,
+        y: stable_rect.y,
+        width: stable_rect.width,
+        height: stable_rect.height,
     };
 
     let lines: Vec<Line> = render_art
@@ -195,8 +214,11 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
 
     let color = Color::Rgb(base.0 as u8, base.1 as u8, base.2 as u8);
     let p = Paragraph::new(lines).style(Style::default().fg(color));
-    frame.render_widget(p, rect);
-    rect
+    frame.render_widget(p, render_rect);
+    // Return the STABLE rect so hands / particles / golden see a steady
+    // biscuit position even when render_rect was shifted by the Frenzy
+    // shake or vertically squeezed by the squash padding.
+    stable_rect
 }
 
 /// Render the golden cuque marker. Position is resolved against the CURRENT
@@ -205,6 +227,60 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
 /// stranding in the old screen position. Returned `Rect` is the actual
 /// drawn rect, used by the click router for hit-testing.
 ///
+/// Build the "squashed" frame of a biscuit ASCII level by removing the rows
+/// immediately above and below the eye row (the one containing 'O') and
+/// padding with a blank row at top and bottom.
+///
+/// Why this shape: a real squash needs the centerline (eye) to stay anchored
+/// while the upper and lower halves contract toward it — that's what reads
+/// as a flattened ellipsoid. Just shrinking from the top makes the cuque
+/// look like the topmost row is flickering, not pulsing.
+///
+/// Why the blank padding: total row count MUST be preserved. The biscuit
+/// rect that this function feeds is read by `hands::draw` to place the
+/// orbital fingerers — any change to rect.height (or rect.y, via
+/// recentering) would shift every hand around the cuque on every click.
+/// Padding keeps the rect identical between calm and squashed states.
+///
+/// Falls back to a plain copy if the art is too short to safely drop two
+/// rows or doesn't contain an eye 'O' — neither case exists in the
+/// shipped catalog but defensive against future zoom levels.
+fn squashed_art(art: &[&str]) -> Vec<String> {
+    let n = art.len();
+    if n < 5 {
+        return art.iter().map(|s| s.to_string()).collect();
+    }
+    let Some(eye_row) = art.iter().position(|s| s.contains('O')) else {
+        return art.iter().map(|s| s.to_string()).collect();
+    };
+    if eye_row == 0 || eye_row + 1 >= n {
+        return art.iter().map(|s| s.to_string()).collect();
+    }
+    // Build a blank line the same width as the widest art row so the rect
+    // dimensions don't shift.
+    let width = art.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let blank: String = " ".repeat(width);
+
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    // Top blank pad — replaces the row we'd otherwise lose by dropping
+    // (eye_row - 1).
+    out.push(blank.clone());
+    // Original rows 0..=eye_row-2 (skipping eye_row-1).
+    for s in art.iter().take(eye_row - 1) {
+        out.push((*s).to_string());
+    }
+    // The eye row itself.
+    out.push(art[eye_row].to_string());
+    // Original rows eye_row+2..n (skipping eye_row+1).
+    for s in art.iter().skip(eye_row + 2) {
+        out.push((*s).to_string());
+    }
+    // Bottom blank pad to match the top pad.
+    out.push(blank);
+    debug_assert_eq!(out.len(), n);
+    out
+}
+
 /// J9 juice: the marker shimmers. Each character of the 5-wide marker
 /// samples its own foreground color from a horizontally-traveling wave
 /// between a `bright` peak, a `dim` trough, and an `accent` highlight on
