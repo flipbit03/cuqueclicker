@@ -10,6 +10,27 @@ use crate::game::state::{Buff, CLENCH_SQUASH_TICKS, CLENCH_TICKS, GameState};
 /// rather than four indistinguishable line strokes.
 const SPIN_FRAMES: [char; 5] = ['\\', '|', '/', '-', '*'];
 
+/// Resolve a prestige count to (tint_color, mix_strength) for the cuque
+/// body. The tint is a noble hue the body bleeds toward; the mix is how
+/// strongly the tint dominates the resting tan. Steps are coarse on
+/// purpose — a player needs to PRESTIGE several times in a tier to start
+/// glimpsing the next one, so a tier transition reads as earned rather
+/// than continuous drift. Caps at "divine white" past tier 5.
+fn prestige_body_tint(prestige: u64) -> ((f32, f32, f32), f32) {
+    // Pure tan when at 0; each tier biases the cuque toward a distinct
+    // hue. Mix grows with tier so endgame is dramatic, but capped < 0.7
+    // so the body never goes monochrome — you can still tell it's a cuque.
+    match prestige {
+        0 => ((220.0, 170.0, 150.0), 0.0),
+        1..=2 => ((255.0, 200.0, 110.0), 0.18),   // warm gold
+        3..=5 => ((255.0, 215.0, 80.0), 0.32),    // saturated gold
+        6..=9 => ((230.0, 220.0, 235.0), 0.40),   // silver-pink
+        10..=14 => ((180.0, 230.0, 255.0), 0.50), // ethereal cyan
+        15..=24 => ((220.0, 200.0, 255.0), 0.55), // celestial violet
+        _ => ((255.0, 250.0, 240.0), 0.65),       // divine white
+    }
+}
+
 // IMPORTANT: the focal cell (asshole) is intentionally a SPACE in each
 // art slice below. The renderer overpaints that cell with the live glyph
 // (`O` / `*` / spin frame `\ | / - *`) at draw time, using the
@@ -268,9 +289,16 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState, zoom_idx: usize) -
     } else {
         let t = (state.session_ticks as f32) / 25.0; // ~8s period at 20Hz
         let breath = 1.0 + 0.05 * t.sin();
-        let r = 220.0 * breath;
-        let g = 170.0 * breath;
-        let b = 150.0 * breath;
+        // Resting tan, then re-tinted toward the prestige tier color.
+        // Higher tiers earn nobler hues so endgame feels visibly rewarded —
+        // tan → warm gold → silver-pink → ethereal cyan → divine white.
+        let (tint, mix) = prestige_body_tint(state.prestige);
+        let base_r = 220.0 * breath;
+        let base_g = 170.0 * breath;
+        let base_b = 150.0 * breath;
+        let r = base_r + (tint.0 - base_r) * mix;
+        let g = base_g + (tint.1 - base_g) * mix;
+        let b = base_b + (tint.2 - base_b) * mix;
         (
             r.clamp(0.0, 255.0),
             g.clamp(0.0, 255.0),
