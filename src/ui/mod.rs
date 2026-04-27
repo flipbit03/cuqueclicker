@@ -159,17 +159,28 @@ pub fn draw(
     // J5 count-up: render the smoothed `displayed_*` values rather than the
     // raw current values. Big jumps (golden, max-buy, F4) ease in instead of
     // snapping. Tween itself runs in `state.tick()`.
+    //
+    // Color sweep: lerp from peak GREEN at t=1 to bright WHITE at t=0, so
+    // the flash decay reads as "green pulse fading to neutral." The
+    // resting (no-flash) style is the same bright white, so when the
+    // flash expires there's no visible cut. Earlier formula moved R and B
+    // up while G dropped, producing a magenta/purple at mid-decay and a
+    // hard snap to default gray at the threshold — two distinct color
+    // artifacts in one short animation.
     let cuques_flash = (state.cuques_flash_ticks as f32 / HUD_FLASH_TICKS as f32).clamp(0.0, 1.0);
-    let cuques_style = if cuques_flash > 0.001 {
-        // Pulse digits toward green during the flash, ease back to white.
-        let g = 80.0 + 175.0 * cuques_flash;
-        let rb = (255.0 - 175.0 * cuques_flash) as u8;
-        Style::default()
-            .fg(Color::Rgb(rb, g.clamp(0.0, 255.0) as u8, rb))
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::BOLD)
-    };
+    const FLASH_PEAK: (f32, f32, f32) = (80.0, 255.0, 80.0);
+    const FLASH_REST: (f32, f32, f32) = (255.0, 255.0, 255.0);
+    let mix = 1.0 - cuques_flash;
+    let r = FLASH_PEAK.0 + (FLASH_REST.0 - FLASH_PEAK.0) * mix;
+    let g = FLASH_PEAK.1 + (FLASH_REST.1 - FLASH_PEAK.1) * mix;
+    let b = FLASH_PEAK.2 + (FLASH_REST.2 - FLASH_PEAK.2) * mix;
+    let cuques_style = Style::default()
+        .fg(Color::Rgb(
+            r.clamp(0.0, 255.0) as u8,
+            g.clamp(0.0, 255.0) as u8,
+            b.clamp(0.0, 255.0) as u8,
+        ))
+        .add_modifier(Modifier::BOLD);
     let mut hud_spans: Vec<Span> = vec![
         Span::raw(format!("{}: ", lang.hud_cuques)),
         Span::styled(format::big(state.displayed_cuques), cuques_style),

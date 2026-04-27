@@ -877,20 +877,25 @@ impl GameState {
         }
 
         // Count-up tween: rendered numbers chase the real ones with
-        // ease-out. Big jumps (golden, F4, max-buy) take ~10-12 frames
-        // to land instead of snapping, so the player's eyes track them.
-        // Tiny per-tick auto income gets caught instantly, so the HUD
-        // never lags noticeably during normal play.
+        // ease-out for BIG jumps (golden, F4, max-buy) so the eye can
+        // track the rise. Small deltas snap — a single +1 manual click
+        // would otherwise take ~30 ticks (1.5s) to finish tweening, AND
+        // `format::big` floors the in-flight value, so the HUD shows "0"
+        // for most of the climb. Counter-productive juice. The threshold
+        // (`SNAP_BELOW`) is in absolute cuques: any change smaller than
+        // ~5 cuques snaps instantly; bigger ones tween. The same
+        // threshold applies to FPS for symmetry — small FPS deltas come
+        // from buying a single fingerer, not worth a tween.
+        const SNAP_BELOW: f64 = 5.0;
         let tween = 0.18_f64;
-        let max_lag = 1e-3;
         let dc = self.cuques - self.displayed_cuques;
-        if dc.abs() < max_lag {
+        if dc.abs() < SNAP_BELOW {
             self.displayed_cuques = self.cuques;
         } else {
             self.displayed_cuques += dc * tween;
         }
         let df = fps - self.displayed_fps;
-        if df.abs() < max_lag {
+        if df.abs() < SNAP_BELOW {
             self.displayed_fps = fps;
         } else {
             self.displayed_fps += df * tween;
