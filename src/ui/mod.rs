@@ -160,20 +160,27 @@ pub fn draw(
     // raw current values. Big jumps (golden, max-buy, F4) ease in instead of
     // snapping. Tween itself runs in `state.tick()`.
     //
-    // Color sweep: lerp from peak GREEN at t=1 to bright WHITE at t=0, so
-    // the flash decay reads as "green pulse fading to neutral." The
-    // resting (no-flash) style is the same bright white, so when the
-    // flash expires there's no visible cut. Earlier formula moved R and B
-    // up while G dropped, producing a magenta/purple at mid-decay and a
-    // hard snap to default gray at the threshold — two distinct color
-    // artifacts in one short animation.
-    let cuques_flash = (state.cuques_flash_ticks as f32 / HUD_FLASH_TICKS as f32).clamp(0.0, 1.0);
-    const FLASH_PEAK: (f32, f32, f32) = (80.0, 255.0, 80.0);
+    // Color sweep: TWO competing channels — green for cuques going UP
+    // (income, golden, F4), red for cuques going DOWN (purchase,
+    // prestige reset). Whichever channel is stronger this frame drives
+    // the lerp toward white. So a buy that lands during a still-decaying
+    // gain flash correctly flips the digits red as the spend channel
+    // overtakes the fading gain. Both lerp toward bright white at t=0,
+    // which matches the resting (no-flash) style — no hard cut.
+    let gain_t = (state.cuques_flash_ticks as f32 / HUD_FLASH_TICKS as f32).clamp(0.0, 1.0);
+    let spend_t = (state.cuques_spend_flash_ticks as f32 / HUD_FLASH_TICKS as f32).clamp(0.0, 1.0);
+    const FLASH_GAIN: (f32, f32, f32) = (80.0, 255.0, 80.0); // bright green
+    const FLASH_SPEND: (f32, f32, f32) = (255.0, 90.0, 90.0); // urgent red
     const FLASH_REST: (f32, f32, f32) = (255.0, 255.0, 255.0);
-    let mix = 1.0 - cuques_flash;
-    let r = FLASH_PEAK.0 + (FLASH_REST.0 - FLASH_PEAK.0) * mix;
-    let g = FLASH_PEAK.1 + (FLASH_REST.1 - FLASH_PEAK.1) * mix;
-    let b = FLASH_PEAK.2 + (FLASH_REST.2 - FLASH_PEAK.2) * mix;
+    let (peak, t) = if spend_t > gain_t {
+        (FLASH_SPEND, spend_t)
+    } else {
+        (FLASH_GAIN, gain_t)
+    };
+    let mix = 1.0 - t;
+    let r = peak.0 + (FLASH_REST.0 - peak.0) * mix;
+    let g = peak.1 + (FLASH_REST.1 - peak.1) * mix;
+    let b = peak.2 + (FLASH_REST.2 - peak.2) * mix;
     let cuques_style = Style::default()
         .fg(Color::Rgb(
             r.clamp(0.0, 255.0) as u8,

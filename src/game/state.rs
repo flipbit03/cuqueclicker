@@ -320,10 +320,18 @@ pub struct GameState {
     pub displayed_cuques: f64,
     #[serde(skip)]
     pub displayed_fps: f64,
-    /// Brief green flash on the HUD digits when a big jump lands (golden,
-    /// purchase, dev cheat).
+    /// Brief green flash on the HUD digits when cuques jump UP — golden
+    /// catch, frenzy click, F4 dev cheat, etc. ("money coming in")
     #[serde(skip)]
     pub cuques_flash_ticks: u32,
+    /// Brief red flash on the HUD digits when cuques drop — successful
+    /// purchase, prestige reset (the big -all event). Mirrors
+    /// `cuques_flash_ticks` and competes with it: whichever channel is
+    /// stronger this frame drives the HUD color sweep, so a buy that
+    /// happens during a still-decaying gain pulse correctly flips the
+    /// digits red instead of staying green.
+    #[serde(skip)]
+    pub cuques_spend_flash_ticks: u32,
 }
 
 pub const LUCKY_FLASH_TICKS: u32 = 70; // 3.5s at 20Hz
@@ -373,6 +381,7 @@ impl Default for GameState {
             displayed_cuques: 0.0,
             displayed_fps: 0.0,
             cuques_flash_ticks: 0,
+            cuques_spend_flash_ticks: 0,
         }
     }
 }
@@ -742,8 +751,11 @@ impl GameState {
         }
         self.prestige = self.prestige_earned_total();
         self.cuques = 0.0;
-        self.displayed_cuques = 0.0;
-        self.displayed_fps = 0.0;
+        // Don't snap `displayed_cuques` to 0 — let it tween down from
+        // its pre-reset value over the next ~1s for a "draining"
+        // feel. Same for FPS. The red spend-flash is fired below to
+        // color the falling counter.
+        self.cuques_spend_flash_ticks = HUD_FLASH_TICKS;
         self.fingerers_owned.clear();
         self.upgrades_earned.clear();
         self.buffs.clear();
@@ -769,6 +781,7 @@ impl GameState {
             self.purchase_flash_strength = 1.0;
         }
         self.cuques_flash_ticks = self.cuques_flash_ticks.saturating_sub(1);
+        self.cuques_spend_flash_ticks = self.cuques_spend_flash_ticks.saturating_sub(1);
         for t in self.fingerer_flash_ticks.iter_mut() {
             *t = t.saturating_sub(1);
         }
@@ -1017,13 +1030,14 @@ impl GameState {
         let c = self.cost(idx);
         // Gate on displayed (matches `can_buy` and the cost color) so
         // clicking a row only succeeds when it visibly looks affordable.
-        // Spend the cost from real cuques, then snap displayed = real so
-        // the post-buy HUD doesn't keep tweening into a stale value.
+        // We do NOT snap `displayed_cuques` to the post-spend `cuques` —
+        // letting it tween DOWN through the existing tick path is the
+        // whole point of the spend animation. The red flash kicks in
+        // via `flash_purchase`.
         if self.displayed_cuques.floor() >= c
             && let Some(f) = FINGERERS.get(idx)
         {
             self.cuques -= c;
-            self.displayed_cuques = self.cuques;
             *self.fingerers_owned.entry(f.id.to_string()).or_insert(0) += 1;
             true
         } else {
@@ -1054,10 +1068,12 @@ impl GameState {
                 }
             }
         }
-        if bought >= 10 {
-            // Big jumps are worth a HUD pop too.
-            self.cuques_flash_ticks = HUD_FLASH_TICKS;
-        }
+        // A buy is a SPEND — it always fires the red HUD flash so the
+        // counter dropping is visibly acknowledged. Earlier this slot
+        // mistakenly used `cuques_flash_ticks` (the gain channel),
+        // making big buys flash green even though cuques went DOWN.
+        // Bulk buys also pop confetti for celebratory feel.
+        self.cuques_spend_flash_ticks = HUD_FLASH_TICKS;
         if bought >= 5 {
             self.spawn_confetti(bought.min(8));
         }
@@ -1122,15 +1138,14 @@ impl GameState {
             return false;
         }
         // Gate on displayed_cuques so visual and behavior match (see
-        // `can_buy` rationale). Snap displayed = real after a successful
-        // spend so the post-buy HUD doesn't keep ramping toward a stale
-        // pre-spend value.
+        // `can_buy` rationale). Don't snap `displayed_cuques` to post-spend
+        // `cuques` — the existing tween path handles the down-lerp and
+        // `flash_purchase` lights the red HUD spend flash.
         if !u.req.met(self) || self.displayed_cuques.floor() < u.cost {
             self.flash_unaffordable_upgrade(idx);
             return false;
         }
         self.cuques -= u.cost;
-        self.displayed_cuques = self.cuques;
         self.upgrades_earned.insert(u.id.to_string());
         self.flash_purchase(idx, 1, PurchaseSlot::Upgrade);
         true
