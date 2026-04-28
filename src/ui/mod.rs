@@ -113,7 +113,7 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
 }
 
 fn draw_zoom_indicator(frame: &mut Frame, area: Rect, label: &str) {
-    let text = format!("[-/+/Wheel] zoom {}", label);
+    let text = format!("zoom {}", label);
     let w = text.chars().count() as u16;
     if area.width < w || area.height == 0 {
         return;
