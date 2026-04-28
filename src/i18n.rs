@@ -46,7 +46,7 @@ pub struct Lang {
 pub const EN: Lang = Lang {
     hud_cuques: "Cuques",
     hud_fps: "FPS (Fingers per Second®)",
-    help_game: "[Space/Click] finger  [Click/1-0] buy  [Shift] x10  [Alt/RClick] max  [-/+/Wheel] zoom\n[u] upgrades  [p] prestige  [s] stats  [a] achievements  [g] grab golden/powerup  [q] quit",
+    help_game: "[Space/Click] finger  [Click/1-0] buy  [Shift] x10  [Alt/RClick] max\n[u] upgrades  [p] prestige  [s] stats  [a] achievements  [g] grab golden/powerup  [q] quit",
     help_stats: "[s/Esc] back to game  [q] quit",
     help_ach: "[a/Esc] back to game  [q] quit",
     fingerers_title: " Fingerers ",
@@ -191,7 +191,7 @@ pub const EN: Lang = Lang {
 pub const PT_BR: Lang = Lang {
     hud_cuques: "Cuques",
     hud_fps: "FPS (Fingers por Segundo®)",
-    help_game: "[Espaço/Clique] dedar  [Clique/1-0] comprar  [Shift] x10  [Alt/Bot.Dir.] max  [-/+/Roda] zoom\n[u] melhorias  [p] prestígio  [s] stats  [a] conquistas  [g] pegar dourado/bônus  [q] sair",
+    help_game: "[Espaço/Clique] dedar  [Clique/1-0] comprar  [Shift] x10  [Alt/Bot.Dir.] max\n[u] melhorias  [p] prestígio  [s] stats  [a] conquistas  [g] pegar dourado/bônus  [q] sair",
     help_stats: "[s/Esc] voltar ao jogo  [q] sair",
     help_ach: "[a/Esc] voltar ao jogo  [q] sair",
     fingerers_title: " Dedadores ",
