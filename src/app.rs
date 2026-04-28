@@ -263,6 +263,7 @@ fn sim_loop(
 ) {
     let tick_dt = Duration::from_micros(1_000_000 / TICK_HZ as u64);
     let mut next_tick = Instant::now() + tick_dt;
+    let mut last_iteration_at = Instant::now();
     let mut ticks_since_save: u64 = 0;
     let mut demo_ticks: u64 = 0;
     let mut demo_golden_spawns: u32 = 0;
@@ -281,6 +282,25 @@ fn sim_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+
+        // Offline-progress detection: if the wall clock advanced FAR more
+        // than one tick (process suspended by macOS energy management,
+        // SSH terminal paused, laptop lid closed, etc.), award the
+        // player the income they would have earned for the gap as a
+        // single bulk add — no slow catch-up grind, no lost cuques.
+        // Threshold of 2 seconds is well above natural tick jitter
+        // (50ms) and recv_timeout drift but safely below any deliberate
+        // pause that would qualify as "real" play.
+        let now = Instant::now();
+        let elapsed_since_last_iter = now.saturating_duration_since(last_iteration_at);
+        if elapsed_since_last_iter > Duration::from_secs(2) && demo_seconds.is_none() {
+            let secs = elapsed_since_last_iter.as_secs_f64();
+            state.apply_offline_progress(secs);
+            // Reset the tick clock so the catch-up loop below doesn't
+            // also try to grind through thousands of ticks for the gap.
+            next_tick = now + tick_dt;
+        }
+        last_iteration_at = now;
 
         // Run every tick we're behind on. If we've fallen absurdly far
         // behind (laptop sleep), snap forward rather than grind through
