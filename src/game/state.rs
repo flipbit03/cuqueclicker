@@ -1008,19 +1008,29 @@ impl GameState {
         raw.floor()
     }
 
-    /// Affordability gate. Compares the DISPLAYED (count-up-tweened, then
-    /// floored) cuques against the cost so the row's red/green color and
-    /// the click-buy result both align with the value the player can
-    /// actually see on the HUD. Without this, a counter still ramping up
-    /// from "8" toward 17 would either:
+    /// Cuques the player can ACTUALLY spend right now: the lesser of real
+    /// `cuques` and the displayed counter. Both bounds matter:
     ///
-    /// - show the row green prematurely (gate uses real >= cost while
-    ///   counter still says 8), or
-    /// - show the row red but a click would succeed anyway.
+    /// - Gating ONLY on `cuques` (real) lets the row turn green and a
+    ///   click succeed before the counter visibly catches up — the
+    ///   "I have 8 but the row says I can buy a 17" lie.
+    /// - Gating ONLY on `displayed_cuques.floor()` lets a click DRAIN
+    ///   real cuques NEGATIVE during a spend's tween-down: real already
+    ///   dropped, displayed hasn't caught down yet, gate sees the high
+    ///   displayed value and lets the buy through against the depleted
+    ///   real. Once `cuques` goes negative, the HUD floor() shows "0"
+    ///   for a long time while the slow income climbs back.
     ///
-    /// Both confused playtesters; gating on displayed_cuques is honest.
+    /// Taking `min(real, displayed.floor())` makes both conditions
+    /// equally binding: row turns green only when the visible counter
+    /// AND the underlying balance both reach the cost; click succeeds
+    /// only when both still hold. No overspend, no visual lie.
+    pub fn affordable_cuques(&self) -> f64 {
+        self.cuques.min(self.displayed_cuques.floor())
+    }
+
     pub fn can_buy(&self, idx: usize) -> bool {
-        self.displayed_cuques.floor() >= self.cost(idx)
+        self.affordable_cuques() >= self.cost(idx)
     }
 
     /// Buy a single unit. Bare mutation only — flash side-effects are
@@ -1028,13 +1038,12 @@ impl GameState {
     /// bulk buy produce visually distinct feedback.
     fn buy_one_quiet(&mut self, idx: usize) -> bool {
         let c = self.cost(idx);
-        // Gate on displayed (matches `can_buy` and the cost color) so
-        // clicking a row only succeeds when it visibly looks affordable.
-        // We do NOT snap `displayed_cuques` to the post-spend `cuques` —
-        // letting it tween DOWN through the existing tick path is the
-        // whole point of the spend animation. The red flash kicks in
-        // via `flash_purchase`.
-        if self.displayed_cuques.floor() >= c
+        // Use the same min(real, displayed) gate as `can_buy` so the
+        // visible row state and the buy outcome agree, AND we never
+        // spend more than `cuques` actually has. We do NOT snap
+        // `displayed_cuques` to post-spend `cuques` — the existing tick
+        // path tweens it down and the red spend flash colors that fall.
+        if self.affordable_cuques() >= c
             && let Some(f) = FINGERERS.get(idx)
         {
             self.cuques -= c;
@@ -1137,11 +1146,9 @@ impl GameState {
         if self.has_upgrade(u.id) {
             return false;
         }
-        // Gate on displayed_cuques so visual and behavior match (see
-        // `can_buy` rationale). Don't snap `displayed_cuques` to post-spend
-        // `cuques` — the existing tween path handles the down-lerp and
-        // `flash_purchase` lights the red HUD spend flash.
-        if !u.req.met(self) || self.displayed_cuques.floor() < u.cost {
+        // Same min(real, displayed) gate as fingerer buys — see
+        // `affordable_cuques` for why both bounds matter.
+        if !u.req.met(self) || self.affordable_cuques() < u.cost {
             self.flash_unaffordable_upgrade(idx);
             return false;
         }

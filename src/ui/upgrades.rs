@@ -58,7 +58,7 @@ pub fn draw(
             let u = &UPGRADES[u_idx];
             // Match `state::buy_upgrade`'s gate so the cost color and the
             // click-buy outcome agree on what "affordable" means.
-            let affordable = state.displayed_cuques.floor() >= u.cost;
+            let affordable = state.affordable_cuques() >= u.cost;
             let name = lang.upgrade_names.get(u_idx).copied().unwrap_or("?");
             let desc = lang.upgrade_descs.get(u_idx).copied().unwrap_or("");
             let cost_style = if affordable {
