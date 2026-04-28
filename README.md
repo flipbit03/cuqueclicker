@@ -45,6 +45,14 @@ cargo install cuqueclicker
 | `-` / `+` | Zoom out / in (mouse scroll also works) |
 | `q` / `Esc` | Quit (autosaves) |
 
+**macOS note:** the kernel can suspend a backgrounded SSH-only process (or any terminal-only app) after a short idle, which freezes the simulation and stops cuque accrual. The game resumes on input, so you'll never lose progress, but you also won't accumulate cuques while parked. To run continuously through long idle periods, launch under `caffeinate`:
+
+```sh
+caffeinate -i cuqueclicker
+```
+
+The `-i` flag prevents idle sleep without overriding lid-close sleep, so closing the lid still puts the Mac to sleep normally.
+
 ## Features
 
 - **Ten fingerer tiers** — starts with your own Index Finger and climbs past Latex Gloves, Robotic Fingers, Tentacles, and a Dimensional Hole, ending at the Hand of God
