@@ -631,30 +631,6 @@ impl GameState {
         self.cuques_flash_ticks = HUD_FLASH_TICKS;
     }
 
-    /// Award income for a wall-clock gap during which the sim wasn't
-    /// running — process suspension by the OS (macOS App Nap on
-    /// SSH-only sessions, laptop sleep, deliberate Ctrl-Z, terminal
-    /// emulator backgrounding, etc.). Called from `sim_loop` when the
-    /// outer-iteration interval far exceeds the tick budget.
-    ///
-    /// Awards `fps * seconds` cuques as one bulk add, snaps
-    /// `displayed_cuques` so the HUD doesn't have to tween a giant gap,
-    /// and lights the green gain flash so the player visibly notices
-    /// they got back from "offline" with new cash.
-    pub fn apply_offline_progress(&mut self, seconds: f64) {
-        let fps = self.fps();
-        if fps <= 0.0 || seconds <= 0.0 {
-            return;
-        }
-        let gained = fps * seconds;
-        self.add_cuques(gained);
-        // Snap displayed so the HUD doesn't tween up over ~5s from the
-        // pre-gap value to (pre-gap + bulk) — that would feel laggy.
-        self.displayed_cuques = self.cuques;
-        self.displayed_fps = fps;
-        self.cuques_flash_ticks = HUD_FLASH_TICKS;
-    }
-
     /// Catch whatever Golden Cuque is currently on screen (any variant:
     /// Lucky, Frenzy, or Buff). Applies the variant-specific effect,
     /// increments `golden_caught`, re-rolls the next spawn cooldown, and
