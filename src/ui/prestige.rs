@@ -35,7 +35,7 @@ pub fn draw(
     lines.push(Line::from(vec![
         Span::raw(format!("  {}: ", lang.prestige_bonus_label)),
         Span::styled(
-            format!("+{:.0}% FPS", bonus_pct),
+            format!("+{:.0}% {}", bonus_pct, lang.fps_unit),
             Style::default().fg(Color::Rgb(120, 230, 120)),
         ),
     ]));
