@@ -355,11 +355,18 @@ fn draw_help(
             //  - actionable (clickable)          : light gray, BOLD
             //  - informational                   : dark gray
             //  - hovered                         : color lifted, bg tint
-            let hovered = mouse_pos
-                .map(|(mx, my)| {
-                    mx >= token_rect.x && mx < token_rect.x + token_rect.width && my == token_rect.y
-                })
-                .unwrap_or(false);
+            // Hover lift fires ONLY on actionable hints — informational
+            // tokens like `[Space/Click] finger` and `[Shift] x10` are
+            // descriptive labels with no click handler, so brightening
+            // them on hover would advertise a button that doesn't exist.
+            let hovered = action.is_some()
+                && mouse_pos
+                    .map(|(mx, my)| {
+                        mx >= token_rect.x
+                            && mx < token_rect.x + token_rect.width
+                            && my == token_rect.y
+                    })
+                    .unwrap_or(false);
             let mut style = if active {
                 Style::default()
                     .fg(Color::Rgb(255, 220, 120))
