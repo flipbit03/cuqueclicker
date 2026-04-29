@@ -13,8 +13,10 @@ mod build_info;
 mod format;
 mod game;
 mod i18n;
-mod save;
+mod input;
+mod platform;
 mod self_cmd;
+mod sim;
 mod ui;
 
 use app::App;
@@ -83,10 +85,11 @@ fn main() -> Result<()> {
         .filter(|_| build_info::is_dev_build());
 
     let _lock;
+    let persistence = platform::Persistence::new();
     let state = if demo_seconds.is_some() {
         app::build_demo_state()
     } else {
-        _lock = match save::acquire_lock() {
+        _lock = match platform::InstanceLock::try_acquire() {
             Ok(l) => l,
             Err(e) => {
                 eprintln!(
@@ -97,7 +100,7 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
         };
-        save::load()
+        persistence.load()
     };
 
     enable_raw_mode()?;
@@ -106,7 +109,7 @@ fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = App::new(state, debug, demo_seconds).run(&mut terminal);
+    let result = App::new(state, debug, demo_seconds, persistence).run(&mut terminal);
 
     disable_raw_mode()?;
     execute!(
