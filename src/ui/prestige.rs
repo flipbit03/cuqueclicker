@@ -5,7 +5,7 @@ use crate::game::state::GameState;
 use crate::i18n::t;
 
 /// Draws the Prestige panel and returns the click-target rect for the
-/// "Press [r] to reset and claim" confirm line. The rect is `Rect::default()`
+/// `Press [r] to reset and claim` confirm line. The rect is `Rect::default()`
 /// when no prestige is currently available — i.e. nothing to confirm.
 pub fn draw(
     frame: &mut Frame,

@@ -28,7 +28,7 @@ pub fn draw_particles(frame: &mut Frame, biscuit: Rect, particles: &[Particle]) 
     }
 }
 
-/// Style picker per kind. `t` ∈ [0,1] is "remaining life fraction" so
+/// Style picker per kind. `t` ∈ `[0,1]` is "remaining life fraction" so
 /// 1.0 = freshly spawned, 0.0 = about to despawn. All kinds fade out as t
 /// drops; the difference is base color and BOLD weight.
 fn particle_style(kind: ParticleKind, t: f32) -> Style {

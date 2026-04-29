@@ -82,7 +82,7 @@ pub struct DrawOutput {
     /// keyboard-only. Empty rects when the hint is non-actionable
     /// (e.g. `[Space/Click] finger` is informational, not a click target).
     pub help_hits: Vec<(HelpAction, Rect)>,
-    /// Click rect for the "Press [r] to reset and claim" confirm line in
+    /// Click rect for the `Press [r] to reset and claim` confirm line in
     /// the Prestige panel. Default rect when not in Prestige mode or no
     /// prestige is available.
     pub prestige_reset_rect: Rect,
