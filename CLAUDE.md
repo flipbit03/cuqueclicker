@@ -49,7 +49,7 @@ HUD shows `v0.0.0 (dev)` in dev, plain `vX.Y.Z` in release. The title is built i
 - **HUD border animation is casino-style, NOT always-spinning.** Baseline is flat grey. Activity (click, buy, buff, achievement) ramps *up* into chromatic pulses; idle ramps back down. Shader math is additive per channel with coprime cycle lengths (11/13/17/23), so stacked events compose into wilder patterns instead of overriding each other.
 - **Pulses go grey → white+color → grey, not grey → grey+color.** The carrier goes to **true white** during activity; colors modulate that white. Pulsing between grey and grey-plus-color reads as dim.
 - **Decay is plateau + smoothstep, not linear.** Sits at full strength, then fades smoothly. No hard cut, no constant shrink.
-- **Zoom is smooth, not stepped.** No per-zoom hardcoded ASCII art. It's OK if the cuque looks imperfect at intermediate sizes — the user explicitly preferred continuous zoom over pixel-perfect discrete levels.
+- **Zoom is stepped — 4 hand-tuned ASCII levels, not interpolated.** `BISCUIT_LEVELS` in `src/ui/biscuit.rs` ships full / medium / small / tiny variants (100% / 70% / 45% / 25%). Each level is an explicit art string; nothing is computed at runtime from a single template. Don't add levels casually (more art to maintain), don't remove one without keeping `level_label()` aligned with the remaining indices.
 - **Hands rings cap per type at `PER_TYPE_CAP = 40`**, ring width `PER_RING = 48`. Visually identical above 40 — don't bother rendering more.
 
 ## Demo recording

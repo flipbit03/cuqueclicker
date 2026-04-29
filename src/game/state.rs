@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use rand::RngExt;
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 
@@ -10,8 +11,29 @@ use crate::game::upgrade::{UPGRADES, UpgradeEffect};
 
 pub const TICK_HZ: u32 = 20;
 pub const TICK_DT: f64 = 1.0 / TICK_HZ as f64;
-const CLENCH_TICKS: u32 = 3;
+/// How long the biscuit stays "clenched" (eye→`*`, color shifts pink, art
+/// vertically squashes by one row). Bumped from 3 to 6 so a single click is
+/// actually visible — at 20Hz, 3 ticks (~150ms) was hard to perceive.
+pub const CLENCH_TICKS: u32 = 6;
+/// First `CLENCH_SQUASH_TICKS` of a clench draw the biscuit one row shorter
+/// (top blank dropped, art shifted) so each finger reads as a real squish
+/// before springing back. Strict subset of CLENCH_TICKS.
+pub const CLENCH_SQUASH_TICKS: u32 = 2;
 const PARTICLE_LIFE: u32 = 20;
+/// Misclick "·" lifetime — short, just enough to acknowledge the attempt.
+pub const MISCLICK_LIFE: u32 = 8;
+/// Achievement-unlock toast: how long the popup stays on screen.
+pub const TOAST_TICKS: u32 = TICK_HZ * 4;
+/// HUD digit "I just got bigger" green flash duration.
+pub const HUD_FLASH_TICKS: u32 = TICK_HZ; // 1s
+/// Achievement-unlock border channel duration (gold pulse like Lucky but
+/// shorter — celebratory, not lingering).
+pub const ACHIEVEMENT_FLASH_TICKS: u32 = TICK_HZ * 2;
+/// "You can afford this now!" row flash — fires the moment a fingerer or
+/// upgrade transitions from unaffordable to affordable. Brief on purpose:
+/// short enough that it's clearly an "announcement," not the longer
+/// purchase flash that fires on actual buy.
+pub const UNLOCK_FLASH_TICKS: u32 = TICK_HZ / 2; // 0.5s
 /// Per-tick upward drift for a particle, expressed as a fraction of the
 /// biscuit's height. Calibrated to match the original feel before the
 /// switch to fractional anchors: the old code rose 0.18 cells/tick on
@@ -21,6 +43,24 @@ const PARTICLE_LIFE: u32 = 20;
 const PARTICLE_FRAC_RISE: f32 = 0.006;
 const GOLDEN_REWARD_SECONDS: f64 = 60.0;
 const GOLDEN_REWARD_FLAT: f64 = 10.0;
+
+/// Visual flavor for a particle. Drives color/weight in the renderer; the
+/// motion model (rise + horizontal drift) is identical across kinds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ParticleKind {
+    /// Default `+1` from a normal click — white→red fade.
+    Click,
+    /// High-power click (Frenzy x777, big mults). Bold + warm-yellow accent
+    /// so it stands out from a swarm of `+1`s.
+    ClickBig,
+    /// Auto-fingerer income particle.
+    Auto,
+    /// Golden-catch label ("FRENZY x777!", "+1.2k", etc). Longer life,
+    /// brighter palette.
+    Golden,
+    /// Bulk-buy confetti pop. Coloured glyphs, shorter than a click.
+    Confetti,
+}
 
 /// Position is stored as a fraction of the biscuit rect ([0.0, 1.0] on each
 /// axis), matching `GoldenCuque`. The renderer resolves these fractions
@@ -32,6 +72,21 @@ pub struct Particle {
     pub frac_y: f32,
     pub life: u32,
     pub text: String,
+    pub kind: ParticleKind,
+    /// Per-tick horizontal drift in fraction-of-biscuit units. Set at spawn
+    /// from a small uniform so co-spawned particles separate as they rise
+    /// instead of stacking into garbage like `++1++++1`.
+    pub drift_x: f32,
+}
+
+/// Screen-anchored particle (raw col/row, not biscuit-fractional). Used for
+/// misclick acknowledgement: a small grey "·" at the exact dead-zone click
+/// point so the player knows the click registered but missed every target.
+#[derive(Clone)]
+pub struct MisclickParticle {
+    pub col: u16,
+    pub row: u16,
+    pub life: u32,
 }
 
 /// Convert an absolute `(col, row)` screen point into biscuit-fractional
@@ -156,28 +211,127 @@ pub struct GameState {
     pub clench_ticks: u32,
     #[serde(skip)]
     pub particles: Vec<Particle>,
+    /// Screen-anchored "misclick" tap particles — independent buffer because
+    /// they don't follow the biscuit (they're feedback for clicks that
+    /// MISSED the biscuit, including the dead zone at low zoom).
+    #[serde(skip)]
+    pub misclick_particles: Vec<MisclickParticle>,
     #[serde(skip)]
     pub golden: Option<GoldenCuque>,
     #[serde(skip)]
     pub golden_cooldown: u32,
     #[serde(skip)]
     pub session_ticks: u64,
-    /// Achievement ids that unlocked this session; drained by the UI after
-    /// it shows the "unlocked!" toast.
+    /// Queue of achievement ids that unlocked but haven't yet been shown as a
+    /// toast. Drained one-at-a-time by `tick()` into `active_unlock_id`.
     #[serde(skip)]
     pub newly_unlocked: Vec<String>,
+    /// Currently-on-screen achievement toast (id) and its remaining life in
+    /// ticks. `None` means no toast right now; `tick()` pops the next pending
+    /// id off `newly_unlocked` when this clears.
+    #[serde(skip)]
+    pub active_unlock_id: Option<String>,
+    #[serde(skip)]
+    pub active_unlock_ticks: u32,
     #[serde(skip)]
     pub visual_debt: f64,
     #[serde(skip)]
     pub lucky_flash_ticks: u32,
     #[serde(skip)]
+    pub achievement_flash_ticks: u32,
+    /// HUD title border phase clock. Advances by `border_speed()` each
+    /// tick, so the title border visibly speeds up under Frenzy / Lucky /
+    /// purchase events. INTENTIONALLY NOT shared with secondary shimmers
+    /// (panel borders, sidebar / upgrade rows) — they need a constant-rate
+    /// clock so a global speed-up on the HUD doesn't drag them along.
+    #[serde(skip)]
     pub border_phase: u32,
+    /// Constant-rate phase clock for secondary shimmers — sidebar row,
+    /// upgrade row, and panel-border flashes. Advances by exactly 1 per
+    /// tick regardless of game state, so e.g. an Achievement / Frenzy
+    /// event accelerating `border_phase` doesn't accelerate the
+    /// "can't-buy" shimmer that happens to be running on a fingerer
+    /// row at the same time.
+    #[serde(skip)]
+    pub steady_phase: u32,
     #[serde(skip)]
     pub purchase_flash_ticks: u32,
+    /// Strength multiplier (1.0..=3.0) for the most recent purchase flash,
+    /// scaled by bulk-buy quantity. The border + panel borders read this so
+    /// a max-buy lands harder than a single click.
+    #[serde(skip)]
+    pub purchase_flash_strength: f32,
     /// One slot per visible sidebar row; indexed by catalog position because
     /// it's purely a render-time flash and doesn't need to survive reorders.
     #[serde(skip)]
     pub fingerer_flash_ticks: Vec<u32>,
+    /// Mirror of `fingerer_flash_ticks` for the Upgrades panel. Sized to
+    /// UPGRADES.len() lazily by `migrate()`.
+    #[serde(skip)]
+    pub upgrade_flash_ticks: Vec<u32>,
+    /// Negative-feedback flash: red row pulse when a click hit a row but
+    /// `cuques < cost`. One slot per fingerer / upgrade index.
+    #[serde(skip)]
+    pub fingerer_unaffordable_flash: Vec<u32>,
+    #[serde(skip)]
+    pub upgrade_unaffordable_flash: Vec<u32>,
+    /// "Just became affordable" flash: a brief one-shot green shimmer
+    /// fired the tick a row's affordability flips false → true. Distinct
+    /// from `*_flash_ticks` (purchase) — shorter duration, no panel
+    /// border bleed — so the player can tell "now buyable" apart from
+    /// "you just bought."
+    #[serde(skip)]
+    pub fingerer_unlock_flash: Vec<u32>,
+    #[serde(skip)]
+    pub upgrade_unlock_flash: Vec<u32>,
+    /// Previous-tick affordability per row, used to detect the
+    /// false→true edge that triggers `*_unlock_flash`. Sized to catalog
+    /// length by `migrate()` and seeded at init from the live state, so a
+    /// freshly-loaded save with rows already affordable doesn't fire a
+    /// fake unlock flash on tick 1.
+    #[serde(skip)]
+    pub prev_fingerer_affordable: Vec<bool>,
+    #[serde(skip)]
+    pub prev_upgrade_affordable: Vec<bool>,
+    /// Held-spacebar tracking.
+    ///
+    /// `space_pressed_this_tick` is set whenever `Action::ClickCenter`
+    /// arrives (terminal key-repeat fires Press events at ~30Hz, easily
+    /// hitting every 50ms tick when a key is genuinely held).
+    /// `ticks_since_last_press` is a small countdown that allows up to 3
+    /// missed ticks (~150ms) before declaring the key released — handles
+    /// real keyboard-repeat jitter so a 1-tick gap doesn't kill the
+    /// streak. `space_hold_ticks` is the consecutive "active" tick streak;
+    /// `space_held()` is true once it crosses 1 second.
+    ///
+    /// Net result: spamming spacebar at human speed (≥150ms between
+    /// presses) never triggers held; actually holding the key climbs the
+    /// streak past 20 ticks within ~1s.
+    #[serde(skip)]
+    pub space_pressed_this_tick: bool,
+    #[serde(skip)]
+    pub ticks_since_last_press: u32,
+    #[serde(skip)]
+    pub space_hold_ticks: u32,
+    /// HUD count-up tween: rendered numbers smoothly chase the real ones.
+    /// Initialized to the live values on load so the first frame doesn't
+    /// look like a count-up from zero.
+    #[serde(skip)]
+    pub displayed_cuques: f64,
+    #[serde(skip)]
+    pub displayed_fps: f64,
+    /// Brief green flash on the HUD digits when cuques jump UP — golden
+    /// catch, frenzy click, F4 dev cheat, etc. ("money coming in")
+    #[serde(skip)]
+    pub cuques_flash_ticks: u32,
+    /// Brief red flash on the HUD digits when cuques drop — successful
+    /// purchase, prestige reset (the big -all event). Mirrors
+    /// `cuques_flash_ticks` and competes with it: whichever channel is
+    /// stronger this frame drives the HUD color sweep, so a buy that
+    /// happens during a still-decaying gain pulse correctly flips the
+    /// digits red instead of staying green.
+    #[serde(skip)]
+    pub cuques_spend_flash_ticks: u32,
 }
 
 pub const LUCKY_FLASH_TICKS: u32 = 70; // 3.5s at 20Hz
@@ -199,15 +353,35 @@ impl Default for GameState {
             buffs: Vec::new(),
             clench_ticks: 0,
             particles: Vec::new(),
+            misclick_particles: Vec::new(),
             golden: None,
             golden_cooldown: crate::game::golden::next_cooldown(),
             session_ticks: 0,
             newly_unlocked: Vec::new(),
+            active_unlock_id: None,
+            active_unlock_ticks: 0,
             visual_debt: 0.0,
             lucky_flash_ticks: 0,
+            achievement_flash_ticks: 0,
             border_phase: 0,
+            steady_phase: 0,
             purchase_flash_ticks: 0,
+            purchase_flash_strength: 1.0,
             fingerer_flash_ticks: vec![0; fingerer::count()],
+            upgrade_flash_ticks: vec![0; UPGRADES.len()],
+            fingerer_unaffordable_flash: vec![0; fingerer::count()],
+            upgrade_unaffordable_flash: vec![0; UPGRADES.len()],
+            fingerer_unlock_flash: vec![0; fingerer::count()],
+            upgrade_unlock_flash: vec![0; UPGRADES.len()],
+            prev_fingerer_affordable: vec![false; fingerer::count()],
+            prev_upgrade_affordable: vec![false; UPGRADES.len()],
+            space_pressed_this_tick: false,
+            ticks_since_last_press: u32::MAX,
+            space_hold_ticks: 0,
+            displayed_cuques: 0.0,
+            displayed_fps: 0.0,
+            cuques_flash_ticks: 0,
+            cuques_spend_flash_ticks: 0,
         }
     }
 }
@@ -218,11 +392,50 @@ impl GameState {
     /// rather than the serde default. Hook point for future shape
     /// transforms — see CLAUDE.md on the stable-id save policy.
     pub fn migrate(mut self) -> Self {
+        // Per-catalog flash slots are runtime-only — re-size if the catalog
+        // grew/shrank since this save was written.
         if self.fingerer_flash_ticks.len() != fingerer::count() {
             self.fingerer_flash_ticks = vec![0; fingerer::count()];
         }
+        if self.upgrade_flash_ticks.len() != UPGRADES.len() {
+            self.upgrade_flash_ticks = vec![0; UPGRADES.len()];
+        }
+        if self.fingerer_unaffordable_flash.len() != fingerer::count() {
+            self.fingerer_unaffordable_flash = vec![0; fingerer::count()];
+        }
+        if self.upgrade_unaffordable_flash.len() != UPGRADES.len() {
+            self.upgrade_unaffordable_flash = vec![0; UPGRADES.len()];
+        }
+        if self.fingerer_unlock_flash.len() != fingerer::count() {
+            self.fingerer_unlock_flash = vec![0; fingerer::count()];
+        }
+        if self.upgrade_unlock_flash.len() != UPGRADES.len() {
+            self.upgrade_unlock_flash = vec![0; UPGRADES.len()];
+        }
+        // Seed `prev_affordable` from the LIVE state so a freshly-loaded
+        // save with rows already affordable doesn't fire spurious unlock
+        // flashes on tick 1. Resize if catalog grew/shrank.
+        if self.prev_fingerer_affordable.len() != fingerer::count() {
+            self.prev_fingerer_affordable =
+                (0..fingerer::count()).map(|i| self.can_buy(i)).collect();
+        }
+        if self.prev_upgrade_affordable.len() != UPGRADES.len() {
+            self.prev_upgrade_affordable = (0..UPGRADES.len())
+                .map(|i| {
+                    let u = &UPGRADES[i];
+                    !self.has_upgrade(u.id) && u.req.met(&self) && self.cuques >= u.cost
+                })
+                .collect();
+        }
         if self.golden_cooldown == 0 {
             self.golden_cooldown = crate::game::golden::next_cooldown();
+        }
+        // Seed the count-up tween at the live values so a freshly-loaded save
+        // doesn't animate the HUD "from 0" up to whatever the player had.
+        self.displayed_cuques = self.cuques;
+        self.displayed_fps = 0.0; // recomputed on first tick
+        if self.purchase_flash_strength <= 0.0 {
+            self.purchase_flash_strength = 1.0;
         }
         self
     }
@@ -265,16 +478,101 @@ impl GameState {
         self.add_cuques(power);
         self.total_clicks += 1;
         self.clench_ticks = CLENCH_TICKS;
-        let jitter = (self.total_clicks as i32 % 9) - 4;
-        let col = (origin.0 as i32 + jitter).max(0) as u16;
-        let row = origin.1.saturating_sub(1);
+        // Click that meaningfully grows the counter also flashes the HUD
+        // digits — a single +1 doesn't deserve the green tint, but a
+        // Frenzy +777 (or any bulk jump) does.
+        if power >= 50.0 {
+            self.cuques_flash_ticks = HUD_FLASH_TICKS;
+        }
+        let mut rng = rand::rng();
+        // Wider random horizontal jitter (proportional to biscuit width) plus
+        // a small Y jitter so co-spawned particles don't overlap into "+1+1+1"
+        // mush at the same row. Per-particle drift_x continues the spread
+        // over the particle's life.
+        let jitter_x_range = (biscuit.width as i32 / 8).max(3);
+        let jitter_x = rng.random_range(-jitter_x_range..=jitter_x_range);
+        let jitter_y = rng.random_range(-1..=1);
+        let col = (origin.0 as i32 + jitter_x).max(0) as u16;
+        let row = origin
+            .1
+            .saturating_sub(1)
+            .saturating_add_signed(jitter_y as i16);
         let (frac_x, frac_y) = screen_to_biscuit_frac(col, row, biscuit);
+        let drift_x = rng.random_range(-0.012_f32..=0.012);
+        let frenzy_active = self
+            .buffs
+            .iter()
+            .any(|b| matches!(b, Buff::ClickFrenzy { .. }));
+        // Small numbers stay subtle; big ones (Frenzy, Cosmic mults) get a
+        // bold ClickBig style so they read as "this matters" against the
+        // chatter of auto-particles.
+        let kind = if power >= 50.0 || frenzy_active {
+            ParticleKind::ClickBig
+        } else {
+            ParticleKind::Click
+        };
         self.particles.push(Particle {
             frac_x,
             frac_y,
             life: PARTICLE_LIFE,
             text: format!("+{}", crate::format::big(power)),
+            kind,
+            drift_x,
         });
+        // Frenzy clicks also spawn a halo of `*` confetti to make every tap
+        // feel chaotic without altering game behavior.
+        if frenzy_active {
+            for _ in 0..2 {
+                let halo_x = rng.random_range(-0.05_f32..=0.05);
+                let halo_y = rng.random_range(-0.04_f32..=0.04);
+                let (hfx, hfy) =
+                    screen_to_biscuit_frac(origin.0, origin.1.saturating_sub(1), biscuit);
+                self.particles.push(Particle {
+                    frac_x: (hfx + halo_x).clamp(0.0, 1.0),
+                    frac_y: (hfy + halo_y).clamp(0.0, 1.0),
+                    life: PARTICLE_LIFE / 2,
+                    text: "*".into(),
+                    kind: ParticleKind::Confetti,
+                    drift_x: rng.random_range(-0.02_f32..=0.02),
+                });
+            }
+        }
+    }
+
+    /// Spawn a screen-anchored "·" particle at a click point that hit nothing
+    /// (biscuit dead zone, blank panel area, etc). Acknowledges that the
+    /// click registered without altering any game state.
+    pub fn spawn_misclick(&mut self, col: u16, row: u16) {
+        // Cap to avoid unbounded buildup if a player rage-clicks empty space.
+        if self.misclick_particles.len() >= 16 {
+            self.misclick_particles.remove(0);
+        }
+        self.misclick_particles.push(MisclickParticle {
+            col,
+            row,
+            life: MISCLICK_LIFE,
+        });
+    }
+
+    /// Spawn `n` confetti particles scattered over the biscuit. Used for
+    /// bulk-buy juice — a max-buy of a fingerer pops a small burst.
+    pub fn spawn_confetti(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let mut rng = rand::rng();
+        let glyphs = ['*', '+', '~', '.', 'o'];
+        for _ in 0..n.min(8) {
+            let glyph = glyphs[rng.random_range(0..glyphs.len())];
+            self.particles.push(Particle {
+                frac_x: rng.random_range(0.10_f32..=0.90),
+                frac_y: rng.random_range(0.20_f32..=0.85),
+                life: PARTICLE_LIFE,
+                text: glyph.to_string(),
+                kind: ParticleKind::Confetti,
+                drift_x: rng.random_range(-0.02_f32..=0.02),
+            });
+        }
     }
 
     pub fn click_power(&self) -> f64 {
@@ -330,6 +628,7 @@ impl GameState {
     /// because the F-key that triggers it is gated behind `App::debug`.
     pub fn dev_add_cuques(&mut self, amount: f64) {
         self.add_cuques(amount);
+        self.cuques_flash_ticks = HUD_FLASH_TICKS;
     }
 
     /// Catch whatever Golden Cuque is currently on screen (any variant:
@@ -349,6 +648,7 @@ impl GameState {
                 let r = (fps * GOLDEN_REWARD_SECONDS).max(GOLDEN_REWARD_FLAT);
                 self.add_cuques(r);
                 self.lucky_flash_ticks = LUCKY_FLASH_TICKS;
+                self.cuques_flash_ticks = HUD_FLASH_TICKS;
                 (r, format!("+{}", crate::format::big(r)))
             }
             GoldenVariant::Frenzy => {
@@ -387,6 +687,8 @@ impl GameState {
             frac_y: golden.frac_y,
             life: PARTICLE_LIFE * 2,
             text: label,
+            kind: ParticleKind::Golden,
+            drift_x: 0.0,
         });
         reward
     }
@@ -411,14 +713,23 @@ impl GameState {
         if self.lucky_flash_ticks > 0 {
             s = s.max(4);
         }
+        if self.achievement_flash_ticks > 0 {
+            s = s.max(3);
+        }
         if self.purchase_flash_ticks > 0 {
             s += 2;
         }
         s
     }
 
-    pub fn trigger_purchase_flash(&mut self) {
+    /// Trigger the green purchase flash on the global border + the panel
+    /// border. `strength` scales how loud the flash is (1.0 = single buy,
+    /// up to 3.0 = bulk max-buy) so a max-buy lands harder than a +1.
+    pub fn trigger_purchase_flash(&mut self, strength: f32) {
         self.purchase_flash_ticks = PURCHASE_FLASH_TICKS;
+        // Take the louder of the in-flight strength and the new event so
+        // back-to-back small buys don't squash a still-decaying loud one.
+        self.purchase_flash_strength = self.purchase_flash_strength.max(strength).clamp(1.0, 3.0);
     }
 
     pub fn prestige_mult(&self) -> f64 {
@@ -440,11 +751,17 @@ impl GameState {
         }
         self.prestige = self.prestige_earned_total();
         self.cuques = 0.0;
+        // Don't snap `displayed_cuques` to 0 — let it tween down from
+        // its pre-reset value over the next ~1s for a "draining"
+        // feel. Same for FPS. The red spend-flash is fired below to
+        // color the falling counter.
+        self.cuques_spend_flash_ticks = HUD_FLASH_TICKS;
         self.fingerers_owned.clear();
         self.upgrades_earned.clear();
         self.buffs.clear();
         self.visual_debt = 0.0;
         self.particles.clear();
+        self.misclick_particles.clear();
         self.golden = None;
         self.clench_ticks = 0;
         self.golden_cooldown = crate::game::golden::next_cooldown();
@@ -458,12 +775,55 @@ impl GameState {
         self.buffs.retain(|b| b.ticks_remaining() > 0);
 
         self.lucky_flash_ticks = self.lucky_flash_ticks.saturating_sub(1);
+        self.achievement_flash_ticks = self.achievement_flash_ticks.saturating_sub(1);
         self.purchase_flash_ticks = self.purchase_flash_ticks.saturating_sub(1);
+        if self.purchase_flash_ticks == 0 {
+            self.purchase_flash_strength = 1.0;
+        }
+        self.cuques_flash_ticks = self.cuques_flash_ticks.saturating_sub(1);
+        self.cuques_spend_flash_ticks = self.cuques_spend_flash_ticks.saturating_sub(1);
         for t in self.fingerer_flash_ticks.iter_mut() {
             *t = t.saturating_sub(1);
         }
+        for t in self.upgrade_flash_ticks.iter_mut() {
+            *t = t.saturating_sub(1);
+        }
+        for t in self.fingerer_unaffordable_flash.iter_mut() {
+            *t = t.saturating_sub(1);
+        }
+        for t in self.upgrade_unaffordable_flash.iter_mut() {
+            *t = t.saturating_sub(1);
+        }
+        for t in self.fingerer_unlock_flash.iter_mut() {
+            *t = t.saturating_sub(1);
+        }
+        for t in self.upgrade_unlock_flash.iter_mut() {
+            *t = t.saturating_sub(1);
+        }
+        // Held-spacebar streak with a small grace window. Real key-repeat
+        // is bursty (~30Hz nominal but with OS-level jitter), so a strict
+        // "every tick must see a press" test breaks on a single missed
+        // tick. Instead: a press resets `ticks_since_last_press` to 0;
+        // each tick increments it; the streak counts ticks that arrived
+        // within the last ~150ms (3 ticks). Spamming with ≥150ms gaps
+        // (human tap speed) never builds a streak. Genuine holding (key
+        // repeat) keeps `ticks_since_last_press ≤ 1` and the streak
+        // climbs by 1 every tick.
+        if self.space_pressed_this_tick {
+            self.ticks_since_last_press = 0;
+        } else {
+            self.ticks_since_last_press = self.ticks_since_last_press.saturating_add(1);
+        }
+        self.space_pressed_this_tick = false;
+        const HOLD_GRACE_TICKS: u32 = 3; // ~150ms at 20Hz
+        if self.ticks_since_last_press <= HOLD_GRACE_TICKS {
+            self.space_hold_ticks = self.space_hold_ticks.saturating_add(1);
+        } else {
+            self.space_hold_ticks = 0;
+        }
         let speed = self.border_speed();
         self.border_phase = self.border_phase.wrapping_add(speed);
+        self.steady_phase = self.steady_phase.wrapping_add(1);
 
         let fps = self.fps();
         if fps > self.best_fps {
@@ -476,11 +836,104 @@ impl GameState {
         for p in self.particles.iter_mut() {
             p.life = p.life.saturating_sub(1);
             p.frac_y -= PARTICLE_FRAC_RISE;
+            // Per-particle horizontal drift so co-spawned particles spread
+            // out over their lifetime instead of overlapping into garbage.
+            p.frac_x = (p.frac_x + p.drift_x).clamp(0.0, 1.0);
         }
         self.particles.retain(|p| p.life > 0);
+        for m in self.misclick_particles.iter_mut() {
+            m.life = m.life.saturating_sub(1);
+        }
+        self.misclick_particles.retain(|m| m.life > 0);
+
+        // K7: edge-detect false→true affordability flips and fire a brief
+        // unlock flash on the row. Detection runs AFTER `add_cuques(gained)`
+        // so an income-driven crossover lights up immediately. Two-pass to
+        // keep the immutable reads (`can_buy`, `req.met`, etc.) cleanly
+        // separated from the mutable writes to the flash + prev vecs.
+        let fingerer_now: Vec<bool> = (0..fingerer::count()).map(|i| self.can_buy(i)).collect();
+        let upgrade_now: Vec<bool> = UPGRADES
+            .iter()
+            .map(|u| !self.has_upgrade(u.id) && u.req.met(self) && self.cuques >= u.cost)
+            .collect();
+        for (i, &now) in fingerer_now.iter().enumerate() {
+            let was = self
+                .prev_fingerer_affordable
+                .get(i)
+                .copied()
+                .unwrap_or(false);
+            if now
+                && !was
+                && let Some(slot) = self.fingerer_unlock_flash.get_mut(i)
+            {
+                *slot = UNLOCK_FLASH_TICKS;
+            }
+            if let Some(slot) = self.prev_fingerer_affordable.get_mut(i) {
+                *slot = now;
+            }
+        }
+        for (i, &now) in upgrade_now.iter().enumerate() {
+            let was = self
+                .prev_upgrade_affordable
+                .get(i)
+                .copied()
+                .unwrap_or(false);
+            if now
+                && !was
+                && let Some(slot) = self.upgrade_unlock_flash.get_mut(i)
+            {
+                *slot = UNLOCK_FLASH_TICKS;
+            }
+            if let Some(slot) = self.prev_upgrade_affordable.get_mut(i) {
+                *slot = now;
+            }
+        }
+
+        // Count-up tween: rendered numbers chase the real ones with
+        // ease-out for BIG jumps (golden, F4, max-buy) so the eye can
+        // track the rise. Small deltas snap — a single +1 manual click
+        // would otherwise take ~30 ticks (1.5s) to finish tweening, AND
+        // `format::big` floors the in-flight value, so the HUD shows "0"
+        // for most of the climb. Counter-productive juice. The threshold
+        // (`SNAP_BELOW`) is in absolute cuques: any change smaller than
+        // ~5 cuques snaps instantly; bigger ones tween. The same
+        // threshold applies to FPS for symmetry — small FPS deltas come
+        // from buying a single fingerer, not worth a tween.
+        const SNAP_BELOW: f64 = 5.0;
+        let tween = 0.18_f64;
+        let dc = self.cuques - self.displayed_cuques;
+        if dc.abs() < SNAP_BELOW {
+            self.displayed_cuques = self.cuques;
+        } else {
+            self.displayed_cuques += dc * tween;
+        }
+        let df = fps - self.displayed_fps;
+        if df.abs() < SNAP_BELOW {
+            self.displayed_fps = fps;
+        } else {
+            self.displayed_fps += df * tween;
+        }
+
         self.session_ticks += 1;
         self.total_play_ticks += 1;
+        // Run the achievement check *before* the toast popper so an unlock
+        // detected this tick can become the on-screen toast on the same
+        // tick. Otherwise we'd waste the first tick of the toast's life
+        // moving the unlock from the queue to active_unlock_id.
         self.tick_achievements();
+
+        // Toast queue: when no toast is on screen, pop the next pending
+        // unlock id and schedule it for TOAST_TICKS. Every other tick
+        // the active toast just decays.
+        self.active_unlock_ticks = self.active_unlock_ticks.saturating_sub(1);
+        if self.active_unlock_ticks == 0 {
+            self.active_unlock_id = None;
+            if !self.newly_unlocked.is_empty() {
+                self.active_unlock_id = Some(self.newly_unlocked.remove(0));
+                self.active_unlock_ticks = TOAST_TICKS;
+                self.achievement_flash_ticks = ACHIEVEMENT_FLASH_TICKS;
+            }
+        }
     }
 
     pub fn tick_achievements(&mut self) {
@@ -509,6 +962,15 @@ impl GameState {
         self.clench_ticks = CLENCH_TICKS;
     }
 
+    /// True when the spacebar has been held continuously for ≥ 1 second.
+    /// Driven by `space_hold_ticks` (a streak counter that increments on
+    /// every tick where at least one ClickCenter arrived, resets the
+    /// instant a tick passes without one). Switches the biscuit's clench
+    /// animation from a burning `*` to the spin frames `\ | / -`.
+    pub fn space_held(&self) -> bool {
+        self.space_hold_ticks >= TICK_HZ
+    }
+
     /// Spawn a "+N" particle representing cuques earned since the last
     /// auto-particle. Silently skips if there isn't a whole cuque of accrued
     /// income to show — at low FPS the caller is a rate-based timer that
@@ -522,36 +984,128 @@ impl GameState {
             return;
         }
         self.visual_debt -= amount as f64;
+        let drift_x = rand::rng().random_range(-0.008_f32..=0.008);
         self.particles.push(Particle {
             frac_x,
             frac_y,
             life: PARTICLE_LIFE,
             text: format!("+{}", crate::format::big(amount as f64)),
+            kind: ParticleKind::Auto,
+            drift_x,
         });
     }
 
     pub fn cost(&self, idx: usize) -> f64 {
         let k = &FINGERERS[idx];
-        k.base_cost * k.cost_scale.powi(self.fingerer_count_idx(idx) as i32)
+        // Floor the result so the cost ALWAYS equals what `format::big`
+        // shows the player. The price formula scales by 1.15× per owned
+        // unit and produces fractional cuques (e.g. 15 × 1.15⁶ = 34.69).
+        // Without flooring, the HUD says "Cuques: 34, cost 34" but the
+        // affordability check `cuques >= 34.69` rejects — the player sees
+        // a lie. Floor here keeps display, gate, and spend consistent at
+        // the integer grain the player actually sees.
+        let raw = k.base_cost * k.cost_scale.powi(self.fingerer_count_idx(idx) as i32);
+        raw.floor()
+    }
+
+    /// Cuques the player can ACTUALLY spend right now: the lesser of real
+    /// `cuques` and the displayed counter. Both bounds matter:
+    ///
+    /// - Gating ONLY on `cuques` (real) lets the row turn green and a
+    ///   click succeed before the counter visibly catches up — the
+    ///   "I have 8 but the row says I can buy a 17" lie.
+    /// - Gating ONLY on `displayed_cuques.floor()` lets a click DRAIN
+    ///   real cuques NEGATIVE during a spend's tween-down: real already
+    ///   dropped, displayed hasn't caught down yet, gate sees the high
+    ///   displayed value and lets the buy through against the depleted
+    ///   real. Once `cuques` goes negative, the HUD floor() shows "0"
+    ///   for a long time while the slow income climbs back.
+    ///
+    /// Taking `min(real, displayed.floor())` makes both conditions
+    /// equally binding: row turns green only when the visible counter
+    /// AND the underlying balance both reach the cost; click succeeds
+    /// only when both still hold. No overspend, no visual lie.
+    pub fn affordable_cuques(&self) -> f64 {
+        self.cuques.min(self.displayed_cuques.floor())
     }
 
     pub fn can_buy(&self, idx: usize) -> bool {
-        self.cuques >= self.cost(idx)
+        self.affordable_cuques() >= self.cost(idx)
     }
 
-    pub fn buy(&mut self, idx: usize) -> bool {
+    /// Buy a single unit. Bare mutation only — flash side-effects are
+    /// scaled by quantity in `buy_n` / `buy_max` so a single buy and a
+    /// bulk buy produce visually distinct feedback.
+    fn buy_one_quiet(&mut self, idx: usize) -> bool {
         let c = self.cost(idx);
-        if self.cuques >= c
+        // Use the same min(real, displayed) gate as `can_buy` so the
+        // visible row state and the buy outcome agree, AND we never
+        // spend more than `cuques` actually has. We do NOT snap
+        // `displayed_cuques` to post-spend `cuques` — the existing tick
+        // path tweens it down and the red spend flash colors that fall.
+        if self.affordable_cuques() >= c
             && let Some(f) = FINGERERS.get(idx)
         {
             self.cuques -= c;
             *self.fingerers_owned.entry(f.id.to_string()).or_insert(0) += 1;
-            self.trigger_purchase_flash();
-            if let Some(slot) = self.fingerer_flash_ticks.get_mut(idx) {
-                *slot = PURCHASE_FLASH_TICKS;
-            }
             true
         } else {
+            false
+        }
+    }
+
+    /// Apply purchase flash + per-row green flash, then optionally pop
+    /// confetti. Called once per public buy action with the total bought
+    /// count, so the loud bulk-buy feedback only fires once.
+    fn flash_purchase(&mut self, idx: usize, bought: u32, slot_table: PurchaseSlot) {
+        if bought == 0 {
+            return;
+        }
+        // 1 → 1.0, 10 → 1.7, 50 → 2.5, capped at 3.0. sqrt-style growth so
+        // a max-buy is dramatic but doesn't blow the eardrums.
+        let strength = (1.0 + ((bought as f32) / 10.0).sqrt()).clamp(1.0, 3.0);
+        self.trigger_purchase_flash(strength);
+        match slot_table {
+            PurchaseSlot::Fingerer => {
+                if let Some(slot) = self.fingerer_flash_ticks.get_mut(idx) {
+                    *slot = PURCHASE_FLASH_TICKS;
+                }
+            }
+            PurchaseSlot::Upgrade => {
+                if let Some(slot) = self.upgrade_flash_ticks.get_mut(idx) {
+                    *slot = PURCHASE_FLASH_TICKS;
+                }
+            }
+        }
+        // A buy is a SPEND — it always fires the red HUD flash so the
+        // counter dropping is visibly acknowledged. Earlier this slot
+        // mistakenly used `cuques_flash_ticks` (the gain channel),
+        // making big buys flash green even though cuques went DOWN.
+        // Bulk buys also pop confetti for celebratory feel.
+        self.cuques_spend_flash_ticks = HUD_FLASH_TICKS;
+        if bought >= 5 {
+            self.spawn_confetti(bought.min(8));
+        }
+    }
+
+    fn flash_unaffordable_fingerer(&mut self, idx: usize) {
+        if let Some(slot) = self.fingerer_unaffordable_flash.get_mut(idx) {
+            *slot = PURCHASE_FLASH_TICKS / 2;
+        }
+    }
+
+    fn flash_unaffordable_upgrade(&mut self, idx: usize) {
+        if let Some(slot) = self.upgrade_unaffordable_flash.get_mut(idx) {
+            *slot = PURCHASE_FLASH_TICKS / 2;
+        }
+    }
+
+    pub fn buy(&mut self, idx: usize) -> bool {
+        if self.buy_one_quiet(idx) {
+            self.flash_purchase(idx, 1, PurchaseSlot::Fingerer);
+            true
+        } else {
+            self.flash_unaffordable_fingerer(idx);
             false
         }
     }
@@ -559,18 +1113,28 @@ impl GameState {
     pub fn buy_n(&mut self, idx: usize, n: u32) -> u32 {
         let mut bought = 0;
         for _ in 0..n {
-            if !self.buy(idx) {
+            if !self.buy_one_quiet(idx) {
                 break;
             }
             bought += 1;
+        }
+        if bought == 0 {
+            self.flash_unaffordable_fingerer(idx);
+        } else {
+            self.flash_purchase(idx, bought, PurchaseSlot::Fingerer);
         }
         bought
     }
 
     pub fn buy_max(&mut self, idx: usize) -> u32 {
         let mut bought = 0;
-        while self.buy(idx) {
+        while self.buy_one_quiet(idx) {
             bought += 1;
+        }
+        if bought == 0 {
+            self.flash_unaffordable_fingerer(idx);
+        } else {
+            self.flash_purchase(idx, bought, PurchaseSlot::Fingerer);
         }
         bought
     }
@@ -582,14 +1146,23 @@ impl GameState {
         if self.has_upgrade(u.id) {
             return false;
         }
-        if !u.req.met(self) || self.cuques < u.cost {
+        // Same min(real, displayed) gate as fingerer buys — see
+        // `affordable_cuques` for why both bounds matter.
+        if !u.req.met(self) || self.affordable_cuques() < u.cost {
+            self.flash_unaffordable_upgrade(idx);
             return false;
         }
         self.cuques -= u.cost;
         self.upgrades_earned.insert(u.id.to_string());
-        self.trigger_purchase_flash();
+        self.flash_purchase(idx, 1, PurchaseSlot::Upgrade);
         true
     }
+}
+
+#[derive(Clone, Copy)]
+enum PurchaseSlot {
+    Fingerer,
+    Upgrade,
 }
 
 #[cfg(test)]
@@ -707,5 +1280,129 @@ mod tests {
         assert_eq!((fx, fy), (0.5, 0.5));
         let (col, row) = biscuit_frac_to_screen(0.5, 0.5, zero);
         assert_eq!((col, row), (0, 0));
+    }
+
+    // -- Juice-flash invariants ---------------------------------------------
+
+    #[test]
+    fn buy_when_broke_sets_unaffordable_flash() {
+        // Player clicks an unaffordable fingerer row → buy() returns false
+        // AND a red row flash is queued so the rejection is visible. This
+        // is the J11 contract; without it the click looks silent.
+        let mut s = GameState::default();
+        s.cuques = 0.0;
+        let bought = s.buy(0);
+        assert!(!bought);
+        assert!(
+            s.fingerer_unaffordable_flash[0] > 0,
+            "buy(0) on broke state must flash red"
+        );
+        assert!(
+            s.fingerer_flash_ticks[0] == 0,
+            "no purchase flash on reject"
+        );
+    }
+
+    #[test]
+    fn buy_n_when_broke_sets_unaffordable_flash() {
+        let mut s = GameState::default();
+        s.cuques = 0.0;
+        let bought = s.buy_n(0, 10);
+        assert_eq!(bought, 0);
+        assert!(s.fingerer_unaffordable_flash[0] > 0);
+    }
+
+    #[test]
+    fn bulk_buy_scales_purchase_flash_strength() {
+        // J8: max-buy is louder than a +1. We don't pin exact values (clamp
+        // boundaries are tuning), only the relative ordering and bounds.
+        // `displayed_cuques` must mirror `cuques` here because buy()'s
+        // affordability gate now reads displayed (matches the visible
+        // counter on the HUD) — a default-constructed test state has
+        // displayed=0 and would otherwise reject every buy.
+        let mut s = GameState {
+            cuques: 1_000_000.0,
+            displayed_cuques: 1_000_000.0,
+            ..Default::default()
+        };
+        s.buy(0);
+        let single = s.purchase_flash_strength;
+        assert!((1.0..=3.0).contains(&single));
+
+        let mut s = GameState {
+            cuques: 1_000_000.0,
+            displayed_cuques: 1_000_000.0,
+            ..Default::default()
+        };
+        s.buy_n(0, 50);
+        let bulk = s.purchase_flash_strength;
+        assert!(
+            bulk > single,
+            "bulk strength must exceed single ({bulk} vs {single})"
+        );
+        assert!(bulk <= 3.0, "bulk strength capped at 3.0");
+    }
+
+    #[test]
+    fn buy_upgrade_when_broke_sets_unaffordable_flash() {
+        let mut s = GameState::default();
+        // Pick the cheapest upgrade and try to buy with no money.
+        let cheapest_idx = (0..UPGRADES.len())
+            .min_by(|&a, &b| UPGRADES[a].cost.partial_cmp(&UPGRADES[b].cost).unwrap())
+            .unwrap();
+        let bought = s.buy_upgrade(cheapest_idx);
+        assert!(!bought);
+        assert!(s.upgrade_unaffordable_flash[cheapest_idx] > 0);
+    }
+
+    #[test]
+    fn migrate_resizes_per_catalog_flash_vecs() {
+        // A serialized state from "before this branch shipped" has empty /
+        // skipped flash vecs after deserialize. migrate() must size them to
+        // the live catalog so paint paths can index without bounds checks
+        // in hot loops.
+        let json = serde_json::to_string(&GameState::default()).unwrap();
+        let mut s: GameState = serde_json::from_str(&json).unwrap();
+        // Simulate stale shape: drop the per-catalog vecs.
+        s.fingerer_flash_ticks.clear();
+        s.upgrade_flash_ticks.clear();
+        s.fingerer_unaffordable_flash.clear();
+        s.upgrade_unaffordable_flash.clear();
+        let m = s.migrate();
+        assert_eq!(m.fingerer_flash_ticks.len(), fingerer::count());
+        assert_eq!(m.upgrade_flash_ticks.len(), UPGRADES.len());
+        assert_eq!(m.fingerer_unaffordable_flash.len(), fingerer::count());
+        assert_eq!(m.upgrade_unaffordable_flash.len(), UPGRADES.len());
+    }
+
+    #[test]
+    fn migrate_seeds_displayed_counters() {
+        // J5 contract: a freshly-loaded save shows the live counters at full
+        // value, not "tweening up from zero".
+        let s = GameState {
+            cuques: 5_000.0,
+            ..Default::default()
+        };
+        let m = s.migrate();
+        assert_eq!(m.displayed_cuques, 5_000.0);
+        // displayed_fps starts at 0 and converges over the first few ticks
+        // (otherwise we'd snap-show the FPS before any tick has run).
+        assert_eq!(m.displayed_fps, 0.0);
+    }
+
+    #[test]
+    fn unlock_pop_sets_active_toast_and_gold_flash() {
+        // J1 contract: when an achievement triggers, tick() drains
+        // newly_unlocked into active_unlock_id and lights the gold border
+        // channel.
+        let mut s = GameState::default();
+        // Force a "First Finger" unlock by simulating one click.
+        let biscuit = r(0, 0, 40, 20);
+        s.click((20, 10), biscuit);
+        s.tick();
+        // The fresh tick should have moved the queued unlock onto the screen.
+        assert!(s.active_unlock_id.is_some());
+        assert!(s.active_unlock_ticks > 0);
+        assert!(s.achievement_flash_ticks > 0);
     }
 }

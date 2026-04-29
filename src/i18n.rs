@@ -4,6 +4,10 @@ use std::sync::OnceLock;
 pub struct Lang {
     pub hud_cuques: &'static str,
     pub hud_fps: &'static str,
+    /// Short form of the FPS/DPS acronym (no trademark, no expansion).
+    /// Used in inline strings like "+5% FPS" / "+5% DPS" where the long
+    /// form would be too noisy.
+    pub fps_unit: &'static str,
     pub help_game: &'static str,
     pub help_stats: &'static str,
     pub help_ach: &'static str,
@@ -46,7 +50,8 @@ pub struct Lang {
 pub const EN: Lang = Lang {
     hud_cuques: "Cuques",
     hud_fps: "FPS (Fingers per Second®)",
-    help_game: "[Space/Click] finger  [1-0] buy  [Shift+N] x10  [Alt+N] max  [-/+] zoom\n[u] upgrades  [p] prestige  [s] stats  [a] achievements  [g] grab golden/powerup  [q] quit",
+    fps_unit: "FPS",
+    help_game: "[Space/Click] finger  [Click/1-0] buy  [Shift] x10  [Alt/RClick] max  [-/+/Wheel] zoom\n[u] upgrades  [p] prestige  [s] stats  [a] achievements  [g] grab golden/powerup  [q] quit",
     help_stats: "[s/Esc] back to game  [q] quit",
     help_ach: "[a/Esc] back to game  [q] quit",
     fingerers_title: " Fingerers ",
@@ -176,7 +181,7 @@ pub const EN: Lang = Lang {
         "Greek Kisses produce twice as much (again)",
         "Greek Kisses produce twice as much (a third time)",
     ],
-    help_upgrades: "[u/Esc] back  [1-9,0] buy upgrade  [q] quit",
+    help_upgrades: "[u/Esc] back  [Click/1-9,0] buy upgrade  [q] quit",
     prestige_title: " Prestige ",
     prestige_currency: "Tissue Paper",
     prestige_owned_label: "Currently owned",
@@ -190,14 +195,15 @@ pub const EN: Lang = Lang {
 
 pub const PT_BR: Lang = Lang {
     hud_cuques: "Cuques",
-    hud_fps: "FPS (Fingers por Segundo®)",
-    help_game: "[Espaço/Clique] dedar  [1-0] comprar  [Shift+N] x10  [Alt+N] max  [-/+] zoom\n[u] melhorias  [p] prestígio  [s] stats  [a] conquistas  [g] pegar dourado/bônus  [q] sair",
+    hud_fps: "DPS (Dedadas por Segundo®)",
+    fps_unit: "DPS",
+    help_game: "[Espaço/Clique] dedar  [Clique/1-0] comprar  [Shift] x10  [Alt/Bot.Dir.] max  [-/+/Roda] zoom\n[u] melhorias  [p] prestígio  [s] stats  [a] conquistas  [g] pegar dourado/bônus  [q] sair",
     help_stats: "[s/Esc] voltar ao jogo  [q] sair",
     help_ach: "[a/Esc] voltar ao jogo  [q] sair",
     fingerers_title: " Dedadores ",
     owned: "possui",
     cost: "custo",
-    fps_each: "FPS cada",
+    fps_each: "DPS cada",
     fingerer_names: &[
         "Dedo Indicador",
         "Mão Inteira",
@@ -215,7 +221,7 @@ pub const PT_BR: Lang = Lang {
     stat_total_time: "Tempo total de jogo",
     stat_total_clicks: "Total de dedadas",
     stat_lifetime_cuques: "Cuques na vida",
-    stat_best_fps: "Melhor FPS",
+    stat_best_fps: "Melhor DPS",
     stat_achievements: "Conquistas",
     stat_fingerers_owned: "Dedadores possuídos",
     stat_golden_caught: "Cuques Dourados pegos",
@@ -321,11 +327,11 @@ pub const PT_BR: Lang = Lang {
         "Beijos Gregos produzem o dobro (de novo)",
         "Beijos Gregos produzem o dobro (terceira vez)",
     ],
-    help_upgrades: "[u/Esc] voltar  [1-9,0] comprar melhoria  [q] sair",
+    help_upgrades: "[u/Esc] voltar  [Clique/1-9,0] comprar melhoria  [q] sair",
     prestige_title: " Prestígio ",
     prestige_currency: "Papel de Seda",
     prestige_owned_label: "Possui atualmente",
-    prestige_bonus_label: "Bônus de FPS",
+    prestige_bonus_label: "Bônus de DPS",
     prestige_available_label: "Disponível para resgatar",
     prestige_lifetime_needed: "Próximo papel em",
     prestige_confirm_hint: "Pressione [r] para resetar e resgatar",

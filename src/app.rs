@@ -53,7 +53,7 @@ use crate::game::golden::{self, GoldenVariant};
 use crate::game::state::{GameState, TICK_DT, TICK_HZ};
 use crate::game::upgrade::UPGRADES;
 use crate::save;
-use crate::ui::{self, Mode};
+use crate::ui::{self, HelpAction, Mode};
 
 const SAVE_INTERVAL_TICKS: u64 = TICK_HZ as u64 * 10;
 // Golden cooldown override used only during demo recording so the viewer
@@ -102,6 +102,13 @@ enum Action {
     /// `debug`; the sim trusts whatever arrives.
     DevAddCuques(f64),
     DevForceGolden(GoldenVariant),
+    /// J10: a click that didn't hit anything actionable. Sim spawns a
+    /// short-lived "·" misclick particle at the screen point so dead-zone
+    /// clicks visibly register.
+    Misclick {
+        col: u16,
+        row: u16,
+    },
 }
 
 /// Messages the sim thread sends back to main. Used exclusively by the
@@ -169,6 +176,17 @@ impl App {
         let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
         let mut biscuit_rect = Rect::default();
         let mut golden_rect = Rect::default();
+        let mut play_area = Rect::default();
+        // M1+M2: help-bar hint click rects + prestige-reset confirm rect.
+        // Both are recomputed every frame and consumed by the click router
+        // so the mouse-first player has equivalents for `[u]`, `[p]`,
+        // `[s]`, `[a]`, `[g]`, `[q]`, and the `[r] reset` confirm.
+        let mut help_hits: Vec<(HelpAction, Rect)> = Vec::new();
+        let mut prestige_reset_rect = Rect::default();
+        // K5: latest mouse position seen via crossterm's `MouseEventKind::Moved`.
+        // Lives on main only — render-time transient, not persisted, never sent
+        // to the sim. `ui::draw` consumes it to highlight the hovered row.
+        let mut last_mouse_pos: Option<(u16, u16)> = None;
 
         while running && !shutdown.load(Ordering::Relaxed) {
             // Drain any panel/quit requests from the demo driver before we draw,
@@ -182,11 +200,14 @@ impl App {
 
             let current = snapshot.load_full();
             terminal.draw(|f| {
-                let out = ui::draw(f, &current, mode, zoom_idx, debug);
+                let out = ui::draw(f, &current, mode, zoom_idx, debug, last_mouse_pos);
                 biscuit_rect = out.biscuit_rect;
                 golden_rect = out.golden_rect;
+                play_area = out.play_area;
                 upgrade_rows = out.upgrade_rows;
                 fingerer_rows = out.fingerer_rows;
+                help_hits = out.help_hits;
+                prestige_reset_rect = out.prestige_reset_rect;
             })?;
 
             // Hand fresh geometry to the sim. Ordering is preserved by mpsc,
@@ -210,6 +231,10 @@ impl App {
                         &current,
                         biscuit_rect,
                         golden_rect,
+                        play_area,
+                        &mut last_mouse_pos,
+                        &help_hits,
+                        prestige_reset_rect,
                     );
                     if !event::poll(Duration::ZERO)? {
                         break;
@@ -315,6 +340,11 @@ fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometry) {
             if r.width > 0 && r.height > 0 {
                 state.click((r.x + r.width / 2, r.y + r.height / 2), r);
             }
+            // Mark this tick as "saw a spacebar press." `tick()` reads the
+            // flag, advances the held-streak counter, and clears it. A
+            // single tap → 1 tick of streak → resets immediately. A held
+            // key (terminal repeat) → streak climbs over time.
+            state.space_pressed_this_tick = true;
         }
         Action::CatchGolden => {
             state.catch_golden();
@@ -344,6 +374,9 @@ fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometry) {
         }
         Action::DevForceGolden(variant) => {
             force_spawn_golden(state, geom, variant);
+        }
+        Action::Misclick { col, row } => {
+            state.spawn_misclick(col, row);
         }
     }
 }
@@ -540,6 +573,10 @@ fn handle_event(
     current: &GameState,
     biscuit_rect: Rect,
     golden_rect: Rect,
+    play_area: Rect,
+    last_mouse_pos: &mut Option<(u16, u16)>,
+    help_hits: &[(HelpAction, Rect)],
+    prestige_reset_rect: Rect,
 ) {
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(
@@ -554,28 +591,115 @@ fn handle_event(
             current,
         ),
         Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
+            *last_mouse_pos = Some((m.column, m.row));
+            // M1+M2: try help-bar / prestige-reset hits first. These give
+            // the mouse-only player parity with `[u]/[p]/[s]/[a]/[g]/[q]/[r]`
+            // shortcuts. Consumed hits short-circuit the rest of the click
+            // pipeline so we don't also fire a misclick particle.
+            if try_help_click(
+                m.column,
+                m.row,
+                help_hits,
+                prestige_reset_rect,
+                mode,
+                running,
+                tx,
+                current,
+            ) {
+                return;
+            }
             handle_click(
                 m.column,
                 m.row,
                 m.modifiers,
+                MouseButton::Left,
                 tx,
                 *mode,
                 biscuit_rect,
                 golden_rect,
                 fingerer_rows,
                 upgrade_rows,
+                play_area,
+                current,
             );
         }
-        Event::Mouse(m) if m.kind == MouseEventKind::ScrollUp => {
-            let _ = m;
+        // J15: right-click is a "buy max" affordance for fingerer/upgrade
+        // rows (saves a modifier on macOS where Alt is awkward). On the
+        // biscuit / golden / dead zone it's a no-op so misclick acks
+        // don't fire and confuse the user.
+        Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Right) => {
+            *last_mouse_pos = Some((m.column, m.row));
+            if try_help_click(
+                m.column,
+                m.row,
+                help_hits,
+                prestige_reset_rect,
+                mode,
+                running,
+                tx,
+                current,
+            ) {
+                return;
+            }
+            handle_click(
+                m.column,
+                m.row,
+                m.modifiers,
+                MouseButton::Right,
+                tx,
+                *mode,
+                biscuit_rect,
+                golden_rect,
+                fingerer_rows,
+                upgrade_rows,
+                play_area,
+                current,
+            );
+        }
+        // Scroll wheel zooms the biscuit anywhere in the play area — the
+        // whole left column where the biscuit lives, including the void
+        // around a small biscuit at low zoom. Only the right-hand sidebar
+        // ignores scroll, so a player reflex-scrolling a long fingerer /
+        // upgrade list doesn't accidentally zoom out their cuque.
+        Event::Mouse(m)
+            if m.kind == MouseEventKind::ScrollUp && in_play_area(m.column, m.row, play_area) =>
+        {
             *zoom_idx = zoom_idx.saturating_sub(1);
         }
-        Event::Mouse(m) if m.kind == MouseEventKind::ScrollDown => {
-            let _ = m;
+        Event::Mouse(m)
+            if m.kind == MouseEventKind::ScrollDown && in_play_area(m.column, m.row, play_area) =>
+        {
             *zoom_idx = (*zoom_idx + 1).min(crate::ui::biscuit::level_count() - 1);
+        }
+        // K5: track mouse position for hover highlighting. Crossterm only
+        // emits Moved/Drag events when AnyMotion mouse mode is enabled
+        // (it is). The renderer reads `last_mouse_pos` to highlight the
+        // hovered row in sidebar/upgrades; missing or stale positions
+        // simply don't highlight anything.
+        Event::Mouse(m)
+            if matches!(
+                m.kind,
+                MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left)
+            ) =>
+        {
+            *last_mouse_pos = Some((m.column, m.row));
         }
         _ => {}
     }
+}
+
+/// True when the scroll happened anywhere inside the play-area rect — the
+/// whole left column the biscuit lives in (HUD-and-help-excluded). Cold
+/// frames (no rect yet) conservatively allow zoom so the very first scroll
+/// after launch isn't dropped.
+fn in_play_area(col: u16, row: u16, play_area: Rect) -> bool {
+    if play_area.width == 0 || play_area.height == 0 {
+        return true;
+    }
+    col >= play_area.x
+        && col < play_area.x + play_area.width
+        && row >= play_area.y
+        && row < play_area.y + play_area.height
 }
 
 fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
@@ -597,51 +721,116 @@ fn click_buy_qty(mods: KeyModifiers) -> BuyQty {
     }
 }
 
+/// Try to consume a click on a help-bar hint or the prestige-reset
+/// confirm line. Returns true when the click was handled — caller should
+/// short-circuit the rest of the pipeline (no biscuit/row/misclick path).
+///
+/// The keyboard shortcuts and the corresponding clickable hints share the
+/// same dispatch logic so behavior is identical across input methods.
+#[allow(clippy::too_many_arguments)]
+fn try_help_click(
+    col: u16,
+    row: u16,
+    help_hits: &[(HelpAction, Rect)],
+    prestige_reset_rect: Rect,
+    mode: &mut Mode,
+    running: &mut bool,
+    tx: &mpsc::Sender<Action>,
+    current: &GameState,
+) -> bool {
+    // Prestige-reset confirm: in-panel button. Match BEFORE help-bar so
+    // the confirm "wins" if the help bar happens to overlap it (it
+    // shouldn't, but defensive).
+    if rect_contains(prestige_reset_rect, col, row) && current.prestige_available() > 0 {
+        let _ = tx.send(Action::PrestigeReset);
+        *mode = Mode::Game;
+        return true;
+    }
+    for &(action, rect) in help_hits {
+        if !rect_contains(rect, col, row) {
+            continue;
+        }
+        match action {
+            HelpAction::OpenMode(target) => {
+                // Same toggle semantics the keyboard uses: tapping the
+                // hint for the active mode returns to Game.
+                *mode = if *mode == target { Mode::Game } else { target };
+            }
+            HelpAction::GrabGolden => {
+                if current.golden.is_some() {
+                    let _ = tx.send(Action::CatchGolden);
+                }
+            }
+            HelpAction::PrestigeReset => {
+                if current.prestige_available() > 0 {
+                    let _ = tx.send(Action::PrestigeReset);
+                    *mode = Mode::Game;
+                }
+            }
+            HelpAction::Quit => {
+                *running = false;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_click(
     col: u16,
     row: u16,
     mods: KeyModifiers,
+    button: MouseButton,
     tx: &mpsc::Sender<Action>,
     mode: Mode,
     biscuit: Rect,
     golden: Rect,
     fingerer_rows: &[(usize, Rect)],
     upgrade_rows: &[(usize, Rect)],
+    play_area: Rect,
+    current: &GameState,
 ) {
     // Golden cuques are catchable from ANY panel — match the keyboard 'g'
     // behavior, which has no mode guard. The marker still renders on the
     // biscuit while a non-Game panel is open, so the user expects clicking
-    // it to work regardless.
+    // it to work regardless. Right-click on a golden also catches (matches
+    // every other "click anywhere on the marker" affordance).
     if rect_contains(golden, col, row) {
         let _ = tx.send(Action::CatchGolden);
         return;
     }
-    // Clicking the biscuit itself is also mode-agnostic: the ass is always
-    // visible in the left column, and the user's reasonable expectation is
-    // that fingering works regardless of which panel is open on the right.
-    // (Mode-specific rows in the right column come AFTER, so a panel-row
-    // click is never confused for a biscuit click.)
+    // Clicking the biscuit itself is also mode-agnostic. Right-click on
+    // the biscuit is a no-op so a player can't accidentally finger the
+    // cuque with the wrong button. (We could overload it for "extra
+    // power" but that changes game behavior, which juice rules say no.)
     if rect_contains(biscuit, col, row) {
-        let _ = tx.send(Action::Click { col, row });
+        if button == MouseButton::Left {
+            let _ = tx.send(Action::Click { col, row });
+        }
         return;
     }
     // Mouse-buy fingerers from the sidebar in Game mode. Modifiers control
     // quantity (plain = 1, Shift = 10, Alt/Ctrl = max), matching the
-    // digit-key shortcuts so the two input methods stay symmetric.
+    // digit-key shortcuts so the two input methods stay symmetric. Right-
+    // click is the always-Max affordance regardless of modifiers.
     if mode == Mode::Game {
         for &(idx, r) in fingerer_rows {
             if rect_contains(r, col, row) {
-                let _ = tx.send(Action::BuyFingerer {
-                    idx,
-                    qty: click_buy_qty(mods),
-                });
+                let qty = if button == MouseButton::Right {
+                    BuyQty::Max
+                } else {
+                    click_buy_qty(mods)
+                };
+                let _ = tx.send(Action::BuyFingerer { idx, qty });
                 return;
             }
         }
     }
     // Mouse-buy upgrades from the Upgrades panel. Modifiers ignored — each
-    // upgrade is a one-shot purchase.
+    // upgrade is a one-shot purchase. Right-click also buys (no "max" for
+    // single-shot purchases — but accept the click so right-click feels
+    // active everywhere it makes sense).
     if mode == Mode::Upgrades {
         for &(idx, r) in upgrade_rows {
             if rect_contains(r, col, row) {
@@ -650,6 +839,28 @@ fn handle_click(
             }
         }
     }
+    // J10: nothing actionable under the click. Acknowledge it visually with
+    // a brief "·" so the dead-zone (e.g. the air around a 25%-zoom biscuit)
+    // doesn't feel inert. Skip when:
+    //   - the click was right-button (right-click without a target is a
+    //     true no-op);
+    //   - the click landed on an orbital hand glyph — those are decoration,
+    //     not click targets, but they're visually present, so a misclick
+    //     "·" replacing part of `[]` / `:*` / `>>` reads as flicker.
+    //   - M3: the click landed OUTSIDE the play area (HUD title, sidebar,
+    //     debug pane, help bar). Inert UI chrome shouldn't get a "·"
+    //     overpainted into it — that visibly damages the title text and
+    //     reads as a bug.
+    if button != MouseButton::Left {
+        return;
+    }
+    if !rect_contains(play_area, col, row) {
+        return;
+    }
+    if crate::ui::hands::occupied_at(col, row, biscuit, current) {
+        return;
+    }
+    let _ = tx.send(Action::Misclick { col, row });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -668,8 +879,12 @@ fn handle_key(
     let mods = k.modifiers;
     match code {
         KeyCode::Char('q') => *running = false,
+        // J12: Esc dismisses panels back to Game mode but is a NO-OP from
+        // Game itself. Quit is `q` only — Esc-to-quit was an aggressive
+        // default that surprised playtesters who reflex-pressed it to
+        // "deselect" with no panel open.
         KeyCode::Esc => match *mode {
-            Mode::Game => *running = false,
+            Mode::Game => {}
             _ => *mode = Mode::Game,
         },
         KeyCode::Char('s') | KeyCode::Char('S') => {

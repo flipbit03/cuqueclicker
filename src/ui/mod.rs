@@ -7,12 +7,13 @@ pub mod hands;
 pub mod prestige;
 pub mod sidebar;
 pub mod stats;
+pub mod toast;
 pub mod upgrades;
 
 use ratatui::{prelude::*, widgets::*};
 
 use crate::format;
-use crate::game::state::{Buff, GameState, TICK_HZ};
+use crate::game::state::{Buff, GameState, HUD_FLASH_TICKS, TICK_HZ};
 use crate::i18n::t;
 
 // Hardcoded as "0.0.0" in source; release.yml patches Cargo.toml before
@@ -43,9 +44,30 @@ pub enum Mode {
     Prestige,
 }
 
+/// Click target for a help-bar hint or for the prestige-reset confirm
+/// line. Mirrors the keyboard shortcuts so the mouse-first player has
+/// equivalent reach to every action a key would fire.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HelpAction {
+    /// Open the named mode (or close it back to Game if already there).
+    OpenMode(Mode),
+    /// Catch whatever golden is on screen.
+    GrabGolden,
+    /// Confirm-and-claim prestige reset (only when prestige_available > 0).
+    PrestigeReset,
+    /// Quit the program.
+    Quit,
+}
+
 pub struct DrawOutput {
     pub biscuit_rect: Rect,
     pub golden_rect: Rect,
+    /// The whole left column where the biscuit + hands + particles live —
+    /// i.e. "the box that displays the ass." Used by the input router so
+    /// the scroll-wheel zoom fires anywhere in this region (including the
+    /// vast empty space around a small biscuit at low zoom), and only the
+    /// right-hand sidebar opts out of zoom.
+    pub play_area: Rect,
     /// `(upgrade_idx, screen_row_rect)` pairs for the Upgrades panel —
     /// populated only when the active mode renders that panel; empty
     /// otherwise. The click router hit-tests these for `BuyUpgrade`.
@@ -54,6 +76,16 @@ pub struct DrawOutput {
     pub upgrade_rows: Vec<(usize, Rect)>,
     /// `(fingerer_idx, screen_row_rect)` for the Game-mode sidebar.
     pub fingerer_rows: Vec<(usize, Rect)>,
+    /// (action, rect) for every clickable help-bar hint at the bottom of
+    /// the play column. Mouse-first players use these to switch panels,
+    /// catch goldens, prestige-reset, and quit — all of which used to be
+    /// keyboard-only. Empty rects when the hint is non-actionable
+    /// (e.g. `[Space/Click] finger` is informational, not a click target).
+    pub help_hits: Vec<(HelpAction, Rect)>,
+    /// Click rect for the `Press [r] to reset and claim` confirm line in
+    /// the Prestige panel. Default rect when not in Prestige mode or no
+    /// prestige is available.
+    pub prestige_reset_rect: Rect,
 }
 
 fn wrapped_height(text: &str, width: u16) -> u16 {
@@ -81,7 +113,7 @@ fn wrapped_height(text: &str, width: u16) -> u16 {
 }
 
 fn draw_zoom_indicator(frame: &mut Frame, area: Rect, label: &str) {
-    let text = format!("[-/+] zoom {}", label);
+    let text = format!("zoom {}", label);
     let w = text.chars().count() as u16;
     if area.width < w || area.height == 0 {
         return;
@@ -103,6 +135,7 @@ pub fn draw(
     mode: Mode,
     zoom_idx: usize,
     debug: bool,
+    mouse_pos: Option<(u16, u16)>,
 ) -> DrawOutput {
     let lang = t();
     let area = frame.area();
@@ -123,13 +156,47 @@ pub fn draw(
     ])
     .split(cols[0]);
 
-    let mut hud_spans: Vec<Span> = vec![Span::raw(format!(
-        "{}: {}   {}: {}",
-        lang.hud_cuques,
-        format::big(state.cuques),
-        lang.hud_fps,
-        format::rate(state.fps())
-    ))];
+    // J5 count-up: render the smoothed `displayed_*` values rather than the
+    // raw current values. Big jumps (golden, max-buy, F4) ease in instead of
+    // snapping. Tween itself runs in `state.tick()`.
+    //
+    // Color sweep: TWO competing channels — green for cuques going UP
+    // (income, golden, F4), red for cuques going DOWN (purchase,
+    // prestige reset). Whichever channel is stronger this frame drives
+    // the lerp toward white. So a buy that lands during a still-decaying
+    // gain flash correctly flips the digits red as the spend channel
+    // overtakes the fading gain. Both lerp toward bright white at t=0,
+    // which matches the resting (no-flash) style — no hard cut.
+    let gain_t = (state.cuques_flash_ticks as f32 / HUD_FLASH_TICKS as f32).clamp(0.0, 1.0);
+    let spend_t = (state.cuques_spend_flash_ticks as f32 / HUD_FLASH_TICKS as f32).clamp(0.0, 1.0);
+    const FLASH_GAIN: (f32, f32, f32) = (80.0, 255.0, 80.0); // bright green
+    const FLASH_SPEND: (f32, f32, f32) = (255.0, 90.0, 90.0); // urgent red
+    const FLASH_REST: (f32, f32, f32) = (255.0, 255.0, 255.0);
+    let (peak, t) = if spend_t > gain_t {
+        (FLASH_SPEND, spend_t)
+    } else {
+        (FLASH_GAIN, gain_t)
+    };
+    let mix = 1.0 - t;
+    let r = peak.0 + (FLASH_REST.0 - peak.0) * mix;
+    let g = peak.1 + (FLASH_REST.1 - peak.1) * mix;
+    let b = peak.2 + (FLASH_REST.2 - peak.2) * mix;
+    let cuques_style = Style::default()
+        .fg(Color::Rgb(
+            r.clamp(0.0, 255.0) as u8,
+            g.clamp(0.0, 255.0) as u8,
+            b.clamp(0.0, 255.0) as u8,
+        ))
+        .add_modifier(Modifier::BOLD);
+    let mut hud_spans: Vec<Span> = vec![
+        Span::raw(format!("{}: ", lang.hud_cuques)),
+        Span::styled(format::big(state.displayed_cuques), cuques_style),
+        Span::raw(format!(
+            "   {}: {}",
+            lang.hud_fps,
+            format::rate(state.displayed_fps)
+        )),
+    ];
     if state.prestige > 0 {
         hud_spans.push(Span::styled(
             format!(
@@ -181,9 +248,10 @@ pub fn draw(
     let hud = Paragraph::new(Line::from(hud_spans));
     frame.render_widget(hud, hud_inner);
 
-    let biscuit_rect = biscuit::draw(frame, left[1], state.clench_ticks > 0, zoom_idx);
+    let biscuit_rect = biscuit::draw(frame, left[1], state, zoom_idx);
     hands::draw(frame, left[1], biscuit_rect, state);
     effects::draw_particles(frame, biscuit_rect, &state.particles);
+    effects::draw_misclicks(frame, &state.misclick_particles);
     draw_zoom_indicator(
         frame,
         left[1],
@@ -198,25 +266,165 @@ pub fn draw(
         None => Rect::default(),
     };
 
-    let help = Paragraph::new(help_text)
-        .style(Style::default().fg(Color::DarkGray))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(help, left[2]);
+    // J1: achievement toast overlay. Lives in `left[1]` (biscuit/main area)
+    // so it covers nothing important on the right; auto-dismisses after
+    // TOAST_TICKS via the sim. We render *after* biscuit/golden so it
+    // always sits on top.
+    toast::draw(frame, left[1], state);
+
+    // Custom help-bar render: lay out `[X] label` tokens left-to-right,
+    // wrapping at the rect width, paint each with mode-aware styling
+    // (active mode bolded), and return per-token click rects so the
+    // mouse-first player can drive the game without ever touching a key.
+    let help_hits = draw_help(frame, left[2], help_text, mode, mouse_pos);
 
     let mut upgrade_rows: Vec<(usize, Rect)> = Vec::new();
     let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
+    let mut prestige_reset_rect = Rect::default();
     match mode {
-        Mode::Game => fingerer_rows = sidebar::draw(frame, cols[1], state),
+        Mode::Game => fingerer_rows = sidebar::draw(frame, cols[1], state, mouse_pos),
         Mode::Stats => stats::draw(frame, cols[1], state),
         Mode::Achievements => achievements::draw(frame, cols[1], state),
-        Mode::Upgrades => upgrade_rows = upgrades::draw(frame, cols[1], state),
-        Mode::Prestige => prestige::draw(frame, cols[1], state),
+        Mode::Upgrades => upgrade_rows = upgrades::draw(frame, cols[1], state, mouse_pos),
+        Mode::Prestige => prestige_reset_rect = prestige::draw(frame, cols[1], state, mouse_pos),
     }
 
     DrawOutput {
         biscuit_rect,
         golden_rect,
+        play_area: left[1],
         upgrade_rows,
         fingerer_rows,
+        help_hits,
+        prestige_reset_rect,
+    }
+}
+
+/// Custom help-bar renderer.
+///
+/// Splits the help string into "tokens" (each token is a contiguous
+/// non-whitespace run of `[X] label words`, separated from the next by
+/// a double space or a newline — the convention used in `i18n::Lang`'s
+/// help strings). Each token is laid out left-to-right with wrap at
+/// the rect's width, painted at the resolved screen position, and
+/// matched against a (mode, key) → action table. Clickable tokens get
+/// a slightly brighter color and BOLD; the token under the mouse
+/// cursor gets an additional brightness lift + bg fill so the player
+/// reads it as a button.
+fn draw_help(
+    frame: &mut Frame,
+    area: Rect,
+    text: &str,
+    mode: Mode,
+    mouse_pos: Option<(u16, u16)>,
+) -> Vec<(HelpAction, Rect)> {
+    let mut hits: Vec<(HelpAction, Rect)> = Vec::new();
+    if area.width == 0 || area.height == 0 {
+        return hits;
+    }
+    let buf = frame.buffer_mut();
+    let mut cursor_x: u16 = 0;
+    let mut cursor_y: u16 = 0;
+    for line in text.split('\n') {
+        // Tokens are separated by a literal `  ` (two spaces). Single
+        // spaces inside a token are content (e.g. "back to game").
+        for token in line.split("  ") {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let w = token.chars().count() as u16;
+            // Wrap if the token wouldn't fit on the current line.
+            if cursor_x + w > area.width && cursor_x > 0 {
+                cursor_y += 1;
+                cursor_x = 0;
+            }
+            if cursor_y >= area.height {
+                break;
+            }
+            let action = map_help_token(token, mode);
+            let active = matches!(action, Some(HelpAction::OpenMode(m)) if m == mode);
+            let token_rect = Rect {
+                x: area.x + cursor_x,
+                y: area.y + cursor_y,
+                width: w.min(area.width.saturating_sub(cursor_x)),
+                height: 1,
+            };
+            // Style picker:
+            //  - active mode hint                : bright yellow, BOLD
+            //  - actionable (clickable)          : light gray, BOLD
+            //  - informational                   : dark gray
+            //  - hovered                         : color lifted, bg tint
+            // Hover lift fires ONLY on actionable hints — informational
+            // tokens like `[Space/Click] finger` and `[Shift] x10` are
+            // descriptive labels with no click handler, so brightening
+            // them on hover would advertise a button that doesn't exist.
+            let hovered = action.is_some()
+                && mouse_pos
+                    .map(|(mx, my)| {
+                        mx >= token_rect.x
+                            && mx < token_rect.x + token_rect.width
+                            && my == token_rect.y
+                    })
+                    .unwrap_or(false);
+            let mut style = if active {
+                Style::default()
+                    .fg(Color::Rgb(255, 220, 120))
+                    .add_modifier(Modifier::BOLD)
+            } else if action.is_some() {
+                Style::default()
+                    .fg(Color::Rgb(180, 180, 180))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            if hovered {
+                style = style
+                    .fg(Color::Rgb(255, 255, 255))
+                    .bg(Color::Rgb(40, 40, 50))
+                    .add_modifier(Modifier::BOLD);
+            }
+            buf.set_string(token_rect.x, token_rect.y, token, style);
+            if let Some(a) = action {
+                hits.push((a, token_rect));
+            }
+            cursor_x += w + 2; // double-space separator
+        }
+        cursor_y += 1;
+        cursor_x = 0;
+        if cursor_y >= area.height {
+            break;
+        }
+    }
+    hits
+}
+
+/// Match a help-bar token like `"[u] upgrades"` to a `HelpAction`,
+/// disambiguated by the current mode (so `[s] stats` opens Stats from
+/// Game but `[s/Esc] back to game` from Stats returns to Game).
+fn map_help_token(token: &str, mode: Mode) -> Option<HelpAction> {
+    // Extract the bracketed key. We accept the first `[...]` group;
+    // everything after the first `]` is descriptive label.
+    let open = token.find('[')?;
+    let close = token[open + 1..].find(']')? + open + 1;
+    let key = &token[open + 1..close];
+    // Universal hints first.
+    if key.eq_ignore_ascii_case("q") {
+        return Some(HelpAction::Quit);
+    }
+    // Back-to-game from any non-Game mode (the `[X/Esc] back ...` pattern
+    // covers stats / achievements / upgrades / prestige).
+    if mode != Mode::Game && (key.contains("Esc") || key.contains("esc")) {
+        return Some(HelpAction::OpenMode(Mode::Game));
+    }
+    // Single-letter mode openers, only meaningful from Game.
+    match (mode, key) {
+        (Mode::Game, "u") | (Mode::Game, "U") => Some(HelpAction::OpenMode(Mode::Upgrades)),
+        (Mode::Game, "p") | (Mode::Game, "P") => Some(HelpAction::OpenMode(Mode::Prestige)),
+        (Mode::Game, "s") | (Mode::Game, "S") => Some(HelpAction::OpenMode(Mode::Stats)),
+        (Mode::Game, "a") | (Mode::Game, "A") => Some(HelpAction::OpenMode(Mode::Achievements)),
+        (Mode::Game, "g") | (Mode::Game, "G") => Some(HelpAction::GrabGolden),
+        (Mode::Prestige, "r") | (Mode::Prestige, "R") => Some(HelpAction::PrestigeReset),
+        _ => None,
     }
 }
