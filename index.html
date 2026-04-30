@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CuqueClicker (web)</title>
+    <link data-trunk rel="rust" data-target-name="cuqueclicker_lib" />
+    <style>
+      /* Black margin around the terminal. Body padding becomes the border;
+         the canvas fills the body's content box. WebGl2Backend's flush()
+         runs check_canvas_resize() every frame and re-sizes the GPU
+         buffer whenever client_width/height changes — so keeping the
+         canvas glued to viewport size via CSS is all the resize plumbing
+         we need. */
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: #000;
+        height: 100%;
+        overflow: hidden;
+      }
+      body {
+        padding: 24px;
+        box-sizing: border-box;
+        cursor: default;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        outline: none;
+      }
+      /* Centered footer in the bottom 24px of the body's black padding
+         gutter — sits above the canvas, doesn't crowd the HUD, doesn't
+         need to be rendered through ratatui. */
+      .footer {
+        position: fixed;
+        left: 50%;
+        bottom: 12px;
+        transform: translateX(-50%);
+        font: 14px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color: #ccc;
+        z-index: 10;
+        white-space: nowrap;
+      }
+      .footer a {
+        color: #ccc;
+        text-decoration: underline;
+      }
+      .footer a:hover { color: #fff; }
+    </style>
+  </head>
+  <body>
+    <!-- WebGl2Backend appends a <canvas> into <body> on first draw. -->
+    <div class="footer">
+      Made with &#x2764;&#xFE0F; by <a
+        href="https://github.com/flipbit03/cuqueclicker"
+        target="_blank"
+        rel="noopener noreferrer">flipbit03</a>
+    </div>
+  </body>
+</html>

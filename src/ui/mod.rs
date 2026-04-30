@@ -35,7 +35,7 @@ fn hud_title() -> String {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
     Game,
     Stats,
@@ -47,7 +47,7 @@ pub enum Mode {
 /// Click target for a help-bar hint or for the prestige-reset confirm
 /// line. Mirrors the keyboard shortcuts so the mouse-first player has
 /// equivalent reach to every action a key would fire.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HelpAction {
     /// Open the named mode (or close it back to Game if already there).
     OpenMode(Mode),
@@ -343,6 +343,14 @@ fn draw_help(
                 break;
             }
             let action = map_help_token(token, mode);
+            // Hide `[q] quit` (or its localized equivalent) on platforms
+            // where the wasm/native runner has no authority to exit —
+            // see `platform::Capabilities::can_quit`. Skipping renders
+            // AND skips appending to `help_hits`, so the next token
+            // slides into the position cursor without leaving a gap.
+            if matches!(action, Some(HelpAction::Quit)) && !crate::platform::CAPABILITIES.can_quit {
+                continue;
+            }
             let active = matches!(action, Some(HelpAction::OpenMode(m)) if m == mode);
             let token_rect = Rect {
                 x: area.x + cursor_x,

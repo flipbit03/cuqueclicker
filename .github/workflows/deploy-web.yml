@@ -88,8 +88,17 @@ jobs:
       - name: Install trunk
         # `cargo binstall` grabs the prebuilt binary in seconds instead
         # of compiling trunk from source (~2 min on a fresh runner).
+        #
+        # The `--force` flag is load-bearing: Swatinem/rust-cache caches
+        # `$CARGO_HOME/.crates.toml` + `.crates2.json` (the cargo install
+        # metadata), so on a cache hit binstall sees "trunk is already
+        # installed" and skips the actual download — but the binary
+        # itself is NOT part of the cache, so the next step dies with
+        # `trunk: command not found`. `--force` ignores the metadata
+        # check and re-downloads the binary every run (~3s on Pages
+        # runners, cheap).
         uses: cargo-bins/cargo-binstall@main
-      - run: cargo binstall trunk --no-confirm --locked
+      - run: cargo binstall trunk --no-confirm --force
 
       - name: Build wasm bundle
         # `--public-url /cuqueclicker/` is what makes the emitted asset

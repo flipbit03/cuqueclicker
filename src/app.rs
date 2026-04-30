@@ -1,40 +1,27 @@
-//! Main application. Runs on two threads:
+//! Native runner. Two threads:
 //!
 //! - **main thread**: owns the terminal, renders snapshots of the game state,
-//!   captures crossterm events, and translates them into [`Action`] messages
-//!   for the sim. Never blocks the sim — a slow render (SSH lag, terminal
-//!   resize, stuck flush) is invisible to game logic.
+//!   captures crossterm events, normalizes them into [`crate::input::InputEvent`]s,
+//!   and feeds them to the platform-agnostic input router (which produces
+//!   [`Action`]s + mutates [`UiState`]). Never blocks the sim — a slow render
+//!   (SSH lag, terminal resize, stuck flush) is invisible to game logic.
 //! - **sim thread**: owns the canonical [`GameState`], runs the 20Hz tick
-//!   loop, drains [`Action`]s, saves to disk, and publishes snapshots via
+//!   loop via [`crate::sim::sim_tick`], drains [`Action`]s, saves to disk
+//!   through the [`Persistence`] impl, and publishes snapshots via
 //!   [`ArcSwap`]. Tick cadence is driven by `mpsc::recv_timeout(until_next_tick)`,
 //!   so it wakes exactly on tick deadlines or incoming actions — no busy spin,
 //!   no lost ticks under arbitrary render delay.
 //!
-//! State flow:
-//!
-//! ```text
-//!   main                                    sim
-//!   ─────                                   ─────
-//!   terminal.draw(&snapshot)           ┌──  sim_loop:
-//!     ├─ computes biscuit/golden rects │     mut state
-//!     └─ returns visible upgrade/      │     loop:
-//!        fingerer slot ordering        │       recv_timeout(next_tick)
-//!                                      │         │
-//!   event::poll + translate            │         ├─ Action → apply
-//!     ├─ Click{col,row}      ──────────┼─> mpsc  ├─ Timeout → tick N times
-//!     ├─ BuyFingerer{idx,qty}          │         └─ snapshot.store(state.clone())
-//!     ├─ UpdateGeometry{rects}         │     on shutdown: save, exit
-//!     ├─ ...                           │
-//!     └─ DevForceGolden/AddCuques  ────┘
-//!
-//!   snapshot.load_full() ◄─── ArcSwap ◄────── sim publishes every iteration
-//!   demo_rx.try_iter()   ◄─── mpsc    ◄────── demo driver panel swaps / quit
-//! ```
+//! The cross-platform half (input router, `apply_action`, `sim_tick`) is in
+//! `src/input.rs` and `src/sim.rs`. This file owns native-specific glue:
+//! crossterm event translation, threading, save scheduling, and the
+//! demo-recorder autopilot.
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    self, Event, KeyCode as CtKeyCode, KeyEventKind, KeyModifiers, MouseButton as CtMouseButton,
+    MouseEvent as CtMouseEvent, MouseEventKind,
 };
 use rand::RngExt;
 use ratatui::{Terminal, prelude::*};
@@ -50,10 +37,15 @@ use crate::game::achievement::ACHIEVEMENTS;
 use crate::game::fingerer;
 use crate::game::fingerer::FINGERERS;
 use crate::game::golden::{self, GoldenVariant};
-use crate::game::state::{GameState, TICK_DT, TICK_HZ};
+use crate::game::state::{GameState, TICK_HZ};
 use crate::game::upgrade::UPGRADES;
-use crate::save;
-use crate::ui::{self, HelpAction, Mode};
+use crate::input::{
+    self, InputContext, InputEvent, KeyCode as InKeyCode, Modifiers, MouseButton as InMouseButton,
+    UiState, WheelDelta,
+};
+use crate::platform::Persistence;
+use crate::sim::{self, Action, SimGeometry};
+use crate::ui::{self, Mode};
 
 const SAVE_INTERVAL_TICKS: u64 = TICK_HZ as u64 * 10;
 // Golden cooldown override used only during demo recording so the viewer
@@ -68,49 +60,6 @@ const INPUT_POLL_MS: u64 = 16;
 // = 1s at 20Hz.
 const MAX_TICK_CATCHUP: u32 = 20;
 
-/// Buy quantity for a fingerer purchase action.
-#[derive(Clone, Copy)]
-enum BuyQty {
-    One,
-    Ten,
-    Max,
-}
-
-/// Commands the main (render) thread sends to the sim thread. The sim is
-/// the sole authority on [`GameState`] mutation — main's event handler only
-/// translates input into these messages.
-enum Action {
-    Click {
-        col: u16,
-        row: u16,
-    },
-    ClickCenter,
-    CatchGolden,
-    BuyFingerer {
-        idx: usize,
-        qty: BuyQty,
-    },
-    BuyUpgrade(usize),
-    PrestigeReset,
-    /// Latest render-computed biscuit geometry, so the sim can place goldens
-    /// and auto-particles inside the current layout. The golden rect stays
-    /// on the main thread (only the click handler reads it).
-    UpdateGeometry {
-        biscuit: Rect,
-    },
-    /// Dev-only cheats (F-keys). Gated at the main-thread handler by
-    /// `debug`; the sim trusts whatever arrives.
-    DevAddCuques(f64),
-    DevForceGolden(GoldenVariant),
-    /// J10: a click that didn't hit anything actionable. Sim spawns a
-    /// short-lived "·" misclick particle at the screen point so dead-zone
-    /// clicks visibly register.
-    Misclick {
-        col: u16,
-        row: u16,
-    },
-}
-
 /// Messages the sim thread sends back to main. Used exclusively by the
 /// demo driver to steer the on-camera panel cycle and to request a clean
 /// shutdown when the recording duration elapses.
@@ -123,14 +72,21 @@ pub struct App {
     state: GameState,
     debug: bool,
     demo_seconds: Option<u32>,
+    persistence: Persistence,
 }
 
 impl App {
-    pub fn new(state: GameState, debug: bool, demo_seconds: Option<u32>) -> Self {
+    pub fn new(
+        state: GameState,
+        debug: bool,
+        demo_seconds: Option<u32>,
+        persistence: Persistence,
+    ) -> Self {
         Self {
             state,
             debug,
             demo_seconds,
+            persistence,
         }
     }
 
@@ -142,6 +98,7 @@ impl App {
             state,
             debug,
             demo_seconds,
+            persistence,
         } = self;
 
         let snapshot = Arc::new(ArcSwap::from_pointee(state.clone()));
@@ -162,16 +119,13 @@ impl App {
                         sim_msg_tx,
                         shutdown,
                         demo_seconds,
+                        persistence,
                     );
                 })
                 .expect("spawn sim thread")
         };
 
-        // UI-only state that lives on the main thread. None of this is
-        // persisted or reachable from sim.
-        let mut mode = Mode::Game;
-        let mut zoom_idx: usize = 0;
-        let mut running = true;
+        let mut ui = UiState::new();
         let mut upgrade_rows: Vec<(usize, Rect)> = Vec::new();
         let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
         let mut biscuit_rect = Rect::default();
@@ -181,26 +135,25 @@ impl App {
         // Both are recomputed every frame and consumed by the click router
         // so the mouse-first player has equivalents for `[u]`, `[p]`,
         // `[s]`, `[a]`, `[g]`, `[q]`, and the `[r] reset` confirm.
-        let mut help_hits: Vec<(HelpAction, Rect)> = Vec::new();
+        let mut help_hits: Vec<(crate::ui::HelpAction, Rect)> = Vec::new();
         let mut prestige_reset_rect = Rect::default();
-        // K5: latest mouse position seen via crossterm's `MouseEventKind::Moved`.
-        // Lives on main only — render-time transient, not persisted, never sent
-        // to the sim. `ui::draw` consumes it to highlight the hovered row.
-        let mut last_mouse_pos: Option<(u16, u16)> = None;
+        // Reused per-event scratch buffer — `process_input_event` appends
+        // produced actions here, then we drain it into the mpsc channel.
+        let mut actions: Vec<Action> = Vec::with_capacity(4);
 
-        while running && !shutdown.load(Ordering::Relaxed) {
+        while ui.running && !shutdown.load(Ordering::Relaxed) {
             // Drain any panel/quit requests from the demo driver before we draw,
             // so the frame we render reflects them.
             for msg in sim_msg_rx.try_iter() {
                 match msg {
-                    SimMsg::DemoSetMode(m) => mode = m,
-                    SimMsg::DemoQuit => running = false,
+                    SimMsg::DemoSetMode(m) => ui.mode = m,
+                    SimMsg::DemoQuit => ui.running = false,
                 }
             }
 
             let current = snapshot.load_full();
             terminal.draw(|f| {
-                let out = ui::draw(f, &current, mode, zoom_idx, debug, last_mouse_pos);
+                let out = ui::draw(f, &current, ui.mode, ui.zoom_idx, debug, ui.last_mouse_pos);
                 biscuit_rect = out.biscuit_rect;
                 golden_rect = out.golden_rect;
                 play_area = out.play_area;
@@ -217,25 +170,26 @@ impl App {
             });
 
             if event::poll(Duration::from_millis(INPUT_POLL_MS))? {
+                let ctx = InputContext {
+                    fingerer_rows: &fingerer_rows,
+                    upgrade_rows: &upgrade_rows,
+                    help_hits: &help_hits,
+                    biscuit_rect,
+                    golden_rect,
+                    play_area,
+                    prestige_reset_rect,
+                    debug,
+                    current: &current,
+                };
                 loop {
                     let ev = event::read()?;
-                    handle_event(
-                        ev,
-                        &action_tx,
-                        &mut mode,
-                        &mut zoom_idx,
-                        &mut running,
-                        &fingerer_rows,
-                        &upgrade_rows,
-                        debug,
-                        &current,
-                        biscuit_rect,
-                        golden_rect,
-                        play_area,
-                        &mut last_mouse_pos,
-                        &help_hits,
-                        prestige_reset_rect,
-                    );
+                    if let Some(input_ev) = translate_crossterm(ev) {
+                        actions.clear();
+                        input::process_input_event(input_ev, &mut ui, &ctx, &mut actions);
+                        for a in actions.drain(..) {
+                            let _ = action_tx.send(a);
+                        }
+                    }
                     if !event::poll(Duration::ZERO)? {
                         break;
                     }
@@ -260,6 +214,7 @@ fn sim_loop(
     sim_msg_tx: mpsc::Sender<SimMsg>,
     shutdown: Arc<AtomicBool>,
     demo_seconds: Option<u32>,
+    persistence: Persistence,
 ) {
     let tick_dt = Duration::from_micros(1_000_000 / TICK_HZ as u64);
     let mut next_tick = Instant::now() + tick_dt;
@@ -277,7 +232,7 @@ fn sim_loop(
         // comes first. No busy spin, no tick drift.
         let timeout = next_tick.saturating_duration_since(Instant::now());
         match actions.recv_timeout(timeout) {
-            Ok(action) => apply_action(&mut state, action, &mut geom),
+            Ok(action) => sim::apply_action(&mut state, action, &mut geom),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -287,15 +242,26 @@ fn sim_loop(
         // thousands of catch-up ticks.
         let mut catchup = 0u32;
         while Instant::now() >= next_tick {
-            sim_tick(
-                &mut state,
-                &geom,
-                demo_seconds,
-                &mut demo_ticks,
-                &mut demo_golden_spawns,
-                &mut ticks_since_save,
-                &sim_msg_tx,
-            );
+            sim::sim_tick(&mut state, &geom);
+            // Native-only post-tick concerns: demo-recorder autopilot and
+            // periodic save scheduling. Both are wrapped around the
+            // platform-agnostic `sim::sim_tick` call above.
+            if demo_seconds.is_some() {
+                demo_driver_tick(
+                    &mut state,
+                    &geom,
+                    demo_seconds,
+                    &mut demo_ticks,
+                    &mut demo_golden_spawns,
+                    &sim_msg_tx,
+                );
+            } else {
+                ticks_since_save += 1;
+                if ticks_since_save >= SAVE_INTERVAL_TICKS {
+                    ticks_since_save = 0;
+                    let _ = persistence.save(&state);
+                }
+            }
             next_tick += tick_dt;
             catchup += 1;
             if catchup >= MAX_TICK_CATCHUP && Instant::now() > next_tick {
@@ -313,151 +279,8 @@ fn sim_loop(
     // mode runs on ephemeral state and never touches disk.
     if demo_seconds.is_none() {
         state.tick_achievements();
-        let _ = save::save(&state);
+        let _ = persistence.save(&state);
     }
-}
-
-#[derive(Clone, Copy, Default)]
-struct SimGeometry {
-    biscuit: Rect,
-}
-
-fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometry) {
-    match action {
-        Action::Click { col, row } => {
-            let r = geom.biscuit;
-            if r.width > 0
-                && col >= r.x
-                && col < r.x + r.width
-                && row >= r.y
-                && row < r.y + r.height
-            {
-                state.click((col, row), r);
-            }
-        }
-        Action::ClickCenter => {
-            let r = geom.biscuit;
-            if r.width > 0 && r.height > 0 {
-                state.click((r.x + r.width / 2, r.y + r.height / 2), r);
-            }
-            // Mark this tick as "saw a spacebar press." `tick()` reads the
-            // flag, advances the held-streak counter, and clears it. A
-            // single tap → 1 tick of streak → resets immediately. A held
-            // key (terminal repeat) → streak climbs over time.
-            state.space_pressed_this_tick = true;
-        }
-        Action::CatchGolden => {
-            state.catch_golden();
-        }
-        Action::BuyFingerer { idx, qty } => match qty {
-            BuyQty::One => {
-                state.buy(idx);
-            }
-            BuyQty::Ten => {
-                state.buy_n(idx, 10);
-            }
-            BuyQty::Max => {
-                state.buy_max(idx);
-            }
-        },
-        Action::BuyUpgrade(idx) => {
-            state.buy_upgrade(idx);
-        }
-        Action::PrestigeReset => {
-            state.prestige_reset();
-        }
-        Action::UpdateGeometry { biscuit } => {
-            *geom = SimGeometry { biscuit };
-        }
-        Action::DevAddCuques(n) => {
-            state.dev_add_cuques(n);
-        }
-        Action::DevForceGolden(variant) => {
-            force_spawn_golden(state, geom, variant);
-        }
-        Action::Misclick { col, row } => {
-            state.spawn_misclick(col, row);
-        }
-    }
-}
-
-fn sim_tick(
-    state: &mut GameState,
-    geom: &SimGeometry,
-    demo_seconds: Option<u32>,
-    demo_ticks: &mut u64,
-    demo_golden_spawns: &mut u32,
-    ticks_since_save: &mut u64,
-    sim_msg_tx: &mpsc::Sender<SimMsg>,
-) {
-    state.tick();
-    state.tick_golden();
-    maybe_spawn_golden(state, geom);
-    maybe_spawn_auto_particle(state, geom);
-    maybe_idle_clench(state);
-    if demo_seconds.is_some() {
-        demo_driver_tick(
-            state,
-            geom,
-            demo_seconds,
-            demo_ticks,
-            demo_golden_spawns,
-            sim_msg_tx,
-        );
-        return;
-    }
-    *ticks_since_save += 1;
-    if *ticks_since_save >= SAVE_INTERVAL_TICKS {
-        *ticks_since_save = 0;
-        let _ = save::save(state);
-    }
-}
-
-fn maybe_idle_clench(state: &mut GameState) {
-    if state.clench_ticks > 0 {
-        return;
-    }
-    // ~1 per 45s average at 20Hz
-    if rand::rng().random::<f64>() < 1.0 / 900.0 {
-        state.trigger_clench();
-    }
-}
-
-fn maybe_spawn_auto_particle(state: &mut GameState, geom: &SimGeometry) {
-    let fps = state.fps();
-    if fps <= 0.0 || geom.biscuit.width < 4 || geom.biscuit.height < 4 {
-        return;
-    }
-    let target_rate = fps.sqrt().clamp(0.5, 8.0);
-    let prob = target_rate * TICK_DT;
-    let mut rng = rand::rng();
-    if rng.random::<f64>() >= prob {
-        return;
-    }
-    // Random anchor within the biscuit, with a small inset so the "+N" text
-    // doesn't clip into the border.
-    let frac_x = rng.random_range(0.05_f32..=0.95);
-    let frac_y = rng.random_range(0.10_f32..=0.95);
-    state.spawn_auto_particle(frac_x, frac_y);
-}
-
-fn maybe_spawn_golden(state: &mut GameState, geom: &SimGeometry) {
-    if state.golden.is_some() || state.golden_cooldown > 0 {
-        return;
-    }
-    if geom.biscuit.width < 8 || geom.biscuit.height < 5 {
-        return;
-    }
-    state.golden = Some(golden::spawn_in(geom.biscuit));
-}
-
-fn force_spawn_golden(state: &mut GameState, geom: &SimGeometry, variant: GoldenVariant) {
-    if geom.biscuit.width < 8 || geom.biscuit.height < 5 {
-        return;
-    }
-    let mut g = golden::spawn_in(geom.biscuit);
-    g.variant = variant;
-    state.golden = Some(g);
 }
 
 /// Demo-mode autopilot, running on the sim thread. Mutates state directly
@@ -558,440 +381,88 @@ fn demo_driver_tick(
     }
 }
 
-// --- Main thread: event → action translation ---------------------------
+// --- crossterm → InputEvent translation --------------------------------
 
-#[allow(clippy::too_many_arguments)]
-fn handle_event(
-    ev: Event,
-    tx: &mpsc::Sender<Action>,
-    mode: &mut Mode,
-    zoom_idx: &mut usize,
-    running: &mut bool,
-    fingerer_rows: &[(usize, Rect)],
-    upgrade_rows: &[(usize, Rect)],
-    debug: bool,
-    current: &GameState,
-    biscuit_rect: Rect,
-    golden_rect: Rect,
-    play_area: Rect,
-    last_mouse_pos: &mut Option<(u16, u16)>,
-    help_hits: &[(HelpAction, Rect)],
-    prestige_reset_rect: Rect,
-) {
+/// Normalize one crossterm event into our platform-neutral [`InputEvent`].
+/// Returns `None` for events we drop entirely (focus, paste, resize, key
+/// release/repeat, and unsupported mouse kinds).
+fn translate_crossterm(ev: Event) -> Option<InputEvent> {
     match ev {
-        Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(
-            k,
-            tx,
-            mode,
-            zoom_idx,
-            running,
-            fingerer_rows,
-            upgrade_rows,
-            debug,
-            current,
-        ),
-        Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left) => {
-            *last_mouse_pos = Some((m.column, m.row));
-            // M1+M2: try help-bar / prestige-reset hits first. These give
-            // the mouse-only player parity with `[u]/[p]/[s]/[a]/[g]/[q]/[r]`
-            // shortcuts. Consumed hits short-circuit the rest of the click
-            // pipeline so we don't also fire a misclick particle.
-            if try_help_click(
-                m.column,
-                m.row,
-                help_hits,
-                prestige_reset_rect,
-                mode,
-                running,
-                tx,
-                current,
-            ) {
-                return;
-            }
-            handle_click(
-                m.column,
-                m.row,
-                m.modifiers,
-                MouseButton::Left,
-                tx,
-                *mode,
-                biscuit_rect,
-                golden_rect,
-                fingerer_rows,
-                upgrade_rows,
-                play_area,
-                current,
-            );
+        Event::Key(k) if k.kind == KeyEventKind::Press => {
+            let code = translate_key_code(k.code)?;
+            Some(InputEvent::KeyPress {
+                code,
+                mods: translate_mods(k.modifiers),
+            })
         }
-        // J15: right-click is a "buy max" affordance for fingerer/upgrade
-        // rows (saves a modifier on macOS where Alt is awkward). On the
-        // biscuit / golden / dead zone it's a no-op so misclick acks
-        // don't fire and confuse the user.
-        Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Right) => {
-            *last_mouse_pos = Some((m.column, m.row));
-            if try_help_click(
-                m.column,
-                m.row,
-                help_hits,
-                prestige_reset_rect,
-                mode,
-                running,
-                tx,
-                current,
-            ) {
-                return;
-            }
-            handle_click(
-                m.column,
-                m.row,
-                m.modifiers,
-                MouseButton::Right,
-                tx,
-                *mode,
-                biscuit_rect,
-                golden_rect,
-                fingerer_rows,
-                upgrade_rows,
-                play_area,
-                current,
-            );
-        }
-        // Scroll wheel zooms the biscuit anywhere in the play area — the
-        // whole left column where the biscuit lives, including the void
-        // around a small biscuit at low zoom. Only the right-hand sidebar
-        // ignores scroll, so a player reflex-scrolling a long fingerer /
-        // upgrade list doesn't accidentally zoom out their cuque.
-        Event::Mouse(m)
-            if m.kind == MouseEventKind::ScrollUp && in_play_area(m.column, m.row, play_area) =>
-        {
-            *zoom_idx = zoom_idx.saturating_sub(1);
-        }
-        Event::Mouse(m)
-            if m.kind == MouseEventKind::ScrollDown && in_play_area(m.column, m.row, play_area) =>
-        {
-            *zoom_idx = (*zoom_idx + 1).min(crate::ui::biscuit::level_count() - 1);
-        }
+        Event::Mouse(m) => translate_mouse(m),
+        _ => None,
+    }
+}
+
+fn translate_key_code(code: CtKeyCode) -> Option<InKeyCode> {
+    match code {
+        CtKeyCode::Char(c) => Some(InKeyCode::Char(c)),
+        CtKeyCode::Esc => Some(InKeyCode::Esc),
+        CtKeyCode::F(n) => Some(InKeyCode::F(n)),
+        _ => None,
+    }
+}
+
+fn translate_mods(mods: KeyModifiers) -> Modifiers {
+    Modifiers {
+        shift: mods.contains(KeyModifiers::SHIFT),
+        alt: mods.contains(KeyModifiers::ALT),
+        ctrl: mods.contains(KeyModifiers::CONTROL),
+    }
+}
+
+/// Narrow crossterm's mouse button to the subset the game cares about.
+/// Middle-click is intentionally dropped at the adapter boundary so it
+/// stays a no-op (matching pre-refactor behavior, where `handle_event`
+/// only matched `Down(Left)` / `Down(Right)`).
+fn translate_mouse_button(button: CtMouseButton) -> Option<InMouseButton> {
+    match button {
+        CtMouseButton::Left => Some(InMouseButton::Left),
+        CtMouseButton::Right => Some(InMouseButton::Right),
+        CtMouseButton::Middle => None,
+    }
+}
+
+fn translate_mouse(m: CtMouseEvent) -> Option<InputEvent> {
+    let mods = translate_mods(m.modifiers);
+    match m.kind {
+        MouseEventKind::Down(button) => Some(InputEvent::MouseDown {
+            col: m.column,
+            row: m.row,
+            button: translate_mouse_button(button)?,
+            mods,
+        }),
+        MouseEventKind::ScrollUp => Some(InputEvent::Wheel {
+            col: m.column,
+            row: m.row,
+            delta: WheelDelta::Up,
+        }),
+        MouseEventKind::ScrollDown => Some(InputEvent::Wheel {
+            col: m.column,
+            row: m.row,
+            delta: WheelDelta::Down,
+        }),
         // K5: track mouse position for hover highlighting. Crossterm only
         // emits Moved/Drag events when AnyMotion mouse mode is enabled
-        // (it is). The renderer reads `last_mouse_pos` to highlight the
-        // hovered row in sidebar/upgrades; missing or stale positions
-        // simply don't highlight anything.
-        Event::Mouse(m)
-            if matches!(
-                m.kind,
-                MouseEventKind::Moved | MouseEventKind::Drag(MouseButton::Left)
-            ) =>
-        {
-            *last_mouse_pos = Some((m.column, m.row));
+        // (it is). Drag-with-left collapses to a plain Moved on the
+        // platform-neutral side; the renderer doesn't care.
+        MouseEventKind::Moved | MouseEventKind::Drag(CtMouseButton::Left) => {
+            Some(InputEvent::MouseMoved {
+                col: m.column,
+                row: m.row,
+            })
         }
-        _ => {}
+        _ => None,
     }
 }
 
-/// True when the scroll happened anywhere inside the play-area rect — the
-/// whole left column the biscuit lives in (HUD-and-help-excluded). Cold
-/// frames (no rect yet) conservatively allow zoom so the very first scroll
-/// after launch isn't dropped.
-fn in_play_area(col: u16, row: u16, play_area: Rect) -> bool {
-    if play_area.width == 0 || play_area.height == 0 {
-        return true;
-    }
-    col >= play_area.x
-        && col < play_area.x + play_area.width
-        && row >= play_area.y
-        && row < play_area.y + play_area.height
-}
-
-fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
-    rect.width > 0
-        && rect.height > 0
-        && col >= rect.x
-        && col < rect.x + rect.width
-        && row >= rect.y
-        && row < rect.y + rect.height
-}
-
-fn click_buy_qty(mods: KeyModifiers) -> BuyQty {
-    if mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::CONTROL) {
-        BuyQty::Max
-    } else if mods.contains(KeyModifiers::SHIFT) {
-        BuyQty::Ten
-    } else {
-        BuyQty::One
-    }
-}
-
-/// Try to consume a click on a help-bar hint or the prestige-reset
-/// confirm line. Returns true when the click was handled — caller should
-/// short-circuit the rest of the pipeline (no biscuit/row/misclick path).
-///
-/// The keyboard shortcuts and the corresponding clickable hints share the
-/// same dispatch logic so behavior is identical across input methods.
-#[allow(clippy::too_many_arguments)]
-fn try_help_click(
-    col: u16,
-    row: u16,
-    help_hits: &[(HelpAction, Rect)],
-    prestige_reset_rect: Rect,
-    mode: &mut Mode,
-    running: &mut bool,
-    tx: &mpsc::Sender<Action>,
-    current: &GameState,
-) -> bool {
-    // Prestige-reset confirm: in-panel button. Match BEFORE help-bar so
-    // the confirm "wins" if the help bar happens to overlap it (it
-    // shouldn't, but defensive).
-    if rect_contains(prestige_reset_rect, col, row) && current.prestige_available() > 0 {
-        let _ = tx.send(Action::PrestigeReset);
-        *mode = Mode::Game;
-        return true;
-    }
-    for &(action, rect) in help_hits {
-        if !rect_contains(rect, col, row) {
-            continue;
-        }
-        match action {
-            HelpAction::OpenMode(target) => {
-                // Same toggle semantics the keyboard uses: tapping the
-                // hint for the active mode returns to Game.
-                *mode = if *mode == target { Mode::Game } else { target };
-            }
-            HelpAction::GrabGolden => {
-                if current.golden.is_some() {
-                    let _ = tx.send(Action::CatchGolden);
-                }
-            }
-            HelpAction::PrestigeReset => {
-                if current.prestige_available() > 0 {
-                    let _ = tx.send(Action::PrestigeReset);
-                    *mode = Mode::Game;
-                }
-            }
-            HelpAction::Quit => {
-                *running = false;
-            }
-        }
-        return true;
-    }
-    false
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_click(
-    col: u16,
-    row: u16,
-    mods: KeyModifiers,
-    button: MouseButton,
-    tx: &mpsc::Sender<Action>,
-    mode: Mode,
-    biscuit: Rect,
-    golden: Rect,
-    fingerer_rows: &[(usize, Rect)],
-    upgrade_rows: &[(usize, Rect)],
-    play_area: Rect,
-    current: &GameState,
-) {
-    // Golden cuques are catchable from ANY panel — match the keyboard 'g'
-    // behavior, which has no mode guard. The marker still renders on the
-    // biscuit while a non-Game panel is open, so the user expects clicking
-    // it to work regardless. Right-click on a golden also catches (matches
-    // every other "click anywhere on the marker" affordance).
-    if rect_contains(golden, col, row) {
-        let _ = tx.send(Action::CatchGolden);
-        return;
-    }
-    // Clicking the biscuit itself is also mode-agnostic. Right-click on
-    // the biscuit is a no-op so a player can't accidentally finger the
-    // cuque with the wrong button. (We could overload it for "extra
-    // power" but that changes game behavior, which juice rules say no.)
-    if rect_contains(biscuit, col, row) {
-        if button == MouseButton::Left {
-            let _ = tx.send(Action::Click { col, row });
-        }
-        return;
-    }
-    // Mouse-buy fingerers from the sidebar in Game mode. Modifiers control
-    // quantity (plain = 1, Shift = 10, Alt/Ctrl = max), matching the
-    // digit-key shortcuts so the two input methods stay symmetric. Right-
-    // click is the always-Max affordance regardless of modifiers.
-    if mode == Mode::Game {
-        for &(idx, r) in fingerer_rows {
-            if rect_contains(r, col, row) {
-                let qty = if button == MouseButton::Right {
-                    BuyQty::Max
-                } else {
-                    click_buy_qty(mods)
-                };
-                let _ = tx.send(Action::BuyFingerer { idx, qty });
-                return;
-            }
-        }
-    }
-    // Mouse-buy upgrades from the Upgrades panel. Modifiers ignored — each
-    // upgrade is a one-shot purchase. Right-click also buys (no "max" for
-    // single-shot purchases — but accept the click so right-click feels
-    // active everywhere it makes sense).
-    if mode == Mode::Upgrades {
-        for &(idx, r) in upgrade_rows {
-            if rect_contains(r, col, row) {
-                let _ = tx.send(Action::BuyUpgrade(idx));
-                return;
-            }
-        }
-    }
-    // J10: nothing actionable under the click. Acknowledge it visually with
-    // a brief "·" so the dead-zone (e.g. the air around a 25%-zoom biscuit)
-    // doesn't feel inert. Skip when:
-    //   - the click was right-button (right-click without a target is a
-    //     true no-op);
-    //   - the click landed on an orbital hand glyph — those are decoration,
-    //     not click targets, but they're visually present, so a misclick
-    //     "·" replacing part of `[]` / `:*` / `>>` reads as flicker.
-    //   - M3: the click landed OUTSIDE the play area (HUD title, sidebar,
-    //     debug pane, help bar). Inert UI chrome shouldn't get a "·"
-    //     overpainted into it — that visibly damages the title text and
-    //     reads as a bug.
-    if button != MouseButton::Left {
-        return;
-    }
-    if !rect_contains(play_area, col, row) {
-        return;
-    }
-    if crate::ui::hands::occupied_at(col, row, biscuit, current) {
-        return;
-    }
-    let _ = tx.send(Action::Misclick { col, row });
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_key(
-    k: KeyEvent,
-    tx: &mpsc::Sender<Action>,
-    mode: &mut Mode,
-    zoom_idx: &mut usize,
-    running: &mut bool,
-    fingerer_rows: &[(usize, Rect)],
-    upgrade_rows: &[(usize, Rect)],
-    debug: bool,
-    current: &GameState,
-) {
-    let code = k.code;
-    let mods = k.modifiers;
-    match code {
-        KeyCode::Char('q') => *running = false,
-        // J12: Esc dismisses panels back to Game mode but is a NO-OP from
-        // Game itself. Quit is `q` only — Esc-to-quit was an aggressive
-        // default that surprised playtesters who reflex-pressed it to
-        // "deselect" with no panel open.
-        KeyCode::Esc => match *mode {
-            Mode::Game => {}
-            _ => *mode = Mode::Game,
-        },
-        KeyCode::Char('s') | KeyCode::Char('S') => {
-            *mode = if matches!(*mode, Mode::Stats) {
-                Mode::Game
-            } else {
-                Mode::Stats
-            };
-        }
-        KeyCode::Char('a') | KeyCode::Char('A') => {
-            *mode = if matches!(*mode, Mode::Achievements) {
-                Mode::Game
-            } else {
-                Mode::Achievements
-            };
-        }
-        KeyCode::Char('u') | KeyCode::Char('U') => {
-            *mode = if matches!(*mode, Mode::Upgrades) {
-                Mode::Game
-            } else {
-                Mode::Upgrades
-            };
-        }
-        // [g] catches any Golden Cuque variant. Guard on the latest snapshot
-        // to avoid sending a noop CatchGolden when nothing is on screen —
-        // race with sim is harmless (worst case: catch fires against empty
-        // state, no-ops inside state.catch_golden()).
-        KeyCode::Char('g') | KeyCode::Char('G') if current.golden.is_some() => {
-            let _ = tx.send(Action::CatchGolden);
-        }
-        // Debug/testing: gated on the main thread by `debug`. See
-        // src/ui/debug_pane.rs for the advertised key list.
-        KeyCode::F(1) if debug => {
-            let _ = tx.send(Action::DevForceGolden(GoldenVariant::Lucky));
-        }
-        KeyCode::F(2) if debug => {
-            let _ = tx.send(Action::DevForceGolden(GoldenVariant::Frenzy));
-        }
-        KeyCode::F(3) if debug => {
-            let _ = tx.send(Action::DevForceGolden(GoldenVariant::Buff));
-        }
-        KeyCode::F(4) if debug => {
-            let _ = tx.send(Action::DevAddCuques(1_000_000.0));
-        }
-        KeyCode::Char('p') | KeyCode::Char('P') => {
-            *mode = if matches!(*mode, Mode::Prestige) {
-                Mode::Game
-            } else {
-                Mode::Prestige
-            };
-        }
-        // Prestige confirm: check the snapshot for available prestige before
-        // firing. Optimistically close the panel — if the sim rejects the
-        // reset (raced against a simultaneous lifetime-cuque drop, which
-        // only happens during prestige itself) nothing bad happens.
-        KeyCode::Char('r') | KeyCode::Char('R')
-            if *mode == Mode::Prestige && current.prestige_available() > 0 =>
-        {
-            let _ = tx.send(Action::PrestigeReset);
-            *mode = Mode::Game;
-        }
-        KeyCode::Char('+') | KeyCode::Char('=') => {
-            *zoom_idx = zoom_idx.saturating_sub(1);
-        }
-        KeyCode::Char('-') | KeyCode::Char('_') => {
-            *zoom_idx = (*zoom_idx + 1).min(crate::ui::biscuit::level_count() - 1);
-        }
-        // Space ALWAYS fingers the cuque, regardless of which panel is open
-        // — same contract as left-click on the biscuit. Enter is reserved
-        // (no-op here) so future menu/dialog work can use it as the global
-        // "accept" key without overloading meaning. The Prestige panel uses
-        // [r] alone to confirm a reset.
-        KeyCode::Char(' ') => {
-            let _ = tx.send(Action::ClickCenter);
-        }
-        KeyCode::Char(c) => {
-            if let Some((slot, shifted_sym)) = digit_slot(c) {
-                let buy_10 = shifted_sym || mods.contains(KeyModifiers::SHIFT);
-                let buy_max =
-                    mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::CONTROL);
-                match *mode {
-                    Mode::Game => {
-                        if let Some(&(fid, _)) = fingerer_rows.get(slot) {
-                            let qty = if buy_max {
-                                BuyQty::Max
-                            } else if buy_10 {
-                                BuyQty::Ten
-                            } else {
-                                BuyQty::One
-                            };
-                            let _ = tx.send(Action::BuyFingerer { idx: fid, qty });
-                        }
-                    }
-                    Mode::Upgrades => {
-                        if let Some(&(u_idx, _)) = upgrade_rows.get(slot) {
-                            let _ = tx.send(Action::BuyUpgrade(u_idx));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-// --- Demo state + digit-slot map ---------------------------------------
+// --- Demo state --------------------------------------------------------
 
 /// Rich starting state for `--demo-for-recording`. Tuned so a viewer
 /// sees **numbers moving fast** (high FPS → counter spins visibly) and
@@ -1042,30 +513,4 @@ pub fn build_demo_state() -> GameState {
         s.achievements_earned.insert(a.id.to_string());
     }
     s
-}
-
-fn digit_slot(c: char) -> Option<(usize, bool)> {
-    match c {
-        '1' => Some((0, false)),
-        '2' => Some((1, false)),
-        '3' => Some((2, false)),
-        '4' => Some((3, false)),
-        '5' => Some((4, false)),
-        '6' => Some((5, false)),
-        '7' => Some((6, false)),
-        '8' => Some((7, false)),
-        '9' => Some((8, false)),
-        '0' => Some((9, false)),
-        '!' => Some((0, true)),
-        '@' => Some((1, true)),
-        '#' => Some((2, true)),
-        '$' => Some((3, true)),
-        '%' => Some((4, true)),
-        '^' => Some((5, true)),
-        '&' => Some((6, true)),
-        '*' => Some((7, true)),
-        '(' => Some((8, true)),
-        ')' => Some((9, true)),
-        _ => None,
-    }
 }
