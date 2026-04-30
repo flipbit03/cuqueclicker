@@ -4,6 +4,36 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>CuqueClicker (web)</title>
+
+    <!--
+      Social-preview metadata. WhatsApp and most chat clients read
+      `<title>` and the standard `<meta name="description">` and call it
+      a day, but X/Twitter, Discord, LinkedIn, and Slack want their
+      respective dialects of OpenGraph and Twitter Cards before they'll
+      render a preview at all. The `og:image` / `twitter:image` URLs
+      MUST be fully-qualified (no relative paths); the image itself is
+      copied into `dist/` by the `copy-file` trunk directive below.
+
+      First-share-no-preview gotcha: X aggressively caches the "no
+      preview" verdict per URL. If a card doesn't show on first share,
+      append `?v=N` to the URL to force a re-fetch.
+    -->
+    <meta name="description" content="CookieClicker-inspired idle-clicker TUI, but you don't click a Cookie..." />
+    <meta property="og:title" content="CuqueClicker" />
+    <meta property="og:description" content="CookieClicker-inspired idle-clicker TUI, but you don't click a Cookie..." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://flipbit03.github.io/cuqueclicker/" />
+    <meta property="og:image" content="https://flipbit03.github.io/cuqueclicker/preview.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="CuqueClicker" />
+    <meta name="twitter:description" content="CookieClicker-inspired idle-clicker TUI, but you don't click a Cookie..." />
+    <meta name="twitter:image" content="https://flipbit03.github.io/cuqueclicker/preview.png" />
+
+    <!-- Trunk drops `docs/preview.png` (committed alongside this file)
+         into `dist/preview.png`, which Pages serves at the absolute URL
+         the meta tags above point at. -->
+    <link data-trunk rel="copy-file" href="docs/preview.png" />
+
     <link data-trunk rel="rust" data-target-name="cuqueclicker_lib" />
     <style>
       /* Black margin around the terminal. Body padding becomes the border;
