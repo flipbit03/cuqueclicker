@@ -1,9 +1,14 @@
 use ratatui::{prelude::*, widgets::*};
 
 /// Keys advertised in the debug pane. One source of truth for both the
-/// rendered rows and the hotkey dispatch in `app.rs`.
+/// rendered rows and the hotkey dispatch in `input.rs`.
+///
+/// `F8` is the Lucky-spawn cheat instead of `F1` because Chrome (and most
+/// browsers) hijack `F1` for "Help" and never deliver the keydown to the
+/// page. `F8` has no default browser binding outside of an open DevTools
+/// instance, so it's safe on both web and native.
 pub const DEBUG_KEYS: &[(&str, &str)] = &[
-    ("F1", "Lucky  [$]"),
+    ("F8", "Lucky  [$]"),
     ("F2", "Frenzy [!]"),
     ("F3", "Buff   [+]"),
     ("F4", "+1M cuques"),

@@ -1,0 +1,115 @@
+# Deploy the wasm bundle to GitHub Pages.
+#
+# Two triggers:
+# - `release: published` — builds a PROD bundle (Cargo.toml version is
+#   sed-patched from the git tag, same as `release.yml` does for native
+#   binaries). With a non-`0.0.0` version, `build_info::is_dev_build()`
+#   returns false → debug pane and F-key cheats are gone, exactly like
+#   a shipped native binary.
+# - `workflow_dispatch` — manual trigger from the GitHub UI or `gh`. By
+#   default builds a dev bundle (`0.0.0` left in place, cheats visible)
+#   so we can preview branches at the same URL without cutting a release.
+#   Pass `version: "X.Y.Z"` as an input to force a prod-style build off
+#   `main`.
+#
+# Pages settings: repo settings → Pages → "GitHub Actions" source.
+# That toggle is one-time; this workflow assumes it's set.
+
+name: Deploy Web
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Override version (e.g. "1.2.3"). Leave empty to deploy a dev build with cheats visible.'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Avoid two deploys racing each other; the more recent run wins.
+concurrency:
+  group: deploy-web
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build wasm bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # On release: check out the tag's commit so the build matches
+          # the release artifact. On manual dispatch: default ref (the
+          # branch the workflow was dispatched from, usually `main`).
+          ref: ${{ github.event.release.tag_name || github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry + build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Keep wasm and native build dirs separate so a wasm rebuild
+          # doesn't blow away the CI cache for native cargo test.
+          key: wasm
+
+      - name: Resolve build version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+            echo "VERSION=${TAG#v}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ inputs.version }}" ]; then
+            echo "VERSION=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "VERSION=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Patch Cargo.toml version (prod build only)
+        if: steps.version.outputs.VERSION != ''
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          sed -i "s/^version = \"0.0.0\"/version = \"${VERSION}\"/" Cargo.toml
+          # Without `cargo update`, the lockfile still references 0.0.0
+          # and `trunk build` errors with a version mismatch.
+          cargo update -p cuqueclicker
+
+      - name: Install trunk
+        # `cargo binstall` grabs the prebuilt binary in seconds instead
+        # of compiling trunk from source (~2 min on a fresh runner).
+        uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall trunk --no-confirm --locked
+
+      - name: Build wasm bundle
+        # `--public-url /cuqueclicker/` is what makes the emitted asset
+        # URLs work under https://flipbit03.github.io/cuqueclicker/.
+        # Drop or change this if Pages is ever moved to a different path.
+        run: trunk build --release --public-url /cuqueclicker/
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

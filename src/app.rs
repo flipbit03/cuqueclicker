@@ -417,11 +417,15 @@ fn translate_mods(mods: KeyModifiers) -> Modifiers {
     }
 }
 
-fn translate_mouse_button(button: CtMouseButton) -> InMouseButton {
+/// Narrow crossterm's mouse button to the subset the game cares about.
+/// Middle-click is intentionally dropped at the adapter boundary so it
+/// stays a no-op (matching pre-refactor behavior, where `handle_event`
+/// only matched `Down(Left)` / `Down(Right)`).
+fn translate_mouse_button(button: CtMouseButton) -> Option<InMouseButton> {
     match button {
-        CtMouseButton::Left => InMouseButton::Left,
-        CtMouseButton::Right => InMouseButton::Right,
-        CtMouseButton::Middle => InMouseButton::Middle,
+        CtMouseButton::Left => Some(InMouseButton::Left),
+        CtMouseButton::Right => Some(InMouseButton::Right),
+        CtMouseButton::Middle => None,
     }
 }
 
@@ -431,7 +435,7 @@ fn translate_mouse(m: CtMouseEvent) -> Option<InputEvent> {
         MouseEventKind::Down(button) => Some(InputEvent::MouseDown {
             col: m.column,
             row: m.row,
-            button: translate_mouse_button(button),
+            button: translate_mouse_button(button)?,
             mods,
         }),
         MouseEventKind::ScrollUp => Some(InputEvent::Wheel {

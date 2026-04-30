@@ -31,6 +31,12 @@ fn lock_path() -> Option<PathBuf> {
 /// from environment variables on every call.
 pub struct Persistence;
 
+impl Default for Persistence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Persistence {
     pub fn new() -> Self {
         Self
