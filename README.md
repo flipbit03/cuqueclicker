@@ -2,6 +2,8 @@
 
 A parody idle-clicker in your terminal. Like Cookie Clicker — but instead of a cookie you click, it's an ASCII **ass** you *finger*.
 
+**[Play in your browser!](https://flipbit03.github.io/cuqueclicker/)**
+
 https://github.com/user-attachments/assets/5d10dd73-53e2-4162-9759-b61b0bcb508e
 
 ## The name
