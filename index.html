@@ -30,9 +30,26 @@
         height: 100%;
         outline: none;
       }
+      /* Tiny GitHub link tucked into the bottom-right of the body's
+         24px black padding gutter — sits above the canvas, doesn't
+         crowd the HUD, doesn't need to be rendered via ratatui. */
+      .repo-link {
+        position: fixed;
+        right: 8px;
+        bottom: 4px;
+        font: 11px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        color: #666;
+        text-decoration: none;
+        z-index: 10;
+      }
+      .repo-link:hover { color: #ddd; }
     </style>
   </head>
   <body>
     <!-- WebGl2Backend appends a <canvas> into <body> on first draw. -->
+    <a class="repo-link"
+       href="https://github.com/flipbit03/cuqueclicker"
+       target="_blank"
+       rel="noopener noreferrer">github.com/flipbit03/cuqueclicker</a>
   </body>
 </html>
