@@ -265,12 +265,19 @@ pub fn run() -> Result<(), JsValue> {
         // Render. The geometry the input router hit-tests against is
         // sourced from this draw's `DrawOutput`.
         let area = f.area();
+        // Mirror native's gate: `is_dev_build()` returns true only when
+        // `Cargo.toml` is still at the placeholder `0.0.0`. The Pages
+        // deploy workflow sed-patches that to the real version on
+        // `release: published`, so a tagged release build flips this
+        // off and the debug pane / F-key cheats vanish exactly like a
+        // shipped native binary.
+        let debug = crate::build_info::is_dev_build();
         let out = ui::draw(
             f,
             &state,
             web.ui.mode,
             web.ui.zoom_idx,
-            true,
+            debug,
             web.ui.last_mouse_pos,
         );
         web.biscuit_rect = out.biscuit_rect;
@@ -366,10 +373,10 @@ fn dispatch(
         golden_rect: *golden_rect,
         play_area: *play_area,
         prestige_reset_rect: *prestige_reset_rect,
-        // Web is itself a "dev" surface in this PoC — F-keys stay live.
-        // When the wasm bundle ships through `release.yml` we'll gate
-        // this on `build_info::is_dev_build()` like native.
-        debug: true,
+        // Same gate as `ui::draw` above — release-tagged Pages builds
+        // (Cargo.toml version sed-patched off `0.0.0`) flip this off
+        // and the F-key cheats stop dispatching.
+        debug: crate::build_info::is_dev_build(),
         current: &state,
     };
     actions.clear();
