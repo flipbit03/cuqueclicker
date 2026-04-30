@@ -86,10 +86,13 @@ jobs:
           cargo update -p cuqueclicker
 
       - name: Install trunk
-        # `cargo binstall` grabs the prebuilt binary in seconds instead
-        # of compiling trunk from source (~2 min on a fresh runner).
-        uses: cargo-bins/cargo-binstall@main
-      - run: cargo binstall trunk --no-confirm --locked
+        # Dedicated trunk install action — drops the prebuilt binary into
+        # `$CARGO_HOME/bin` (which is on PATH) and skips compiling from
+        # source (~2 min on a fresh runner). Earlier attempts with
+        # `cargo binstall` left the binary in a non-PATH location.
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: 'latest'
 
       - name: Build wasm bundle
         # `--public-url /cuqueclicker/` is what makes the emitted asset
