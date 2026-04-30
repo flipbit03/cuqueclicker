@@ -343,6 +343,14 @@ fn draw_help(
                 break;
             }
             let action = map_help_token(token, mode);
+            // Hide `[q] quit` (or its localized equivalent) on platforms
+            // where the wasm/native runner has no authority to exit —
+            // see `platform::Capabilities::can_quit`. Skipping renders
+            // AND skips appending to `help_hits`, so the next token
+            // slides into the position cursor without leaving a gap.
+            if matches!(action, Some(HelpAction::Quit)) && !crate::platform::CAPABILITIES.can_quit {
+                continue;
+            }
             let active = matches!(action, Some(HelpAction::OpenMode(m)) if m == mode);
             let token_rect = Rect {
                 x: area.x + cursor_x,

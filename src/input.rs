@@ -344,7 +344,11 @@ fn handle_key(
     out: &mut Vec<Action>,
 ) {
     match code {
-        KeyCode::Char('q') => ui.running = false,
+        // Gated on the platform's `can_quit` capability so a stray `q`
+        // press in the browser doesn't silently flip `ui.running` (which
+        // a future feature might key off of even though the rAF loop
+        // doesn't read it today).
+        KeyCode::Char('q') if crate::platform::CAPABILITIES.can_quit => ui.running = false,
         // J12: Esc dismisses panels back to Game mode but is a NO-OP from
         // Game itself. Quit is `q` only — Esc-to-quit was an aggressive
         // default that surprised playtesters who reflex-pressed it to

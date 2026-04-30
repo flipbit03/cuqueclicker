@@ -8,7 +8,14 @@
 //! alternative (BroadcastChannel + leader election) is far more code
 //! than the failure mode warrants for a single-player idle game.
 
+use super::Capabilities;
 use crate::game::state::GameState;
+
+/// In a browser tab the wasm bundle has no way to exit — there's no
+/// process to signal, and `window.close()` only works for windows the
+/// script opened. The player closes the tab themselves; we hide the
+/// `[q] quit` affordance accordingly.
+pub const CAPABILITIES: Capabilities = Capabilities { can_quit: false };
 
 const SAVE_KEY: &str = "cuqueclicker:save";
 

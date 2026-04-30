@@ -12,7 +12,12 @@ use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
 use std::path::PathBuf;
 
+use super::Capabilities;
 use crate::game::state::GameState;
+
+/// Native is the canonical surface — every game-side affordance maps to
+/// something the OS can actually do.
+pub const CAPABILITIES: Capabilities = Capabilities { can_quit: true };
 
 fn save_path() -> Option<PathBuf> {
     let base = env::var_os("XDG_CONFIG_HOME")
