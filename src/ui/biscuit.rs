@@ -94,19 +94,24 @@ const BISCUIT_MEDIUM: &[&str] = &[
     r"         `~-,,_______________,,-~'      ",
 ];
 
+// Body walls sit at cols 1 and 25 → visual center column 13. The rounded
+// contour rows (0-3, 9-11) used to terminate one column short of the wall
+// on the right side, leaving a 2-column gap between e.g. `\` (row 3) and
+// `|` (row 4). Symmetrized around col 13 so each row's left margin and
+// right margin are equal — same shape now reads as a closed oval.
 const BISCUIT_SMALL: &[&str] = &[
-    r"        __________        ",
-    r"     ,-~          ~-,     ",
-    r"   ,'                `.   ",
-    r"  /    -~-~-  -~-~-    \  ",
+    r"        ___________       ",
+    r"     ,-~           ~-,    ",
+    r"   ,'                 `.  ",
+    r"  /    -~-~-  -~-~-     \ ",
     r" |       \\\ | ///       | ",
     r" |        \\\|///        | ",
     r" | ~ - -           - - ~ | ",
     r" |        ///|\\\        | ",
     r" |       /// | \\\       | ",
-    r"  \    -~-~-  -~-~-    /  ",
-    r"   `.                ,'   ",
-    r"     `-,,________,,-'     ",
+    r"  \    -~-~-  -~-~-     / ",
+    r"   `.                 ,'  ",
+    r"     `-,,_________,,-'    ",
 ];
 
 const BISCUIT_TINY: &[&str] = &[
