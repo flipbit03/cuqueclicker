@@ -208,8 +208,21 @@ pub struct GameState {
     pub lifetime_cuques: f64,
     #[serde(default)]
     pub best_fps: f64,
+    /// Lifetime grand total of every powerup caught (Lucky, Frenzy, Buff,
+    /// Green Coin). Stays a strict rollup so existing achievements that
+    /// gate on it continue to work, and pre-V3 saves whose breakdown was
+    /// never recorded keep an honest total. The four per-variant counters
+    /// below were added in V3; they only count post-V3 catches.
     #[serde(default)]
     pub golden_caught: u64,
+    #[serde(default)]
+    pub lucky_caught: u64,
+    #[serde(default)]
+    pub frenzy_caught: u64,
+    #[serde(default)]
+    pub buff_caught: u64,
+    #[serde(default)]
+    pub green_coin_caught: u64,
 
     /// Fingerer id → owned count + attached modifiers + aggregate cache.
     #[serde(default)]
@@ -397,6 +410,10 @@ impl Default for GameState {
             lifetime_cuques: 0.0,
             best_fps: 0.0,
             golden_caught: 0,
+            lucky_caught: 0,
+            frenzy_caught: 0,
+            buff_caught: 0,
+            green_coin_caught: 0,
             fingerers_state: HashMap::new(),
             achievements_earned: HashSet::new(),
             upgrades_earned: HashSet::new(),
@@ -546,8 +563,9 @@ impl GameState {
     }
 
     /// Pick a random fingerer with `count > 0` and attach `m` to it. Returns
-    /// the chosen id, or `None` if no fingerer is owned. Used by Green Coin
-    /// catch and any future "boost a random owned fingerer" mechanic.
+    /// the chosen id, or `None` if no fingerer is owned. Used by the Buff
+    /// Golden (Purple Coin), where targeting an un-owned tier is pointless
+    /// — a temporary x7 multiplier on a count of zero produces zero output.
     pub fn attach_modifier_random_owned(&mut self, m: Modifier) -> Option<String> {
         let owned: Vec<String> = self
             .fingerers_state
@@ -559,6 +577,35 @@ impl GameState {
             return None;
         }
         let pick = owned[rand::rng().random_range(0..owned.len())].clone();
+        self.attach_modifier(&pick, m);
+        Some(pick)
+    }
+
+    /// Pick a random fingerer that is currently *visible in the sidebar*
+    /// — by the same `fingerer::visible` rule the UI uses (`idx == 0` ||
+    /// `owned > 0` || `lifetime_cuques >= base_cost * 0.5`) — and attach
+    /// `m` to it.
+    ///
+    /// Used by the Green Coin: a *permanent* +10% boost is still useful on
+    /// a tier the player can see but hasn't bought yet; when they finally
+    /// buy it the boost is already in place. Index Finger is always visible
+    /// (`idx == 0`), so as long as `FINGERERS` is non-empty this picks
+    /// something. Returns `None` only on an empty catalog (never in
+    /// practice).
+    pub fn attach_modifier_random_visible(&mut self, m: Modifier) -> Option<String> {
+        let visible: Vec<String> = FINGERERS
+            .iter()
+            .enumerate()
+            .filter(|(idx, f)| {
+                let owned = self.fingerer_count(f.id);
+                fingerer::visible(*idx, owned, self.lifetime_cuques)
+            })
+            .map(|(_, f)| f.id.to_string())
+            .collect();
+        if visible.is_empty() {
+            return None;
+        }
+        let pick = visible[rand::rng().random_range(0..visible.len())].clone();
         self.attach_modifier(&pick, m);
         Some(pick)
     }
@@ -749,6 +796,7 @@ impl GameState {
         self.golden_cooldown = crate::game::golden::next_cooldown();
         let (reward, label) = match golden.variant {
             GoldenVariant::Lucky => {
+                self.lucky_caught += 1;
                 let fps = self.fps();
                 let r = (fps * GOLDEN_REWARD_SECONDS).max(GOLDEN_REWARD_FLAT);
                 self.add_cuques(r);
@@ -757,6 +805,7 @@ impl GameState {
                 (r, format!("+{}", crate::format::big(r)))
             }
             GoldenVariant::Frenzy => {
+                self.frenzy_caught += 1;
                 let dur = TICK_HZ * 13;
                 self.buffs.push(Buff::ClickFrenzy {
                     ticks_remaining: dur,
@@ -766,6 +815,7 @@ impl GameState {
                 (0.0, "FRENZY x777!".into())
             }
             GoldenVariant::Buff => {
+                self.buff_caught += 1;
                 let dur = TICK_HZ * 60;
                 let m = Modifier {
                     source: crate::game::modifier::ModifierSource::PurpleCoin,
@@ -1138,11 +1188,18 @@ impl GameState {
             duration: ModifierDuration::Permanent,
             created_at_tick: self.total_play_ticks,
         };
-        let chosen = self.attach_modifier_random_owned(m);
-        // Catch counts toward the existing "golden caught" stat — feels
-        // right (it's a powerup catch), and avoids inventing a new stat
-        // until/unless we want a separate "Green Coins caught" counter.
+        // Visible-set targeting: a permanent +10% can land on a sidebar-
+        // visible tier the player hasn't bought yet, so they get a head
+        // start when they finally afford it. (Buff golden uses
+        // `attach_modifier_random_owned` instead, since its temp x7 only
+        // matters on a tier with non-zero count.)
+        let chosen = self.attach_modifier_random_visible(m);
+        // Counts toward both the all-time rollup and the dedicated
+        // Green Coin counter (V3+). Achievements that gate on
+        // `golden_caught` (e.g. "Golden Touch") still fire because the
+        // rollup keeps incrementing.
         self.golden_caught += 1;
+        self.green_coin_caught += 1;
         self.green_coin_flash_ticks = GREEN_COIN_FLASH_TICKS;
         // Visual feedback: a "+10% <fingerer>" particle anchored at the
         // coin's position. Phase 5 wraps this with a green border channel
@@ -1823,6 +1880,22 @@ mod tests {
     }
 
     #[test]
+    fn catch_green_coin_increments_grand_total_and_per_variant_counter() {
+        let mut s = GameState {
+            green_coin: Some(fake_green_coin()),
+            ..Default::default()
+        };
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        assert!(s.catch_green_coin());
+        assert_eq!(s.golden_caught, 1, "rollup increments");
+        assert_eq!(s.green_coin_caught, 1, "per-variant increments");
+        assert_eq!(s.lucky_caught, 0);
+        assert_eq!(s.frenzy_caught, 0);
+        assert_eq!(s.buff_caught, 0);
+    }
+
+    #[test]
     fn catch_green_coin_attaches_permanent_modifier() {
         let mut s = GameState::default();
         s.fingerers_state
@@ -1846,11 +1919,11 @@ mod tests {
     }
 
     #[test]
-    fn catch_green_coin_with_no_owned_consumes_coin_without_attaching() {
-        // No fingerer owned — there's nothing for the modifier to land on.
-        // The coin is still consumed (player pressed catch; that's resolved)
-        // and `catch_green_coin` returns true to signal "yes a coin was
-        // there." No FingererState entries get created.
+    fn catch_green_coin_with_no_owned_lands_on_index_finger() {
+        // The visible-set targeting (vs the old owned-only) means even on a
+        // brand-new save, a Green Coin attaches somewhere — Index Finger is
+        // always visible (`idx == 0` short-circuits in `fingerer::visible`).
+        // The previous "consumes without attaching" no-op behavior is gone.
         let mut s = GameState {
             green_coin: Some(fake_green_coin()),
             ..Default::default()
@@ -1860,7 +1933,38 @@ mod tests {
 
         assert!(caught);
         assert!(s.green_coin.is_none());
-        assert!(s.fingerers_state.is_empty());
+        let st = s
+            .fingerers_state
+            .get(FINGERERS[0].id)
+            .expect("modifier landed on Index Finger");
+        assert_eq!(st.modifiers.len(), 1);
+        assert!((st.aggregate.add_percent - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attach_modifier_random_visible_can_pick_unowned_when_lifetime_unlocks_it() {
+        // Tier 1 (Whole Hand) has base_cost 100; visibility threshold is
+        // 0.5 * base_cost = 50. With lifetime_cuques == 60, Whole Hand is
+        // visible despite being unowned. Index Finger is always visible
+        // (idx == 0). The picker can land on either; with a deterministic
+        // seed we can't pin which, but the modifier lands SOMEWHERE.
+        let mut s = GameState {
+            lifetime_cuques: 60.0,
+            ..Default::default()
+        };
+        let m = perm_add_percent(0.10);
+        let chosen = s.attach_modifier_random_visible(m);
+        let id = chosen.expect("at least one visible fingerer always exists");
+        // Allowed targets at this lifetime: Index Finger + Whole Hand.
+        let visible_ids: Vec<&str> = FINGERERS
+            .iter()
+            .enumerate()
+            .filter(|(idx, f)| {
+                fingerer::visible(*idx, 0, s.lifetime_cuques) && (*idx == 0 || f.id == "whole_hand")
+            })
+            .map(|(_, f)| f.id)
+            .collect();
+        assert!(visible_ids.contains(&id.as_str()));
     }
 
     #[test]

@@ -90,7 +90,12 @@ Final per-fingerer FPS:
 ((base * count + flat_fps) * upgrades_mult) * (1 + add_percent) * mul_factor
 ```
 
-The `aggregate: FingererAggregate` cache on `FingererState` is `#[serde(skip)]` and rebuilt in three situations only: (a) modifier add/remove via `attach_modifier` / `attach_modifier_random_owned`, (b) per-tick expiry walk if any timed modifier expired, (c) save load via `migrate_runtime`. Hot-path reads (`fps()`, sidebar render) MUST go through the aggregate; never iterate `Vec<Modifier>` per FPS read.
+The `aggregate: FingererAggregate` cache on `FingererState` is `#[serde(skip)]` and rebuilt in three situations only: (a) modifier add/remove via `attach_modifier` / `attach_modifier_random_*`, (b) per-tick expiry walk if any timed modifier expired, (c) save load via `migrate_runtime`. Hot-path reads (`fps()`, sidebar render) MUST go through the aggregate; never iterate `Vec<Modifier>` per FPS read.
+
+**Picking a target fingerer** for a "random fingerer" event:
+
+- **`attach_modifier_random_owned`** filters by `count > 0`. Use this when the modifier is meaningless on a 0-owned tier — e.g. the Buff Golden's temp `MulFactor(7.0)` multiplies zero output if the player doesn't own one.
+- **`attach_modifier_random_visible`** filters by `fingerer::visible(idx, count, lifetime_cuques)` — the same rule the sidebar uses to decide which rows to show. Use this when the modifier is **permanent** and useful to "save for later" — e.g. the Green Coin's permanent `+10%` AddPercent: landing on a tier the player can see but hasn't bought yet still benefits them when they finally afford it. Index Finger is always visible (`idx == 0` short-circuits), so this picker is never empty in practice.
 
 **Adding a new buff/debuff source** = add a variant to `ModifierSource` and map its `id()`. No new tick code unless the trigger is novel (the existing per-tick walk already decrements timed modifiers and rebuilds aggregates on expiry). Cosmetic names belong in `i18n.rs`; the id stays stable forever.
 
@@ -113,6 +118,32 @@ Current dev hotkeys:
 | F5  | Spawn Green Coin |
 
 When adding a new key, update both `DEBUG_KEYS` (the rendered list) and the corresponding `KeyCode::F(N)` arm in `src/input.rs`. The two must stay aligned — the pane is the single source of truth for what's advertised.
+
+## Quality-test gate for new features
+
+**Every new gameplay feature ships with a `tu`-driven smoke test that the assistant runs before declaring the feature done.** Type checks and `cargo test` verify code correctness; they do *not* verify that the feature actually works on screen. The TUI is the product — if the marker doesn't render, the badge doesn't update, or the click doesn't catch, no amount of green tests catches that. Drive the live binary, screenshot the result, assert what you see.
+
+The recipe (works for any feature involving rendering, input, or RNG-gated events):
+
+1. **Build release**: `cargo build --release`. Dev binary, `(dev)` in the HUD, all F-key cheats live.
+2. **Spawn a fresh-save session** under `tu` with an isolated config dir so the test never touches the real save:
+   ```sh
+   TMPSAVE=$(mktemp -d)
+   tu run --name <feature>-test --size 140x42 \
+       --env XDG_CONFIG_HOME=$TMPSAVE -- \
+       /full/path/target/release/cuqueclicker
+   ```
+3. **Drive it with the relevant cheats**. F4 grants 1M cuques (so you can buy what you need), then F8/F2/F3/F5 force-spawn the powerup variants. Bare digits buy fingerers; `g` catches the on-screen powerup. Use `tu screenshot --png --output /tmp/<step>.png` and then `Read` the image — **prefer PNG over text screenshots**: the text variant strips color, so green vs purple vs gold tints (which are often the whole point of the visual feedback) collapse into invisible whitespace. Reach for the text form only when you don't need color at all (e.g. asserting a specific string is on screen). Do NOT rely on `tu wait --stable` — the HUD count-up and casino border animate continuously, so the screen never stabilizes. Insert short `sleep 0.3`-`0.5` pauses between actions instead.
+4. **For letter keys, prefer `tu type "<letter>"` over `tu press <letter>`.** Empirically, `tu press g` did not deliver a 'g' keystroke into the alt-screen TUI under tu 0.6.1 in this repo's setup; `tu type "g"` does. Use `tu press` for named keys (F1-F12, Enter, Escape, etc.) and `tu type` for letters/digits.
+5. **Assert on the screenshot.** For PNG: read it with the `Read` tool and visually inspect colors + glyphs. For text: parse with `python3 -c 'import json,sys;d=json.load(sys.stdin);…'` and grep for marker glyphs (e.g. `( $ )` for Green Coin), sidebar badges (e.g. `+10%`), and HUD numbers the feature should change.
+6. **Tear down**: `tu press q --name <feature>-test` (clean quit so the save lock releases), then `tu kill --name <feature>-test` and `rm -rf $TMPSAVE`.
+
+Two important rules:
+
+- **Never run the test against the real save dir.** Always pass `--env XDG_CONFIG_HOME=<tempdir>`. The single-instance lock will block a real running game, and a stray test write would corrupt the player's save.
+- **Quit cleanly with `q` before `tu kill`.** Killing while the alt-screen is up can leave the host terminal in a wrecked state on some configurations; quitting first lets the binary restore the screen.
+
+The smoke test for #21 (Green Coin) walked: launch fresh save → F5 (force-spawn) → PNG screenshot (assert green `( $ )` marker rendered in green palette, distinct from gold/purple) → `tu type "g"` (catch) → PNG screenshot (assert `+10%` badge on Index Finger row, green-tinted title-bar pulse from the new border channel firing). That sequence is the template for any future powerup. Note the visible-set targeting: the badge can land on a tier the player hasn't bought yet (any sidebar-visible row), so the test doesn't need to buy a fingerer first.
 
 ## Visual / animation policy
 

@@ -64,12 +64,12 @@ pub struct GameStateV1 {
 
 impl GameStateV1 {
     /// Convenience shortcut for tests and tooling: walk this V1 snapshot
-    /// through the migration chain to a live `GameState`. Equivalent to
-    /// `super::v2::GameStateV2::from(self).into_current()`. Production
-    /// code goes through `crate::save::load_from_str` instead, which also
-    /// runs `migrate_runtime()`.
+    /// through the migration chain to a live `GameState`. Folds through
+    /// every intermediate version. Production code goes through
+    /// `crate::save::load_from_str` instead, which also runs
+    /// `migrate_runtime()`.
     pub fn into_current(self) -> GameState {
-        super::v2::GameStateV2::from(self).into_current()
+        super::v3::GameStateV3::from(super::v2::GameStateV2::from(self)).into_current()
     }
 }
 

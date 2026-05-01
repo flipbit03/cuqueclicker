@@ -8,7 +8,7 @@ use ratatui::{prelude::*, widgets::*};
 /// page. `F8` has no default browser binding outside of an open DevTools
 /// instance, so it's safe on both web and native.
 pub const DEBUG_KEYS: &[(&str, &str)] = &[
-    ("F8", "Lucky  [$]"),
+    ("F8", "Golden [$]"),
     ("F2", "Frenzy [!]"),
     ("F3", "Buff   [+]"),
     ("F4", "+1M cuques"),
