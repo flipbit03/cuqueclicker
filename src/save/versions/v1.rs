@@ -12,10 +12,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-use crate::game::state::{Buff, GameState};
+use crate::game::state::GameState;
 
 /// V1 mirror of `Buff`. Frozen at the shape it had when V1 shipped:
-/// click-frenzy and per-fingerer-boost variants only.
+/// click-frenzy and per-fingerer-boost variants only. The `FingererBoost`
+/// variant is consumed by the V1→V2 chain step (`super::v2`); the V1
+/// snapshot itself stays unchanged.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum BuffV1 {
     ClickFrenzy {
@@ -29,33 +31,6 @@ pub enum BuffV1 {
         fingerer_id: String,
         mult: f64,
     },
-}
-
-impl From<BuffV1> for Buff {
-    fn from(b: BuffV1) -> Self {
-        match b {
-            BuffV1::ClickFrenzy {
-                ticks_remaining,
-                initial_ticks,
-                mult,
-            } => Buff::ClickFrenzy {
-                ticks_remaining,
-                initial_ticks,
-                mult,
-            },
-            BuffV1::FingererBoost {
-                ticks_remaining,
-                initial_ticks,
-                fingerer_id,
-                mult,
-            } => Buff::FingererBoost {
-                ticks_remaining,
-                initial_ticks,
-                fingerer_id,
-                mult,
-            },
-        }
-    }
 }
 
 /// V1 game-state snapshot. Holds only the persisted fields — everything
@@ -88,32 +63,20 @@ pub struct GameStateV1 {
 }
 
 impl GameStateV1 {
-    /// Convert into the live `GameState`. At V1 the live and frozen shapes
-    /// match (V1 is the inaugural version), so this is a straight copy of
-    /// every persisted field; ephemeral state is left at `Default` and
-    /// gets seeded by `migrate_runtime()` after the chain.
+    /// Convenience shortcut for tests and tooling: walk this V1 snapshot
+    /// through the migration chain to a live `GameState`. Equivalent to
+    /// `super::v2::GameStateV2::from(self).into_current()`. Production
+    /// code goes through `crate::save::load_from_str` instead, which also
+    /// runs `migrate_runtime()`.
     pub fn into_current(self) -> GameState {
-        GameState {
-            version: crate::save::CURRENT_VERSION,
-            cuques: self.cuques,
-            total_clicks: self.total_clicks,
-            lifetime_cuques: self.lifetime_cuques,
-            best_fps: self.best_fps,
-            golden_caught: self.golden_caught,
-            fingerers_owned: self.fingerers_owned,
-            achievements_earned: self.achievements_earned,
-            upgrades_earned: self.upgrades_earned,
-            prestige: self.prestige,
-            total_play_ticks: self.total_play_ticks,
-            buffs: self.buffs.into_iter().map(Into::into).collect(),
-            ..GameState::default()
-        }
+        super::v2::GameStateV2::from(self).into_current()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::state::Buff;
 
     #[test]
     fn into_current_preserves_all_persisted_fields() {

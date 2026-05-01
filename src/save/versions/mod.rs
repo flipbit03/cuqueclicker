@@ -6,3 +6,4 @@
 //! with a `From<vN>`-style conversion instead.
 
 pub mod v1;
+pub mod v2;

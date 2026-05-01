@@ -20,7 +20,7 @@ use crate::game::state::GameState;
 
 /// The version number every fresh save is written as. Bump in lockstep
 /// with adding a new `versions/vN.rs` and routing it in [`load_from_str`].
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Best-effort load from a JSON string. Falls back to a default state if
 /// the input is malformed at any layer of the chain. The result is always
@@ -33,7 +33,13 @@ pub const CURRENT_VERSION: u32 = 1;
 pub fn load_from_str(json: &str) -> GameState {
     match migrate::peek_version(json) {
         1 => match serde_json::from_str::<versions::v1::GameStateV1>(json) {
-            Ok(v1) => v1.into_current().migrate_runtime(),
+            Ok(v1) => versions::v2::GameStateV2::from(v1)
+                .into_current()
+                .migrate_runtime(),
+            Err(_) => GameState::default().migrate_runtime(),
+        },
+        2 => match serde_json::from_str::<versions::v2::GameStateV2>(json) {
+            Ok(v2) => v2.into_current().migrate_runtime(),
             Err(_) => GameState::default().migrate_runtime(),
         },
         _ => GameState::default().migrate_runtime(),

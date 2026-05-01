@@ -499,7 +499,7 @@ pub fn build_demo_state() -> GameState {
         if let Some(f) = FINGERERS.get(idx)
             && count > 0
         {
-            s.fingerers_owned.insert(f.id.to_string(), count);
+            s.fingerers_state.entry(f.id.to_string()).or_default().count = count;
         }
     }
     // Take the first 10 upgrades from the catalog (deterministic regardless
