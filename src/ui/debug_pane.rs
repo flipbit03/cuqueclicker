@@ -12,6 +12,7 @@ pub const DEBUG_KEYS: &[(&str, &str)] = &[
     ("F2", "Frenzy [!]"),
     ("F3", "Buff   [+]"),
     ("F4", "+1M cuques"),
+    ("F5", "Green  [+]"),
 ];
 
 pub fn draw(frame: &mut Frame, play_area: Rect) {

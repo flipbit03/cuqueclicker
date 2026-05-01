@@ -380,7 +380,9 @@ fn handle_key(
         }
         // [g] catches any Golden Cuque variant. Guard on the latest snapshot
         // to avoid sending a noop CatchGolden when nothing is on screen.
-        KeyCode::Char('g') | KeyCode::Char('G') if ctx.current.golden.is_some() => {
+        KeyCode::Char('g') | KeyCode::Char('G')
+            if ctx.current.golden.is_some() || ctx.current.green_coin.is_some() =>
+        {
             out.push(Action::CatchGolden);
         }
         // Debug/testing: gated by `debug`. See src/ui/debug_pane.rs for the
@@ -405,6 +407,9 @@ fn handle_key(
         }
         KeyCode::F(4) if ctx.debug => {
             out.push(Action::DevAddCuques(1_000_000.0));
+        }
+        KeyCode::F(5) if ctx.debug => {
+            out.push(Action::DevSpawnGreenCoin);
         }
         KeyCode::Char('p') | KeyCode::Char('P') => {
             ui.mode = if matches!(ui.mode, Mode::Prestige) {

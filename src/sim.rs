@@ -20,6 +20,7 @@ use rand::RngExt;
 use ratatui::layout::Rect;
 
 use crate::game::golden::{self, GoldenVariant};
+use crate::game::green_coin;
 use crate::game::state::{GameState, TICK_DT};
 
 /// Buy quantity for a fingerer purchase action. Modifier-key meaning is
@@ -59,6 +60,9 @@ pub enum Action {
     /// the sim trusts whatever arrives.
     DevAddCuques(f64),
     DevForceGolden(GoldenVariant),
+    /// Force-spawn a Green Coin (F5 in dev). Bypasses the spawn pity
+    /// counter and the golden-spawn-event tie-in entirely.
+    DevSpawnGreenCoin,
     /// J10: a click that didn't hit anything actionable. Sim spawns a
     /// short-lived "·" misclick particle at the screen point so dead-zone
     /// clicks visibly register.
@@ -103,7 +107,12 @@ pub fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometr
             state.space_pressed_this_tick = true;
         }
         Action::CatchGolden => {
+            // Catch button is unified across the on-screen powerups — try
+            // both and let whichever's present consume the press. Order
+            // doesn't matter (independent slots) but Golden goes first to
+            // match the legacy code path.
             state.catch_golden();
+            state.catch_green_coin();
         }
         Action::BuyFingerer { idx, qty } => match qty {
             BuyQty::One => {
@@ -131,6 +140,9 @@ pub fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometr
         Action::DevForceGolden(variant) => {
             force_spawn_golden(state, geom, variant);
         }
+        Action::DevSpawnGreenCoin => {
+            force_spawn_green_coin(state, geom);
+        }
         Action::Misclick { col, row } => {
             state.spawn_misclick(col, row);
         }
@@ -143,6 +155,7 @@ pub fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometr
 pub fn sim_tick(state: &mut GameState, geom: &SimGeometry) {
     state.tick();
     state.tick_golden();
+    state.tick_green_coin();
     maybe_spawn_golden(state, geom);
     maybe_spawn_auto_particle(state, geom);
     maybe_idle_clench(state);
@@ -184,6 +197,21 @@ fn maybe_spawn_golden(state: &mut GameState, geom: &SimGeometry) {
         return;
     }
     state.golden = Some(golden::spawn_in(geom.biscuit));
+
+    // Green Coin spawn pity: each regular Golden spawn bumps the chance
+    // by 1%. The roll fires whether or not a Green Coin slot is currently
+    // free; if one's already on screen, the counter still increments but
+    // the roll is *not* re-cast (the existing coin keeps its turn). The
+    // counter resets the moment a Green Coin appears, regardless of
+    // whether the player catches it or it expires.
+    state.goldens_since_green_coin = state.goldens_since_green_coin.saturating_add(1);
+    if state.green_coin.is_none() {
+        let p = state.goldens_since_green_coin as f64 * 0.01;
+        if rand::rng().random::<f64>() < p {
+            state.green_coin = Some(green_coin::spawn_in(geom.biscuit));
+            state.goldens_since_green_coin = 0;
+        }
+    }
 }
 
 fn force_spawn_golden(state: &mut GameState, geom: &SimGeometry, variant: GoldenVariant) {
@@ -193,4 +221,14 @@ fn force_spawn_golden(state: &mut GameState, geom: &SimGeometry, variant: Golden
     let mut g = golden::spawn_in(geom.biscuit);
     g.variant = variant;
     state.golden = Some(g);
+}
+
+fn force_spawn_green_coin(state: &mut GameState, geom: &SimGeometry) {
+    if state.green_coin.is_some() {
+        return;
+    }
+    if geom.biscuit.width < 8 || geom.biscuit.height < 5 {
+        return;
+    }
+    state.green_coin = Some(green_coin::spawn_in(geom.biscuit));
 }

@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::game::achievement::ACHIEVEMENTS;
 use crate::game::fingerer::{self, FINGERERS};
 use crate::game::golden::GoldenCuque;
-use crate::game::modifier::{FingererAggregate, Modifier, ModifierDuration};
+use crate::game::green_coin::GreenCoin;
+use crate::game::modifier::{
+    FingererAggregate, Modifier, ModifierDuration, ModifierEffect, ModifierSource,
+};
 use crate::game::upgrade::{UPGRADES, UpgradeEffect};
 
 pub const TICK_HZ: u32 = 20;
@@ -224,6 +227,12 @@ pub struct GameState {
     pub total_play_ticks: u64,
     #[serde(default)]
     pub buffs: Vec<Buff>,
+    /// Green Coin pity counter. Increments on every regular Golden spawn,
+    /// drives a `rng < counter * 0.01` roll for an alongside Green Coin
+    /// spawn, and resets the moment a Green Coin appears. Persisted so the
+    /// pity timer survives quit/restart.
+    #[serde(default)]
+    pub goldens_since_green_coin: u32,
 
     #[serde(skip)]
     pub clench_ticks: u32,
@@ -238,6 +247,12 @@ pub struct GameState {
     pub golden: Option<GoldenCuque>,
     #[serde(skip)]
     pub golden_cooldown: u32,
+    /// On-screen Green Coin, if one is currently visible. Lifetime ticked
+    /// down by `tick_green_coin`; cleared on catch or expiry. Not persisted
+    /// (parallel to `golden`) — closing and reopening the game shouldn't
+    /// preserve a frozen coin frame.
+    #[serde(skip)]
+    pub green_coin: Option<GreenCoin>,
     #[serde(skip)]
     pub session_ticks: u64,
     /// Queue of achievement ids that unlocked but haven't yet been shown as a
@@ -378,11 +393,13 @@ impl Default for GameState {
             prestige: 0,
             total_play_ticks: 0,
             buffs: Vec::new(),
+            goldens_since_green_coin: 0,
             clench_ticks: 0,
             particles: Vec::new(),
             misclick_particles: Vec::new(),
             golden: None,
             golden_cooldown: crate::game::golden::next_cooldown(),
+            green_coin: None,
             session_ticks: 0,
             newly_unlocked: Vec::new(),
             active_unlock_id: None,
@@ -856,6 +873,9 @@ impl GameState {
         self.particles.clear();
         self.misclick_particles.clear();
         self.golden = None;
+        self.green_coin = None;
+        // Pity counter resets too — the new run earns its own Green Coins.
+        self.goldens_since_green_coin = 0;
         self.clench_ticks = 0;
         self.golden_cooldown = crate::game::golden::next_cooldown();
         true
@@ -1069,6 +1089,71 @@ impl GameState {
         } else if self.golden_cooldown > 0 {
             self.golden_cooldown -= 1;
         }
+    }
+
+    /// Lifetime tick for the Green Coin (mirror of `tick_golden`'s coin
+    /// half — Green Coin has no cooldown of its own; spawning is gated on
+    /// regular Golden spawns instead). Decrements `life_ticks` each call,
+    /// clears the slot when it hits 0.
+    pub fn tick_green_coin(&mut self) {
+        if let Some(g) = self.green_coin.as_mut() {
+            if g.life_ticks == 0 {
+                self.green_coin = None;
+            } else {
+                g.life_ticks -= 1;
+            }
+        }
+    }
+
+    /// Catch the on-screen Green Coin if any. Picks a random owned fingerer
+    /// (`count > 0`) and attaches a permanent `+10%` `AddPercent` modifier
+    /// sourced as `GreenCoin`. Returns `true` if a coin was consumed (catch
+    /// or no-op miss because nothing was owned), `false` if there was no
+    /// coin to catch in the first place.
+    ///
+    /// Edge case: if the player owns nothing yet, the coin is consumed but
+    /// no modifier attaches — same defensive behavior as the old Buff
+    /// golden when the catalog was empty. The +10% had nothing to land on.
+    pub fn catch_green_coin(&mut self) -> bool {
+        let Some(g) = self.green_coin.take() else {
+            return false;
+        };
+        let m = Modifier {
+            source: ModifierSource::GreenCoin,
+            effects: vec![ModifierEffect::AddPercent(
+                crate::game::green_coin::GREEN_COIN_ADD_PERCENT,
+            )],
+            duration: ModifierDuration::Permanent,
+            created_at_tick: self.total_play_ticks,
+        };
+        let chosen = self.attach_modifier_random_owned(m);
+        // Catch counts toward the existing "golden caught" stat — feels
+        // right (it's a powerup catch), and avoids inventing a new stat
+        // until/unless we want a separate "Green Coins caught" counter.
+        self.golden_caught += 1;
+        // Visual feedback: a "+10% <fingerer>" particle anchored at the
+        // coin's position. Phase 5 wraps this with a green border channel
+        // pulse and proper marker rendering.
+        let label = match &chosen {
+            Some(id) => {
+                let idx = FINGERERS.iter().position(|f| f.id == id);
+                let name = idx
+                    .and_then(|i| crate::i18n::t().fingerer_names.get(i).copied())
+                    .unwrap_or("?");
+                format!("+10% {}", name)
+            }
+            // No owned fingerer to host the boost — show a neutral marker.
+            None => "+10% ???".to_string(),
+        };
+        self.particles.push(Particle {
+            frac_x: g.frac_x,
+            frac_y: g.frac_y,
+            life: PARTICLE_LIFE * 2,
+            text: label,
+            kind: ParticleKind::Golden,
+            drift_x: 0.0,
+        });
+        true
     }
 
     pub fn trigger_clench(&mut self) {
@@ -1710,5 +1795,115 @@ mod tests {
         let m = s.migrate_runtime();
         let agg = m.fingerer_aggregate("index_finger");
         assert!((agg.add_percent - 0.25).abs() < 1e-9);
+    }
+
+    // -- Green Coin ---------------------------------------------------------
+
+    use crate::game::green_coin::{GREEN_COIN_LIFE_TICKS, GreenCoin};
+
+    fn fake_green_coin() -> GreenCoin {
+        GreenCoin {
+            frac_x: 0.5,
+            frac_y: 0.5,
+            life_ticks: GREEN_COIN_LIFE_TICKS,
+        }
+    }
+
+    #[test]
+    fn catch_green_coin_attaches_permanent_modifier() {
+        let mut s = GameState::default();
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(3));
+        s.green_coin = Some(fake_green_coin());
+
+        let caught = s.catch_green_coin();
+
+        assert!(caught);
+        assert!(s.green_coin.is_none());
+        let st = s.fingerers_state.get("index_finger").unwrap();
+        assert_eq!(st.modifiers.len(), 1);
+        let m = &st.modifiers[0];
+        assert!(matches!(m.source, ModifierSource::GreenCoin));
+        assert!(matches!(m.duration, ModifierDuration::Permanent));
+        assert!(matches!(
+            m.effects[0],
+            ModifierEffect::AddPercent(v) if (v - 0.10).abs() < 1e-9
+        ));
+        assert!((st.aggregate.add_percent - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn catch_green_coin_with_no_owned_consumes_coin_without_attaching() {
+        // No fingerer owned — there's nothing for the modifier to land on.
+        // The coin is still consumed (player pressed catch; that's resolved)
+        // and `catch_green_coin` returns true to signal "yes a coin was
+        // there." No FingererState entries get created.
+        let mut s = GameState {
+            green_coin: Some(fake_green_coin()),
+            ..Default::default()
+        };
+
+        let caught = s.catch_green_coin();
+
+        assert!(caught);
+        assert!(s.green_coin.is_none());
+        assert!(s.fingerers_state.is_empty());
+    }
+
+    #[test]
+    fn catch_green_coin_returns_false_when_no_coin() {
+        let mut s = GameState::default();
+        assert!(!s.catch_green_coin());
+    }
+
+    #[test]
+    fn tick_green_coin_decrements_lifetime_and_clears_at_zero() {
+        let mut s = GameState {
+            green_coin: Some(GreenCoin {
+                frac_x: 0.5,
+                frac_y: 0.5,
+                life_ticks: 2,
+            }),
+            ..Default::default()
+        };
+        s.tick_green_coin();
+        assert_eq!(s.green_coin.as_ref().unwrap().life_ticks, 1);
+        s.tick_green_coin();
+        // Now `life_ticks` is 0 but slot still occupied.
+        assert_eq!(s.green_coin.as_ref().unwrap().life_ticks, 0);
+        s.tick_green_coin();
+        // The next tick clears it (mirrors `tick_golden`'s convention).
+        assert!(s.green_coin.is_none());
+    }
+
+    #[test]
+    fn green_coin_stacks_additively_on_repeat_catches() {
+        // Two Green Coins on the same fingerer = +20%, not +21%.
+        let mut s = GameState::default();
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        for _ in 0..2 {
+            s.green_coin = Some(fake_green_coin());
+            s.catch_green_coin();
+        }
+        let st = s.fingerers_state.get("index_finger").unwrap();
+        // RNG randomly picks the only owned fingerer both times.
+        assert_eq!(st.modifiers.len(), 2);
+        assert!((st.aggregate.add_percent - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prestige_reset_clears_green_coin_state() {
+        let mut s = GameState {
+            lifetime_cuques: 1_000_000_000.0,
+            ..Default::default()
+        };
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        s.goldens_since_green_coin = 7;
+        s.green_coin = Some(fake_green_coin());
+        s.prestige_reset();
+        assert!(s.green_coin.is_none());
+        assert_eq!(s.goldens_since_green_coin, 0);
     }
 }

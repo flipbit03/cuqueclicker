@@ -166,6 +166,11 @@ pub struct GameStateV2 {
     pub total_play_ticks: u64,
     #[serde(default)]
     pub buffs: Vec<BuffV2>,
+    /// Pity counter for the Green Coin spawn roll. Persisted so the timer
+    /// survives quit/restart. Pre-V2 saves default this to 0 — they had
+    /// no Green Coin mechanic, so starting fresh is correct.
+    #[serde(default)]
+    pub goldens_since_green_coin: u32,
 }
 
 impl GameStateV2 {
@@ -193,6 +198,7 @@ impl GameStateV2 {
             prestige: self.prestige,
             total_play_ticks: self.total_play_ticks,
             buffs,
+            goldens_since_green_coin: self.goldens_since_green_coin,
             ..GameState::default()
         }
     }
@@ -271,6 +277,9 @@ impl From<GameStateV1> for GameStateV2 {
             prestige: v1.prestige,
             total_play_ticks: v1.total_play_ticks,
             buffs,
+            // V1 saves predate the Green Coin mechanic; the pity counter
+            // simply starts fresh on first load into V2.
+            goldens_since_green_coin: 0,
         }
     }
 }
@@ -464,6 +473,7 @@ mod tests {
             prestige: 0,
             total_play_ticks: 0,
             buffs: vec![],
+            goldens_since_green_coin: 0,
         };
 
         let live = v2.into_current();
