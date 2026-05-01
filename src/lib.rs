@@ -15,6 +15,7 @@ pub mod game;
 pub mod i18n;
 pub mod input;
 pub mod platform;
+pub mod save;
 pub mod sim;
 pub mod ui;
 

@@ -38,16 +38,15 @@ impl Persistence {
 
     /// Best-effort load. Returns `GameState::default()` if storage isn't
     /// available, the key is missing, or the value fails to deserialize.
-    /// Always runs the loaded state through `migrate()` so older saves
-    /// from other browsers / older versions reach the current schema.
+    /// The version-dispatch chain in `crate::save` handles older shapes
+    /// (and seeds ephemeral state via `migrate_runtime`).
     pub fn load(&self) -> GameState {
         if let Some(storage) = local_storage()
             && let Ok(Some(data)) = storage.get_item(SAVE_KEY)
-            && let Ok(state) = serde_json::from_str::<GameState>(&data)
         {
-            return state.migrate();
+            return crate::save::load_from_str(&data);
         }
-        GameState::default()
+        GameState::default().migrate_runtime()
     }
 
     /// Best-effort save. localStorage `set_item` can fail when the quota
@@ -58,7 +57,7 @@ impl Persistence {
         let Some(storage) = local_storage() else {
             return Ok(());
         };
-        let data = serde_json::to_string(state)?;
+        let data = crate::save::save_to_string(state)?;
         let _ = storage.set_item(SAVE_KEY, &data);
         Ok(())
     }

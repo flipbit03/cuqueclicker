@@ -179,6 +179,14 @@ impl Buff {
 /// to zero / absent (backward-compat).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GameState {
+    /// Save schema version. The on-disk migration chain (`crate::save`)
+    /// reads this via `peek_version` *before* deserializing into the right
+    /// `GameStateVN` struct. A live in-memory state always equals
+    /// `crate::save::CURRENT_VERSION` — the chain stamps it on conversion
+    /// and `Default` initializes it that way. Pre-versioned saves on disk
+    /// have no `version` key, which `peek_version` treats as V1.
+    #[serde(default = "default_save_version")]
+    pub version: u32,
     #[serde(default)]
     pub cuques: f64,
     #[serde(default)]
@@ -337,9 +345,18 @@ pub struct GameState {
 pub const LUCKY_FLASH_TICKS: u32 = 70; // 3.5s at 20Hz
 pub const PURCHASE_FLASH_TICKS: u32 = 20; // 1s at 20Hz
 
+/// Serde default for `GameState::version`. A direct deserialize of the live
+/// `GameState` from a pre-versioned save (one without the field) still
+/// produces a sensibly-stamped state — though production loads always go
+/// through the migration chain in `crate::save`.
+fn default_save_version() -> u32 {
+    crate::save::CURRENT_VERSION
+}
+
 impl Default for GameState {
     fn default() -> Self {
         Self {
+            version: crate::save::CURRENT_VERSION,
             cuques: 0.0,
             total_clicks: 0,
             lifetime_cuques: 0.0,
@@ -389,9 +406,14 @@ impl Default for GameState {
 impl GameState {
     /// Initialize ephemeral runtime state that `#[serde(skip)]` left empty
     /// after deserialization, and normalize any fields that need live values
-    /// rather than the serde default. Hook point for future shape
-    /// transforms — see CLAUDE.md on the stable-id save policy.
-    pub fn migrate(mut self) -> Self {
+    /// rather than the serde default.
+    ///
+    /// **Runtime-only.** Persisted-shape migrations live in
+    /// `crate::save::versions::vN.rs` (see CLAUDE.md "Save versioning").
+    /// This method runs *after* the migration chain has produced a live
+    /// `GameState`; it must not assume any particular pre-state and must
+    /// be safe to call multiple times.
+    pub fn migrate_runtime(mut self) -> Self {
         // Per-catalog flash slots are runtime-only — re-size if the catalog
         // grew/shrank since this save was written.
         if self.fingerer_flash_ticks.len() != fingerer::count() {
@@ -1178,7 +1200,7 @@ mod tests {
             ..GameState::default()
         };
 
-        let m = state.migrate();
+        let m = state.migrate_runtime();
 
         assert_eq!(m.fingerer_count("index_finger"), 9);
         assert!(m.has_upgrade("click_mult_1"));
@@ -1197,7 +1219,7 @@ mod tests {
             ..GameState::default()
         };
 
-        let m = state.migrate();
+        let m = state.migrate_runtime();
 
         assert_eq!(m.fingerer_count("giga_finger_from_the_future"), 42);
         assert_eq!(m.fingerer_count("index_finger"), 0);
@@ -1219,7 +1241,7 @@ mod tests {
 
         let json = serde_json::to_string(&state).expect("serialize");
         let roundtripped: GameState = serde_json::from_str(&json).expect("deserialize");
-        let m = roundtripped.migrate();
+        let m = roundtripped.migrate_runtime();
 
         assert_eq!(m.cuques, 1234.5);
         assert_eq!(m.total_clicks, 99);
@@ -1289,8 +1311,8 @@ mod tests {
         // Player clicks an unaffordable fingerer row → buy() returns false
         // AND a red row flash is queued so the rejection is visible. This
         // is the J11 contract; without it the click looks silent.
+        // (Default already zeroes `cuques`; no explicit reset needed.)
         let mut s = GameState::default();
-        s.cuques = 0.0;
         let bought = s.buy(0);
         assert!(!bought);
         assert!(
@@ -1306,7 +1328,6 @@ mod tests {
     #[test]
     fn buy_n_when_broke_sets_unaffordable_flash() {
         let mut s = GameState::default();
-        s.cuques = 0.0;
         let bought = s.buy_n(0, 10);
         assert_eq!(bought, 0);
         assert!(s.fingerer_unaffordable_flash[0] > 0);
@@ -1368,7 +1389,7 @@ mod tests {
         s.upgrade_flash_ticks.clear();
         s.fingerer_unaffordable_flash.clear();
         s.upgrade_unaffordable_flash.clear();
-        let m = s.migrate();
+        let m = s.migrate_runtime();
         assert_eq!(m.fingerer_flash_ticks.len(), fingerer::count());
         assert_eq!(m.upgrade_flash_ticks.len(), UPGRADES.len());
         assert_eq!(m.fingerer_unaffordable_flash.len(), fingerer::count());
@@ -1383,7 +1404,7 @@ mod tests {
             cuques: 5_000.0,
             ..Default::default()
         };
-        let m = s.migrate();
+        let m = s.migrate_runtime();
         assert_eq!(m.displayed_cuques, 5_000.0);
         // displayed_fps starts at 0 and converges over the first few ticks
         // (otherwise we'd snap-show the FPS before any tick has run).
