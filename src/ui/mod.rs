@@ -62,6 +62,11 @@ pub enum HelpAction {
 pub struct DrawOutput {
     pub biscuit_rect: Rect,
     pub golden_rect: Rect,
+    /// On-screen Green Coin marker rect, or zero-rect when no coin is
+    /// visible. Hit-tested by the click router exactly like `golden_rect`
+    /// — clicking either one routes through `Action::CatchGolden`, which
+    /// the sim resolves by trying both catch paths.
+    pub green_coin_rect: Rect,
     /// The whole left column where the biscuit + hands + particles live —
     /// i.e. "the box that displays the ass." Used by the input router so
     /// the scroll-wheel zoom fires anywhere in this region (including the
@@ -288,6 +293,10 @@ pub fn draw(
         Some(g) => biscuit::draw_golden(frame, g, biscuit_rect),
         None => Rect::default(),
     };
+    let green_coin_rect = match &state.green_coin {
+        Some(c) => biscuit::draw_green_coin(frame, c, biscuit_rect),
+        None => Rect::default(),
+    };
 
     // J1: achievement toast overlay. Lives in `left[1]` (biscuit/main area)
     // so it covers nothing important on the right; auto-dismisses after
@@ -315,6 +324,7 @@ pub fn draw(
     DrawOutput {
         biscuit_rect,
         golden_rect,
+        green_coin_rect,
         play_area: left[1],
         upgrade_rows,
         fingerer_rows,

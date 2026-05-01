@@ -272,6 +272,12 @@ pub struct GameState {
     pub lucky_flash_ticks: u32,
     #[serde(skip)]
     pub achievement_flash_ticks: u32,
+    /// Brief green border channel pulse fired on a Green Coin catch.
+    /// Behaves like `lucky_flash_ticks` (plateau-fade); coexists with
+    /// other channels so a Green Coin caught during a Frenzy or Lucky
+    /// adds a green moiré rather than overwriting them.
+    #[serde(skip)]
+    pub green_coin_flash_ticks: u32,
     /// HUD title border phase clock. Advances by `border_speed()` each
     /// tick, so the title border visibly speeds up under Frenzy / Lucky /
     /// purchase events. INTENTIONALLY NOT shared with secondary shimmers
@@ -369,6 +375,10 @@ pub struct GameState {
 
 pub const LUCKY_FLASH_TICKS: u32 = 70; // 3.5s at 20Hz
 pub const PURCHASE_FLASH_TICKS: u32 = 20; // 1s at 20Hz
+/// Green Coin catch pulse — slightly shorter than Lucky's so the celebratory
+/// blip lands without lingering for so long it competes with whatever might
+/// be running on top (Frenzy, Buff, Lucky).
+pub const GREEN_COIN_FLASH_TICKS: u32 = 50; // 2.5s at 20Hz
 
 /// Serde default for `GameState::version`. A direct deserialize of the live
 /// `GameState` from a pre-versioned save (one without the field) still
@@ -407,6 +417,7 @@ impl Default for GameState {
             visual_debt: 0.0,
             lucky_flash_ticks: 0,
             achievement_flash_ticks: 0,
+            green_coin_flash_ticks: 0,
             border_phase: 0,
             steady_phase: 0,
             purchase_flash_ticks: 0,
@@ -909,6 +920,7 @@ impl GameState {
 
         self.lucky_flash_ticks = self.lucky_flash_ticks.saturating_sub(1);
         self.achievement_flash_ticks = self.achievement_flash_ticks.saturating_sub(1);
+        self.green_coin_flash_ticks = self.green_coin_flash_ticks.saturating_sub(1);
         self.purchase_flash_ticks = self.purchase_flash_ticks.saturating_sub(1);
         if self.purchase_flash_ticks == 0 {
             self.purchase_flash_strength = 1.0;
@@ -1131,6 +1143,7 @@ impl GameState {
         // right (it's a powerup catch), and avoids inventing a new stat
         // until/unless we want a separate "Green Coins caught" counter.
         self.golden_caught += 1;
+        self.green_coin_flash_ticks = GREEN_COIN_FLASH_TICKS;
         // Visual feedback: a "+10% <fingerer>" particle anchored at the
         // coin's position. Phase 5 wraps this with a green border channel
         // pulse and proper marker rendering.

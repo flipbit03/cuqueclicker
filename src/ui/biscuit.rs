@@ -1,6 +1,7 @@
 use ratatui::{prelude::*, widgets::*};
 
 use crate::game::golden::{GOLDEN_LIFE_TICKS, GoldenCuque, GoldenVariant};
+use crate::game::green_coin::{GREEN_COIN_LIFE_TICKS, GreenCoin};
 use crate::game::state::{Buff, CLENCH_SQUASH_TICKS, CLENCH_TICKS, GameState};
 
 /// Asshole-spin animation frames. Cycled by `total_clicks % N` while a
@@ -526,6 +527,109 @@ pub fn draw_golden(frame: &mut Frame, golden: &GoldenCuque, biscuit: Rect) -> Re
             let main_b = dim_dim.2 + (bright.2 - dim_dim.2) * wave_main;
             // Cap accent contribution at 35% so it tints without washing
             // out the bright peak.
+            let accent_w = wave_accent * 0.35;
+            let r = main_r + (accent.0 - main_r) * accent_w;
+            let g = main_g + (accent.1 - main_g) * accent_w;
+            let b = main_b + (accent.2 - main_b) * accent_w;
+            let style = Style::default()
+                .fg(Color::Rgb(
+                    r.clamp(0.0, 255.0) as u8,
+                    g.clamp(0.0, 255.0) as u8,
+                    b.clamp(0.0, 255.0) as u8,
+                ))
+                .bg(bg)
+                .add_modifier(Modifier::BOLD);
+            buf.set_string(x, y, ch.to_string(), style);
+        }
+    }
+
+    Rect {
+        x: col,
+        y: row,
+        width: w,
+        height: h,
+    }
+}
+
+/// Render the Green Coin marker. Same shimmer model as `draw_golden` but
+/// a fixed green palette + `$` glyph (the Green Coin is sourced from the
+/// "Moeda Verde" idea — a money coin, hence the dollar sign). Independent
+/// from `GoldenVariant` because Green Coin has its own lifetime constant
+/// and lives in `GameState::green_coin` (parallel slot to `golden`), so
+/// folding it into the variant enum would tangle two unrelated entities.
+pub fn draw_green_coin(frame: &mut Frame, coin: &GreenCoin, biscuit: Rect) -> Rect {
+    let buf = frame.buffer_mut();
+    let center = '$';
+    // Green palette — clearly distinct from Lucky's gold and Buff's purple.
+    let bright = (140.0_f32, 255.0, 160.0);
+    let dim = (10.0_f32, 80.0, 30.0);
+    let accent = (200.0_f32, 255.0, 110.0);
+    let bg = Color::Rgb(0, 30, 10);
+
+    let life_frac = (coin.life_ticks as f32 / GREEN_COIN_LIFE_TICKS as f32).clamp(0.0, 1.0);
+    let alarm = life_frac < 0.20;
+    let speed = if alarm { 1.5 } else { 0.6 };
+    let dim_pull = if alarm { 1.0 } else { 0.6 };
+    let phase = (GREEN_COIN_LIFE_TICKS - coin.life_ticks) as f32 * speed;
+    let cell_offset = std::f32::consts::TAU / 5.0;
+
+    let lines: [String; 3] = [
+        ".---.".to_string(),
+        format!("( {} )", center),
+        "`---'".to_string(),
+    ];
+    let w: u16 = 5;
+    let h: u16 = 3;
+
+    let area = buf.area;
+    if area.width == 0 || area.height == 0 || biscuit.width < w || biscuit.height < h {
+        return Rect::default();
+    }
+
+    let (anchor_col, anchor_row) =
+        crate::game::state::biscuit_frac_to_screen(coin.frac_x, coin.frac_y, biscuit);
+    let mut col = anchor_col;
+    let mut row = anchor_row;
+    if col + w > biscuit.x + biscuit.width {
+        col = (biscuit.x + biscuit.width).saturating_sub(w);
+    }
+    if row + h > biscuit.y + biscuit.height {
+        row = (biscuit.y + biscuit.height).saturating_sub(h);
+    }
+    if col < biscuit.x {
+        col = biscuit.x;
+    }
+    if row < biscuit.y {
+        row = biscuit.y;
+    }
+    if col + w > area.x + area.width {
+        col = (area.x + area.width).saturating_sub(w);
+    }
+    if row + h > area.y + area.height {
+        row = (area.y + area.height).saturating_sub(h);
+    }
+
+    for (dy, line) in lines.iter().enumerate() {
+        let y = row + dy as u16;
+        if y >= area.y + area.height {
+            break;
+        }
+        for (i, ch) in line.chars().enumerate() {
+            let x = col + i as u16;
+            if x >= area.x + area.width {
+                break;
+            }
+            let arg = phase + i as f32 * cell_offset;
+            let wave_main = (arg.sin() + 1.0) * 0.5;
+            let wave_accent = ((arg + std::f32::consts::FRAC_PI_2).sin() + 1.0) * 0.5;
+            let dim_dim = (
+                dim.0 * (1.0 - 0.4 * dim_pull),
+                dim.1 * (1.0 - 0.4 * dim_pull),
+                dim.2 * (1.0 - 0.4 * dim_pull),
+            );
+            let main_r = dim_dim.0 + (bright.0 - dim_dim.0) * wave_main;
+            let main_g = dim_dim.1 + (bright.1 - dim_dim.1) * wave_main;
+            let main_b = dim_dim.2 + (bright.2 - dim_dim.2) * wave_main;
             let accent_w = wave_accent * 0.35;
             let r = main_r + (accent.0 - main_r) * accent_w;
             let g = main_g + (accent.1 - main_g) * accent_w;

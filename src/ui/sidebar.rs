@@ -78,12 +78,46 @@ pub fn draw(
         } else {
             String::new()
         };
-        lines.push(Line::from(format!(
+        // Permanent-modifier badge: how much the player has stacked from
+        // Green Coins (et al) on this fingerer, summed as AddPercent. Timed
+        // modifiers (Purple Coin) are intentionally excluded — they show up
+        // in the active-modifiers strip on the HUD instead. Skip the badge
+        // entirely if there's nothing to brag about.
+        let perm_pct: f64 = state
+            .fingerers_state
+            .get(k.id)
+            .map(|st| {
+                st.modifiers
+                    .iter()
+                    .filter(|m| {
+                        matches!(
+                            m.duration,
+                            crate::game::modifier::ModifierDuration::Permanent
+                        )
+                    })
+                    .flat_map(|m| m.effects.iter())
+                    .filter_map(|e| match e {
+                        crate::game::modifier::ModifierEffect::AddPercent(v) => Some(*v),
+                        _ => None,
+                    })
+                    .sum()
+            })
+            .unwrap_or(0.0);
+        let mut spans = vec![Span::raw(format!(
             "    +{} {}{}",
             format::rate(effective),
             lang.fps_each,
             mult_tag,
-        )));
+        ))];
+        if perm_pct > 0.0001 {
+            spans.push(Span::styled(
+                format!(" +{:.0}%", perm_pct * 100.0),
+                Style::default()
+                    .fg(Color::Rgb(120, 230, 140))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(spans));
         lines.push(Line::raw(""));
     }
     let p = Paragraph::new(lines).block(Block::bordered().title(lang.fingerers_title));
