@@ -127,6 +127,36 @@ pub struct InputContext<'a> {
     pub current: &'a GameState,
 }
 
+impl<'a> InputContext<'a> {
+    /// Build an input context by borrowing from a render
+    /// [`DrawOutput`](crate::ui::DrawOutput).
+    ///
+    /// The platform shells (`app.rs`, `wasm_app.rs`) call this so adding
+    /// a new clickable region only touches `DrawOutput` + `InputContext` +
+    /// this projection — never the platform code. Without this single
+    /// projection point, native and wasm each kept their own field-by-field
+    /// copy of the layout snapshot, and a new field meant updating both;
+    /// the wasm build broke once when only the native copy was updated.
+    pub fn from_layout(
+        layout: &'a crate::ui::DrawOutput,
+        current: &'a GameState,
+        debug: bool,
+    ) -> Self {
+        InputContext {
+            fingerer_rows: &layout.fingerer_rows,
+            upgrade_rows: &layout.upgrade_rows,
+            help_hits: &layout.help_hits,
+            biscuit_rect: layout.biscuit_rect,
+            golden_rect: layout.golden_rect,
+            green_coin_rect: layout.green_coin_rect,
+            play_area: layout.play_area,
+            prestige_reset_rect: layout.prestige_reset_rect,
+            debug,
+            current,
+        }
+    }
+}
+
 /// Process one [`InputEvent`]. Mutates [`UiState`]; appends produced actions
 /// to `out`. Pure data — does no I/O. The router *reads* `GameState` (via
 /// `ctx.current` for `prestige_available()` / `golden.is_some()` and via

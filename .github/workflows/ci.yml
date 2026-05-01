@@ -113,3 +113,35 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
+
+  build-web:
+    name: Build (Web wasm)
+    # Catch wasm-only breakage at PR time, not at deploy time. Native and
+    # wasm code paths are gated by `cfg(target_arch = "wasm32")`, so a
+    # missing field on a struct used by `wasm_app.rs` compiles fine on
+    # every native target and only blows up here. (See InputContext +
+    # DrawOutput projection in `crate::input` for why most platform-side
+    # rect plumbing is now centralized.)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: wasm32-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: wasm32-cargo-
+
+      # `cargo check` is enough — the deploy-web workflow does the full
+      # trunk pipeline; here we just want the typecheck to fail fast.
+      - name: Check wasm build
+        run: cargo check --target wasm32-unknown-unknown --release

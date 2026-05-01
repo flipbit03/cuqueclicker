@@ -32,7 +32,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use ratatui::Terminal;
-use ratatui::layout::Rect;
 use ratzilla::backend::webgl2::{FontAtlasData, WebGl2BackendOptions};
 use ratzilla::event::{
     KeyCode as RzKeyCode, KeyEvent as RzKeyEvent, MouseButton as RzMouseButton,
@@ -47,7 +46,7 @@ use crate::input::{
 };
 use crate::platform::Persistence;
 use crate::sim::{self, Action, SimGeometry};
-use crate::ui::{self, HelpAction};
+use crate::ui;
 
 /// 20Hz sim tick → 50ms per tick.
 const SIM_TICK_MS: f64 = 1000.0 / TICK_HZ as f64;
@@ -70,13 +69,12 @@ const SAVE_INTERVAL_TICKS: u64 = TICK_HZ as u64;
 /// overlap because JS callbacks aren't reentrant within a single task.
 struct WebUi {
     ui: UiState,
-    biscuit_rect: Rect,
-    golden_rect: Rect,
-    play_area: Rect,
-    prestige_reset_rect: Rect,
-    fingerer_rows: Vec<(usize, Rect)>,
-    upgrade_rows: Vec<(usize, Rect)>,
-    help_hits: Vec<(HelpAction, Rect)>,
+    /// Single per-frame layout snapshot — same role as the native
+    /// `App::layout`. `InputContext::from_layout` projects this into the
+    /// per-event input ctx, so adding a new clickable region is one struct
+    /// edit (in `DrawOutput`) and one projection edit (in `InputContext`)
+    /// — no platform-side mirror to keep in sync.
+    layout: crate::ui::DrawOutput,
     /// Wall-clock anchor for sim catch-up. Set on first rAF, advanced
     /// by `SIM_TICK_MS` per tick we actually run.
     last_tick_ms: f64,
@@ -93,13 +91,7 @@ impl WebUi {
     fn new() -> Self {
         Self {
             ui: UiState::new(),
-            biscuit_rect: Rect::default(),
-            golden_rect: Rect::default(),
-            play_area: Rect::default(),
-            prestige_reset_rect: Rect::default(),
-            fingerer_rows: Vec::new(),
-            upgrade_rows: Vec::new(),
-            help_hits: Vec::new(),
+            layout: Default::default(),
             last_tick_ms: now_ms(),
             ticks_since_save: 0,
             cell_pixel_w: 0.0,
@@ -272,7 +264,7 @@ pub fn run() -> Result<(), JsValue> {
         // off and the debug pane / F-key cheats vanish exactly like a
         // shipped native binary.
         let debug = crate::build_info::is_dev_build();
-        let out = ui::draw(
+        web.layout = ui::draw(
             f,
             &state,
             web.ui.mode,
@@ -280,16 +272,9 @@ pub fn run() -> Result<(), JsValue> {
             debug,
             web.ui.last_mouse_pos,
         );
-        web.biscuit_rect = out.biscuit_rect;
-        web.golden_rect = out.golden_rect;
-        web.play_area = out.play_area;
-        web.prestige_reset_rect = out.prestige_reset_rect;
-        web.fingerer_rows = out.fingerer_rows;
-        web.upgrade_rows = out.upgrade_rows;
-        web.help_hits = out.help_hits;
         // Hand the latest biscuit rect to the sim so goldens and auto-
         // particles spawn inside the current layout.
-        geom.biscuit = out.biscuit_rect;
+        geom.biscuit = web.layout.biscuit_rect;
 
         // Re-derive the cell pitch from canvas size vs grid cells.
         //
@@ -349,36 +334,11 @@ fn dispatch(
     let mut actions = actions.borrow_mut();
 
     // Split-borrow `web` so `process_input_event` gets `&mut ui` while
-    // `InputContext` reads the geometry slices/rects from the same struct.
+    // `InputContext::from_layout` reads `&layout` from the same struct.
     // Rust's disjoint-field rule allows this only via explicit
-    // destructuring; the equivalent `&mut web.ui` + `&web.fingerer_rows`
-    // through a `RefMut` deref triggers an aliasing borrow check error.
-    let WebUi {
-        ui,
-        fingerer_rows,
-        upgrade_rows,
-        help_hits,
-        biscuit_rect,
-        golden_rect,
-        play_area,
-        prestige_reset_rect,
-        ..
-    } = &mut *web_ref;
-
-    let ctx = InputContext {
-        fingerer_rows: fingerer_rows.as_slice(),
-        upgrade_rows: upgrade_rows.as_slice(),
-        help_hits: help_hits.as_slice(),
-        biscuit_rect: *biscuit_rect,
-        golden_rect: *golden_rect,
-        play_area: *play_area,
-        prestige_reset_rect: *prestige_reset_rect,
-        // Same gate as `ui::draw` above — release-tagged Pages builds
-        // (Cargo.toml version sed-patched off `0.0.0`) flip this off
-        // and the F-key cheats stop dispatching.
-        debug: crate::build_info::is_dev_build(),
-        current: &state,
-    };
+    // destructuring.
+    let WebUi { ui, layout, .. } = &mut *web_ref;
+    let ctx = InputContext::from_layout(layout, &state, crate::build_info::is_dev_build());
     actions.clear();
     input::process_input_event(ev, ui, &ctx, &mut actions);
     for a in actions.drain(..) {

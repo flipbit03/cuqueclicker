@@ -126,18 +126,11 @@ impl App {
         };
 
         let mut ui = UiState::new();
-        let mut upgrade_rows: Vec<(usize, Rect)> = Vec::new();
-        let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
-        let mut biscuit_rect = Rect::default();
-        let mut golden_rect = Rect::default();
-        let mut green_coin_rect = Rect::default();
-        let mut play_area = Rect::default();
-        // M1+M2: help-bar hint click rects + prestige-reset confirm rect.
-        // Both are recomputed every frame and consumed by the click router
-        // so the mouse-first player has equivalents for `[u]`, `[p]`,
-        // `[s]`, `[a]`, `[g]`, `[q]`, and the `[r] reset` confirm.
-        let mut help_hits: Vec<(crate::ui::HelpAction, Rect)> = Vec::new();
-        let mut prestige_reset_rect = Rect::default();
+        // Single per-frame layout snapshot — the source of truth for every
+        // clickable region. The input router consumes it via
+        // `InputContext::from_layout`. Adding a new rect/list goes through
+        // `DrawOutput` + the projection, never here.
+        let mut layout: ui::DrawOutput = Default::default();
         // Reused per-event scratch buffer — `process_input_event` appends
         // produced actions here, then we drain it into the mpsc channel.
         let mut actions: Vec<Action> = Vec::with_capacity(4);
@@ -154,36 +147,17 @@ impl App {
 
             let current = snapshot.load_full();
             terminal.draw(|f| {
-                let out = ui::draw(f, &current, ui.mode, ui.zoom_idx, debug, ui.last_mouse_pos);
-                biscuit_rect = out.biscuit_rect;
-                golden_rect = out.golden_rect;
-                green_coin_rect = out.green_coin_rect;
-                play_area = out.play_area;
-                upgrade_rows = out.upgrade_rows;
-                fingerer_rows = out.fingerer_rows;
-                help_hits = out.help_hits;
-                prestige_reset_rect = out.prestige_reset_rect;
+                layout = ui::draw(f, &current, ui.mode, ui.zoom_idx, debug, ui.last_mouse_pos);
             })?;
 
             // Hand fresh geometry to the sim. Ordering is preserved by mpsc,
             // so the sim always uses the most recently drawn layout.
             let _ = action_tx.send(Action::UpdateGeometry {
-                biscuit: biscuit_rect,
+                biscuit: layout.biscuit_rect,
             });
 
             if event::poll(Duration::from_millis(INPUT_POLL_MS))? {
-                let ctx = InputContext {
-                    fingerer_rows: &fingerer_rows,
-                    upgrade_rows: &upgrade_rows,
-                    help_hits: &help_hits,
-                    biscuit_rect,
-                    golden_rect,
-                    green_coin_rect,
-                    play_area,
-                    prestige_reset_rect,
-                    debug,
-                    current: &current,
-                };
+                let ctx = InputContext::from_layout(&layout, &current, debug);
                 loop {
                     let ev = event::read()?;
                     if let Some(input_ev) = translate_crossterm(ev) {
