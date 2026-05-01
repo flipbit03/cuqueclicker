@@ -42,7 +42,77 @@ HUD shows `v0.0.0 (dev)` in dev, plain `vX.Y.Z` in release. The title is built i
 - **Exactly 10 fingerers, aligned to hotkeys `1`–`9`, `0`.** Don't add an 11th without also rethinking keybinds. We explicitly dropped the Singularity tier for this reason.
 - **`--demo-for-recording` must never touch the save file or the lock.** It runs on `build_demo_state()`, skips `save::acquire_lock()`, and the tick loop early-returns before the save-interval check. Two live sessions (one normal, one demo) must coexist.
 - **Single-instance lock uses `std::fs::File::try_lock`** (stdlib, Rust ≥ 1.89). Do **not** reintroduce the `fs4` crate. The `.lock` file on disk is just a handle target — OS releases the lock on process exit, clean or crash. If it ever appears stuck, the fix is "close the other instance or delete the lock file", not new code.
-- **Active buffs persist across quit/restart; goldens and `golden_cooldown` don't.** `buffs` is serialized; `golden` and `golden_cooldown` are `#[serde(skip)]` and re-seeded on load. If you add new persistent buff state, make sure it's `Serialize + Deserialize` on `GameState` — and that `Buff::FingererBoost` variants use the stable `fingerer_id: String`, not a position index.
+- **Active buffs persist across quit/restart; goldens and `golden_cooldown` don't.** `buffs` is serialized (click-side only — `Buff::ClickFrenzy`); `golden`, `golden_cooldown`, and `green_coin` are `#[serde(skip)]` and re-seeded on load. Per-fingerer modifiers (Purple Coin, Green Coin, future events) live on `FingererState.modifiers` and ARE persisted; the `aggregate` cache they drive is `#[serde(skip)]` and rebuilt by `migrate_runtime`. The Green-Coin spawn pity counter `goldens_since_green_coin` IS persisted so the timer survives quit/restart.
+- **Per-fingerer modifier source ids are load-bearing forever.** `ModifierSource::id()` strings (`green_coin`, `purple_coin`, ...) appear in serialized saves. Renaming silently invalidates every existing save's modifier list. Treat them like fingerer/upgrade ids: cosmetic names live in `i18n.rs`; the id stays stable.
+
+## Save versioning
+
+The on-disk format is dispatched by a `version: u32` field at the top of every save. Pre-versioned saves (everything written by `main` before this branch) are V1 by definition — `crate::save::migrate::peek_version` returns 1 when the field is absent.
+
+Layout:
+
+```
+src/save/
+├── mod.rs              # public API: load_from_str / save_to_string + CURRENT_VERSION
+├── migrate.rs          # peek_version(json) -> u32
+└── versions/
+    ├── mod.rs
+    ├── v1.rs           # FROZEN: pre-versioned shape
+    ├── v2.rs           # FROZEN once shipped: per-fingerer modifiers, Green Coin pity
+    └── ...
+```
+
+Loading is a chain: `peek_version → deserialize as GameStateVN → fold through From impls → into_current() → migrate_runtime()`. `migrate_runtime` is **runtime-only** — it seeds ephemeral `#[serde(skip)]` fields (flash vecs, count-up tweens, modifier aggregate cache) and MUST NOT do shape transforms. All persisted-shape changes live in the `From<Vn> for Vn+1` impl in `vN+1.rs`.
+
+The freeze rule: **once `vN.rs` is on `main`, do not edit it** (except to fix a migration bug). Schema changes go in `vN+1.rs` together with a `From<vN>`-style conversion. Each version's frozen file owns its own copies of every persisted enum/struct so future changes to live types in `crate::game::*` cannot retroactively reshape what `vN` means on disk.
+
+Every migration branch ships with a unit test that constructs a `GameStateVN` fixture, runs the chain, and asserts the resulting state. The mandatory-test rule from "Project policies" applies to migration steps as much as to the live code.
+
+When bumping `CURRENT_VERSION`:
+
+1. Add `vN+1.rs` and route it in `load_from_str`'s match.
+2. Implement `From<GameStateVN> for GameStateV{N+1}` (the actual shape transform).
+3. Implement `GameStateV{N+1}::into_current() -> GameState`.
+4. Update the live `GameState` struct + `GameState::default()` to match the V{N+1} shape.
+5. Bump `CURRENT_VERSION = N+1` in `src/save/mod.rs`.
+6. Tests: deserialize a vN fixture, walk it through the chain, assert outcomes.
+
+## Modifier system
+
+Per-fingerer modifiers live on `FingererState.modifiers: Vec<Modifier>`. Each `Modifier` has a stable `ModifierSource` id, zero or more `ModifierEffect`s, and an optional `ModifierDuration`. See `src/game/modifier.rs` for the type definitions and stacking rules; the short version:
+
+- **`AddPercent` values across modifiers SUM** (two +10% Green Coins = +20%, not +21%).
+- **`MulFactor` values across modifiers MULTIPLY** (two x2 buffs = x4).
+- **`FlatFps` values SUM**, applied before any percent.
+
+Final per-fingerer FPS:
+```
+((base * count + flat_fps) * upgrades_mult) * (1 + add_percent) * mul_factor
+```
+
+The `aggregate: FingererAggregate` cache on `FingererState` is `#[serde(skip)]` and rebuilt in three situations only: (a) modifier add/remove via `attach_modifier` / `attach_modifier_random_owned`, (b) per-tick expiry walk if any timed modifier expired, (c) save load via `migrate_runtime`. Hot-path reads (`fps()`, sidebar render) MUST go through the aggregate; never iterate `Vec<Modifier>` per FPS read.
+
+**Adding a new buff/debuff source** = add a variant to `ModifierSource` and map its `id()`. No new tick code unless the trigger is novel (the existing per-tick walk already decrements timed modifiers and rebuilds aggregates on expiry). Cosmetic names belong in `i18n.rs`; the id stays stable forever.
+
+The `Buff` enum (`src/game/state.rs`) is now click-side only (`ClickFrenzy`). Anything that targets a specific fingerer is a `Modifier`, not a `Buff` — Purple Coin (Buff golden), Green Coin, future Blizzard / RedCoin / etc. The V1→V2 migration absorbs in-flight `BuffV1::FingererBoost` entries into per-fingerer modifiers.
+
+## Debug pane policy
+
+Any new feature whose trigger depends on RNG, time, or other non-input signal **must** ship with a corresponding F-key in `src/ui/debug_pane.rs::DEBUG_KEYS` that forces the event in dev builds. Gate every dev hotkey behind `is_dev_build() && !cli.no_debug`, same as F2/F3/F4/F5/F8.
+
+Strict content (new upgrade tiers, new fingerers, new achievements) doesn't need a debug key — only event triggers.
+
+Current dev hotkeys:
+
+| Key | Action |
+|-----|--------|
+| F8  | Spawn Lucky Golden  *(F1 is hijacked by browsers for Help)* |
+| F2  | Spawn Frenzy Golden |
+| F3  | Spawn Buff Golden (Purple Coin → x7 fingerer modifier) |
+| F4  | +1M cuques |
+| F5  | Spawn Green Coin |
+
+When adding a new key, update both `DEBUG_KEYS` (the rendered list) and the corresponding `KeyCode::F(N)` arm in `src/input.rs`. The two must stay aligned — the pane is the single source of truth for what's advertised.
 
 ## Visual / animation policy
 
@@ -114,19 +184,27 @@ src/
 ├── app.rs               # App state, tick loop, event dispatch, demo driver
 ├── build_info.rs        # VERSION const + is_dev_build()
 ├── format.rs            # number formatting for HUD (k/M/B/T suffixes)
-├── save.rs              # load/save + single-instance lock via std::fs::File::try_lock
+├── input.rs             # InputContext + raw events → Action router
+├── sim.rs               # Action / BuyQty / sim_tick / spawn-rolls / apply_action
 ├── self_cmd.rs          # `cuqueclicker self update` impl
 ├── i18n.rs              # EN + pt_BR strings, $LANG auto-detect
+├── platform/            # Persistence + InstanceLock — native vs web parity
+├── save/                # versioned migration chain
+│   ├── mod.rs           # load_from_str / save_to_string / CURRENT_VERSION
+│   ├── migrate.rs       # peek_version
+│   └── versions/        # vN.rs frozen schemas + From<Vn> chain steps
 ├── game/
-│   ├── state.rs         # GameState, Buff, Particle, migrate()
+│   ├── state.rs         # GameState, FingererState, Buff (click-only), migrate_runtime
 │   ├── fingerer.rs      # 10 tiers: Index Finger → Hand of God
+│   ├── modifier.rs      # Modifier / Effect / Duration / Source / FingererAggregate
 │   ├── upgrade.rs       # 34 upgrades across tiers
 │   ├── achievement.rs
-│   └── golden.rs        # Golden Cuque: Lucky | Frenzy | Buff
+│   ├── golden.rs        # Golden Cuque: Lucky | Frenzy | Buff
+│   └── green_coin.rs    # Green Coin: rare powerup, +10% permanent on catch
 └── ui/
     ├── mod.rs           # top-level draw, HUD title w/ version + (dev)
     ├── border.rs        # casino-style animated border
-    ├── biscuit.rs       # the ASCII ass, smooth zoom
+    ├── biscuit.rs       # the ASCII ass + draw_golden + draw_green_coin
     ├── hands.rs         # colored rings of fingerers
     ├── sidebar.rs, stats.rs, upgrades.rs, prestige.rs, achievements.rs, effects.rs
     └── debug_pane.rs    # F-key cheats overlay, dev-only
