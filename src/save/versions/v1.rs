@@ -69,7 +69,7 @@ impl GameStateV1 {
     /// `crate::save::load_from_str` instead, which also runs
     /// `migrate_runtime()`.
     pub fn into_current(self) -> GameState {
-        super::v3::GameStateV3::from(super::v2::GameStateV2::from(self)).into_current()
+        super::v2::GameStateV2::from(self).into_current()
     }
 }
 

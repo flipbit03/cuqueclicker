@@ -152,8 +152,24 @@ pub struct GameStateV2 {
     pub lifetime_cuques: f64,
     #[serde(default)]
     pub best_fps: f64,
+    /// Lifetime grand total across every powerup variant. Strict rollup;
+    /// existing achievements (Golden Touch, Golden Hoarder) gate on this,
+    /// so it stays accurate even when migrating from a V1 that only had
+    /// the rollup.
     #[serde(default)]
     pub golden_caught: u64,
+    /// Per-variant catch counters introduced with V2. V1 saves had no
+    /// breakdown to recover, so these zero-init on V1→V2 — the *total*
+    /// stays accurate via `golden_caught`; only the *breakdown* is
+    /// post-V2.
+    #[serde(default)]
+    pub lucky_caught: u64,
+    #[serde(default)]
+    pub frenzy_caught: u64,
+    #[serde(default)]
+    pub buff_caught: u64,
+    #[serde(default)]
+    pub green_coin_caught: u64,
     #[serde(default)]
     pub fingerers_state: HashMap<String, FingererStateV2>,
     #[serde(default)]
@@ -192,6 +208,10 @@ impl GameStateV2 {
             lifetime_cuques: self.lifetime_cuques,
             best_fps: self.best_fps,
             golden_caught: self.golden_caught,
+            lucky_caught: self.lucky_caught,
+            frenzy_caught: self.frenzy_caught,
+            buff_caught: self.buff_caught,
+            green_coin_caught: self.green_coin_caught,
             fingerers_state,
             achievements_earned: self.achievements_earned,
             upgrades_earned: self.upgrades_earned,
@@ -271,6 +291,12 @@ impl From<GameStateV1> for GameStateV2 {
             lifetime_cuques: v1.lifetime_cuques,
             best_fps: v1.best_fps,
             golden_caught: v1.golden_caught,
+            // V1 had no per-variant breakdown — the four counters
+            // zero-init. The rollup `golden_caught` stays accurate.
+            lucky_caught: 0,
+            frenzy_caught: 0,
+            buff_caught: 0,
+            green_coin_caught: 0,
             fingerers_state,
             achievements_earned: v1.achievements_earned,
             upgrades_earned: v1.upgrades_earned,
@@ -446,6 +472,10 @@ mod tests {
             lifetime_cuques: 0.0,
             best_fps: 0.0,
             golden_caught: 0,
+            lucky_caught: 0,
+            frenzy_caught: 0,
+            buff_caught: 0,
+            green_coin_caught: 0,
             fingerers_state: [(
                 "latex_glove".to_string(),
                 FingererStateV2 {
@@ -482,5 +512,65 @@ mod tests {
         assert_eq!(st.modifiers.len(), 2);
         assert!((st.aggregate.add_percent - 0.10).abs() < 1e-9);
         assert!((st.aggregate.mul_factor - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn v1_to_v2_zero_inits_per_variant_counters() {
+        // V1 had only the rollup `golden_caught`. V2 adds four per-variant
+        // counters; on V1→V2 they zero-init while the rollup is preserved.
+        // No data is lost — the *total* stays accurate; only the
+        // *breakdown* is post-V2.
+        let v1 = GameStateV1 {
+            cuques: 0.0,
+            total_clicks: 0,
+            lifetime_cuques: 0.0,
+            best_fps: 0.0,
+            golden_caught: 17,
+            fingerers_owned: HashMap::new(),
+            achievements_earned: HashSet::new(),
+            upgrades_earned: HashSet::new(),
+            prestige: 0,
+            total_play_ticks: 0,
+            buffs: vec![],
+        };
+
+        let v2: GameStateV2 = v1.into();
+
+        assert_eq!(v2.golden_caught, 17, "rollup carried forward");
+        assert_eq!(v2.lucky_caught, 0);
+        assert_eq!(v2.frenzy_caught, 0);
+        assert_eq!(v2.buff_caught, 0);
+        assert_eq!(v2.green_coin_caught, 0);
+    }
+
+    #[test]
+    fn v2_into_current_preserves_per_variant_counters() {
+        let v2 = GameStateV2 {
+            version: 2,
+            cuques: 0.0,
+            total_clicks: 0,
+            lifetime_cuques: 0.0,
+            best_fps: 0.0,
+            golden_caught: 100,
+            lucky_caught: 60,
+            frenzy_caught: 20,
+            buff_caught: 15,
+            green_coin_caught: 5,
+            fingerers_state: HashMap::new(),
+            achievements_earned: HashSet::new(),
+            upgrades_earned: HashSet::new(),
+            prestige: 0,
+            total_play_ticks: 0,
+            buffs: vec![],
+            goldens_since_green_coin: 0,
+        };
+
+        let live = v2.into_current();
+
+        assert_eq!(live.golden_caught, 100);
+        assert_eq!(live.lucky_caught, 60);
+        assert_eq!(live.frenzy_caught, 20);
+        assert_eq!(live.buff_caught, 15);
+        assert_eq!(live.green_coin_caught, 5);
     }
 }
