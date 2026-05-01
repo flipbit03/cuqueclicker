@@ -59,6 +59,17 @@ pub enum HelpAction {
     Quit,
 }
 
+/// Per-frame layout snapshot produced by [`draw`]. Single source of truth
+/// for every clickable region on screen + the play-area envelope.
+///
+/// The platform shells (`app.rs`, `wasm_app.rs`) **store this verbatim**
+/// and call [`crate::input::InputContext::from_layout`] to project it
+/// into the per-event input context. Adding a new clickable region only
+/// touches this struct + `InputContext` + the projection — never the
+/// platform code. (We were burned by the alternative once: a missing
+/// `green_coin_rect` field on the wasm-side `InputContext` constructor
+/// crashed the wasm build after the native code shipped just fine.)
+#[derive(Default)]
 pub struct DrawOutput {
     pub biscuit_rect: Rect,
     pub golden_rect: Rect,
