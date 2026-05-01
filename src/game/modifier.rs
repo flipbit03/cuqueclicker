@@ -27,8 +27,8 @@
 //! [`FingererAggregate`], never iterate the `Vec<Modifier>` directly. The
 //! aggregate is rebuilt in three situations only:
 //!   1. A modifier is added or removed via the public API.
-//!   2. The per-tick walk drops an expired [`ModifierDuration::Ticks(0)`]
-//!      entry.
+//!   2. The per-tick walk drops an expired [`ModifierDuration::Ticks`]
+//!      entry whose count just hit zero.
 //!   3. The save loader reconstructs it (the field is `#[serde(skip)]`).
 //!
 //! ## Adding a new buff/debuff source
