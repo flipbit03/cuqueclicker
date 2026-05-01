@@ -1,7 +1,8 @@
 use ratatui::{prelude::*, widgets::*};
 
 use crate::game::state::{
-    ACHIEVEMENT_FLASH_TICKS, Buff, GameState, LUCKY_FLASH_TICKS, PURCHASE_FLASH_TICKS,
+    ACHIEVEMENT_FLASH_TICKS, Buff, GREEN_COIN_FLASH_TICKS, GameState, LUCKY_FLASH_TICKS,
+    PURCHASE_FLASH_TICKS,
 };
 
 // Resting baseline — what the border looks like when nothing is happening.
@@ -28,6 +29,11 @@ const PURCHASE_CYCLE: f32 = 11.0;
 // existing tint — it lays a distinct moiré on top.
 const ACHIEVEMENT_TINT: (f32, f32, f32) = (255.0, 200.0, 100.0);
 const ACHIEVEMENT_CYCLE: f32 = 19.0;
+// Green Coin catch channel: brighter green than the purchase tint so it
+// reads as a distinct event. Coprime cycle (29) keeps it from beating
+// against the purchase channel (11) when both run simultaneously.
+const GREEN_COIN_TINT: (f32, f32, f32) = (120.0, 255.0, 140.0);
+const GREEN_COIN_CYCLE: f32 = 29.0;
 
 // Permanent subtle undertone once any prestige has been earned.
 const PRESTIGE_TINT: (f32, f32, f32) = (200.0, 170.0, 80.0);
@@ -89,21 +95,31 @@ fn cell_color(i: usize, state: &GameState) -> Color {
     let purchase_s = plateau_fade(state.purchase_flash_ticks, PURCHASE_FLASH_TICKS);
     let lucky_s = plateau_fade(state.lucky_flash_ticks, LUCKY_FLASH_TICKS);
     let achievement_s = plateau_fade(state.achievement_flash_ticks, ACHIEVEMENT_FLASH_TICKS);
+    let green_coin_s = plateau_fade(state.green_coin_flash_ticks, GREEN_COIN_FLASH_TICKS);
+    // Single-variant `Buff` today — no need to filter, just pluck the
+    // strongest. (Kept as a fold so adding new global buffs in the future
+    // is a one-arm match update.)
     let frenzy_s = state
         .buffs
         .iter()
-        .filter_map(|b| match b {
-            Buff::ClickFrenzy { .. } => Some(b.strength()),
-            _ => None,
+        .map(|b| {
+            let Buff::ClickFrenzy { .. } = b;
+            b.strength()
         })
         .fold(0.0_f32, f32::max);
+    // Per-fingerer timed modifiers (PurpleCoin Buff golden, future events).
+    // Take the strongest one across all fingerers for the border channel.
     let buff_s = state
-        .buffs
-        .iter()
-        .filter_map(|b| match b {
-            Buff::FingererBoost { .. } => Some(b.strength()),
-            _ => None,
+        .fingerers_state
+        .values()
+        .flat_map(|st| st.modifiers.iter())
+        .filter(|m| {
+            matches!(
+                m.duration,
+                crate::game::modifier::ModifierDuration::Ticks(_)
+            )
         })
+        .map(|m| m.strength())
         .fold(0.0_f32, f32::max);
 
     // Carrier smoothly blends from resting gray to pure white as total
@@ -114,7 +130,8 @@ fn cell_color(i: usize, state: &GameState) -> Color {
         .max(lucky_s)
         .max(achievement_s)
         .max(frenzy_s)
-        .max(buff_s);
+        .max(buff_s)
+        .max(green_coin_s);
     let carrier_r = BASELINE.0 + (ACTIVE_CARRIER.0 - BASELINE.0) * activity;
     let carrier_g = BASELINE.1 + (ACTIVE_CARRIER.1 - BASELINE.1) * activity;
     let carrier_b = BASELINE.2 + (ACTIVE_CARRIER.2 - BASELINE.2) * activity;
@@ -138,6 +155,7 @@ fn cell_color(i: usize, state: &GameState) -> Color {
         (ACHIEVEMENT_TINT, ACHIEVEMENT_CYCLE, achievement_s, 1.0),
         (BUFF_TINT, BUFF_CYCLE, buff_s, 1.0),
         (FRENZY_TINT, FRENZY_CYCLE, frenzy_s, 1.0),
+        (GREEN_COIN_TINT, GREEN_COIN_CYCLE, green_coin_s, 1.0),
     ] {
         if strength > 0.001 {
             let wave01 = (((i as f32 + phase) * std::f32::consts::TAU / cycle).sin() + 1.0) * 0.5;

@@ -130,6 +130,7 @@ impl App {
         let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
         let mut biscuit_rect = Rect::default();
         let mut golden_rect = Rect::default();
+        let mut green_coin_rect = Rect::default();
         let mut play_area = Rect::default();
         // M1+M2: help-bar hint click rects + prestige-reset confirm rect.
         // Both are recomputed every frame and consumed by the click router
@@ -156,6 +157,7 @@ impl App {
                 let out = ui::draw(f, &current, ui.mode, ui.zoom_idx, debug, ui.last_mouse_pos);
                 biscuit_rect = out.biscuit_rect;
                 golden_rect = out.golden_rect;
+                green_coin_rect = out.green_coin_rect;
                 play_area = out.play_area;
                 upgrade_rows = out.upgrade_rows;
                 fingerer_rows = out.fingerer_rows;
@@ -176,6 +178,7 @@ impl App {
                     help_hits: &help_hits,
                     biscuit_rect,
                     golden_rect,
+                    green_coin_rect,
                     play_area,
                     prestige_reset_rect,
                     debug,
@@ -499,7 +502,7 @@ pub fn build_demo_state() -> GameState {
         if let Some(f) = FINGERERS.get(idx)
             && count > 0
         {
-            s.fingerers_owned.insert(f.id.to_string(), count);
+            s.fingerers_state.entry(f.id.to_string()).or_default().count = count;
         }
     }
     // Take the first 10 upgrades from the catalog (deterministic regardless

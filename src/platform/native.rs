@@ -48,16 +48,16 @@ impl Persistence {
     }
 
     /// Best-effort load. Returns `GameState::default()` if no save exists,
-    /// the file is unreadable, or it fails to deserialize. Always runs the
-    /// loaded state through `migrate()` to bring older save schemas current.
+    /// the file is unreadable, or it fails to deserialize. The migration
+    /// chain in `crate::save` handles version dispatch + ephemeral-state
+    /// seeding (`migrate_runtime`); we just hand it the raw JSON.
     pub fn load(&self) -> GameState {
         if let Some(path) = save_path()
             && let Ok(data) = fs::read_to_string(&path)
-            && let Ok(state) = serde_json::from_str::<GameState>(&data)
         {
-            return state.migrate();
+            return crate::save::load_from_str(&data);
         }
-        GameState::default()
+        GameState::default().migrate_runtime()
     }
 
     /// Atomic write via tmp-rename. On failure (no save dir, disk full)
@@ -69,7 +69,7 @@ impl Persistence {
                 fs::create_dir_all(parent)?;
             }
             let tmp = path.with_extension("json.tmp");
-            let data = serde_json::to_string_pretty(state)?;
+            let data = crate::save::save_to_string(state)?;
             fs::write(&tmp, data)?;
             fs::rename(&tmp, &path)?;
         }

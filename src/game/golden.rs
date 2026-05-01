@@ -10,8 +10,9 @@ pub enum GoldenVariant {
     Lucky,
     /// 13-second `ClickFrenzy` buff: manual clicks produce x777 cuques.
     Frenzy,
-    /// 60-second `FingererBoost` buff on a random owned fingerer: that
-    /// fingerer's passive FPS is multiplied x7.
+    /// 60-second per-fingerer modifier on a random owned fingerer: that
+    /// fingerer's passive FPS is multiplied x7. Implemented as a
+    /// `ModifierSource::PurpleCoin` `MulFactor(7.0)` with `Ticks(1200)`.
     Buff,
 }
 

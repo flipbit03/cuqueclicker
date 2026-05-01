@@ -117,6 +117,10 @@ pub struct InputContext<'a> {
     pub help_hits: &'a [(HelpAction, Rect)],
     pub biscuit_rect: Rect,
     pub golden_rect: Rect,
+    /// Hit-test rect for the on-screen Green Coin marker. Zero-rect when
+    /// no coin is visible; click-routes through `Action::CatchGolden` (the
+    /// sim resolves both Golden and Green Coin from that single action).
+    pub green_coin_rect: Rect,
     pub play_area: Rect,
     pub prestige_reset_rect: Rect,
     pub debug: bool,
@@ -273,7 +277,7 @@ fn handle_click(
     // behavior, which has no mode guard. The marker still renders on the
     // biscuit while a non-Game panel is open. Right-click on a golden
     // also catches.
-    if rect_contains(ctx.golden_rect, col, row) {
+    if rect_contains(ctx.golden_rect, col, row) || rect_contains(ctx.green_coin_rect, col, row) {
         out.push(Action::CatchGolden);
         return;
     }
@@ -380,7 +384,9 @@ fn handle_key(
         }
         // [g] catches any Golden Cuque variant. Guard on the latest snapshot
         // to avoid sending a noop CatchGolden when nothing is on screen.
-        KeyCode::Char('g') | KeyCode::Char('G') if ctx.current.golden.is_some() => {
+        KeyCode::Char('g') | KeyCode::Char('G')
+            if ctx.current.golden.is_some() || ctx.current.green_coin.is_some() =>
+        {
             out.push(Action::CatchGolden);
         }
         // Debug/testing: gated by `debug`. See src/ui/debug_pane.rs for the
@@ -405,6 +411,9 @@ fn handle_key(
         }
         KeyCode::F(4) if ctx.debug => {
             out.push(Action::DevAddCuques(1_000_000.0));
+        }
+        KeyCode::F(5) if ctx.debug => {
+            out.push(Action::DevSpawnGreenCoin);
         }
         KeyCode::Char('p') | KeyCode::Char('P') => {
             ui.mode = if matches!(ui.mode, Mode::Prestige) {
@@ -532,6 +541,7 @@ mod tests {
             help_hits,
             biscuit_rect: biscuit,
             golden_rect,
+            green_coin_rect: Rect::default(),
             play_area,
             prestige_reset_rect,
             debug,

@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::game::achievement::ACHIEVEMENTS;
 use crate::game::fingerer::{self, FINGERERS};
 use crate::game::golden::GoldenCuque;
+use crate::game::green_coin::GreenCoin;
+use crate::game::modifier::{
+    FingererAggregate, Modifier, ModifierDuration, ModifierEffect, ModifierSource,
+};
 use crate::game::upgrade::{UPGRADES, UpgradeEffect};
 
 pub const TICK_HZ: u32 = 20;
@@ -111,20 +115,15 @@ pub fn biscuit_frac_to_screen(frac_x: f32, frac_y: f32, biscuit: Rect) -> (u16, 
     )
 }
 
+/// Global, click-side buffs. Per-fingerer multipliers (the old
+/// `Buff::FingererBoost`) live on the modifier system in
+/// `crate::game::modifier`; only buffs that affect global click power
+/// belong here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Buff {
     ClickFrenzy {
         ticks_remaining: u32,
         initial_ticks: u32,
-        mult: f64,
-    },
-    /// Fingerer mult buff — applied when a "Buff" golden variant is caught.
-    /// Targets a fingerer by stable id so the buff stays on the right tier
-    /// across catalog changes.
-    FingererBoost {
-        ticks_remaining: u32,
-        initial_ticks: u32,
-        fingerer_id: String,
         mult: f64,
     },
 }
@@ -133,9 +132,6 @@ impl Buff {
     pub fn ticks_remaining(&self) -> u32 {
         match self {
             Buff::ClickFrenzy {
-                ticks_remaining, ..
-            } => *ticks_remaining,
-            Buff::FingererBoost {
                 ticks_remaining, ..
             } => *ticks_remaining,
         }
@@ -162,16 +158,33 @@ impl Buff {
             } => {
                 *ticks_remaining = ticks_remaining.saturating_sub(1);
             }
-            Buff::FingererBoost {
-                ticks_remaining, ..
-            } => {
-                *ticks_remaining = ticks_remaining.saturating_sub(1);
-            }
         }
     }
 }
 
-/// Persistent game state. Catalog-addressed state (`fingerers_owned`,
+/// Per-fingerer persistent state.
+///
+/// `count` is the number of units the player owns. `modifiers` is the list
+/// of [`Modifier`]s attached to this fingerer (Green Coin permanents,
+/// Purple Coin temp boosts, future buffs/debuffs); see
+/// [`crate::game::modifier`] for the stacking rules. `aggregate` is a
+/// derived cache rebuilt from `modifiers` on add/remove/expire and on
+/// save load — it's `#[serde(skip)]` because it's pure-derived data, and
+/// the live state is always reconstructable from `modifiers`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FingererState {
+    #[serde(default)]
+    pub count: u32,
+    #[serde(default)]
+    pub modifiers: Vec<Modifier>,
+    /// Pre-computed aggregate of every effect across every modifier.
+    /// Rebuilt by `attach_modifier` / per-tick expiry / `migrate_runtime`.
+    /// FPS reads MUST consult this, not the `Vec`.
+    #[serde(skip)]
+    pub aggregate: FingererAggregate,
+}
+
+/// Persistent game state. Catalog-addressed state (`fingerers_state`,
 /// `upgrades_earned`, `achievements_earned`) is keyed by STABLE STRING IDS,
 /// not positional indices, so reordering / inserting / removing entries in
 /// `FINGERERS`, `UPGRADES`, or `ACHIEVEMENTS` never corrupts an old save.
@@ -179,6 +192,14 @@ impl Buff {
 /// to zero / absent (backward-compat).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GameState {
+    /// Save schema version. The on-disk migration chain (`crate::save`)
+    /// reads this via `peek_version` *before* deserializing into the right
+    /// `GameStateVN` struct. A live in-memory state always equals
+    /// `crate::save::CURRENT_VERSION` — the chain stamps it on conversion
+    /// and `Default` initializes it that way. Pre-versioned saves on disk
+    /// have no `version` key, which `peek_version` treats as V1.
+    #[serde(default = "default_save_version")]
+    pub version: u32,
     #[serde(default)]
     pub cuques: f64,
     #[serde(default)]
@@ -187,12 +208,25 @@ pub struct GameState {
     pub lifetime_cuques: f64,
     #[serde(default)]
     pub best_fps: f64,
+    /// Lifetime grand total of every powerup caught (Lucky, Frenzy, Buff,
+    /// Green Coin). Stays a strict rollup so existing achievements that
+    /// gate on it continue to work, and pre-V3 saves whose breakdown was
+    /// never recorded keep an honest total. The four per-variant counters
+    /// below were added in V3; they only count post-V3 catches.
     #[serde(default)]
     pub golden_caught: u64,
-
-    /// Fingerer id → owned count.
     #[serde(default)]
-    pub fingerers_owned: HashMap<String, u32>,
+    pub lucky_caught: u64,
+    #[serde(default)]
+    pub frenzy_caught: u64,
+    #[serde(default)]
+    pub buff_caught: u64,
+    #[serde(default)]
+    pub green_coin_caught: u64,
+
+    /// Fingerer id → owned count + attached modifiers + aggregate cache.
+    #[serde(default)]
+    pub fingerers_state: HashMap<String, FingererState>,
     /// Set of earned achievement ids.
     #[serde(default)]
     pub achievements_earned: HashSet<String>,
@@ -206,6 +240,12 @@ pub struct GameState {
     pub total_play_ticks: u64,
     #[serde(default)]
     pub buffs: Vec<Buff>,
+    /// Green Coin pity counter. Increments on every regular Golden spawn,
+    /// drives a `rng < counter * 0.01` roll for an alongside Green Coin
+    /// spawn, and resets the moment a Green Coin appears. Persisted so the
+    /// pity timer survives quit/restart.
+    #[serde(default)]
+    pub goldens_since_green_coin: u32,
 
     #[serde(skip)]
     pub clench_ticks: u32,
@@ -220,6 +260,12 @@ pub struct GameState {
     pub golden: Option<GoldenCuque>,
     #[serde(skip)]
     pub golden_cooldown: u32,
+    /// On-screen Green Coin, if one is currently visible. Lifetime ticked
+    /// down by `tick_green_coin`; cleared on catch or expiry. Not persisted
+    /// (parallel to `golden`) — closing and reopening the game shouldn't
+    /// preserve a frozen coin frame.
+    #[serde(skip)]
+    pub green_coin: Option<GreenCoin>,
     #[serde(skip)]
     pub session_ticks: u64,
     /// Queue of achievement ids that unlocked but haven't yet been shown as a
@@ -239,6 +285,12 @@ pub struct GameState {
     pub lucky_flash_ticks: u32,
     #[serde(skip)]
     pub achievement_flash_ticks: u32,
+    /// Brief green border channel pulse fired on a Green Coin catch.
+    /// Behaves like `lucky_flash_ticks` (plateau-fade); coexists with
+    /// other channels so a Green Coin caught during a Frenzy or Lucky
+    /// adds a green moiré rather than overwriting them.
+    #[serde(skip)]
+    pub green_coin_flash_ticks: u32,
     /// HUD title border phase clock. Advances by `border_speed()` each
     /// tick, so the title border visibly speeds up under Frenzy / Lucky /
     /// purchase events. INTENTIONALLY NOT shared with secondary shimmers
@@ -336,26 +388,45 @@ pub struct GameState {
 
 pub const LUCKY_FLASH_TICKS: u32 = 70; // 3.5s at 20Hz
 pub const PURCHASE_FLASH_TICKS: u32 = 20; // 1s at 20Hz
+/// Green Coin catch pulse — slightly shorter than Lucky's so the celebratory
+/// blip lands without lingering for so long it competes with whatever might
+/// be running on top (Frenzy, Buff, Lucky).
+pub const GREEN_COIN_FLASH_TICKS: u32 = 50; // 2.5s at 20Hz
+
+/// Serde default for `GameState::version`. A direct deserialize of the live
+/// `GameState` from a pre-versioned save (one without the field) still
+/// produces a sensibly-stamped state — though production loads always go
+/// through the migration chain in `crate::save`.
+fn default_save_version() -> u32 {
+    crate::save::CURRENT_VERSION
+}
 
 impl Default for GameState {
     fn default() -> Self {
         Self {
+            version: crate::save::CURRENT_VERSION,
             cuques: 0.0,
             total_clicks: 0,
             lifetime_cuques: 0.0,
             best_fps: 0.0,
             golden_caught: 0,
-            fingerers_owned: HashMap::new(),
+            lucky_caught: 0,
+            frenzy_caught: 0,
+            buff_caught: 0,
+            green_coin_caught: 0,
+            fingerers_state: HashMap::new(),
             achievements_earned: HashSet::new(),
             upgrades_earned: HashSet::new(),
             prestige: 0,
             total_play_ticks: 0,
             buffs: Vec::new(),
+            goldens_since_green_coin: 0,
             clench_ticks: 0,
             particles: Vec::new(),
             misclick_particles: Vec::new(),
             golden: None,
             golden_cooldown: crate::game::golden::next_cooldown(),
+            green_coin: None,
             session_ticks: 0,
             newly_unlocked: Vec::new(),
             active_unlock_id: None,
@@ -363,6 +434,7 @@ impl Default for GameState {
             visual_debt: 0.0,
             lucky_flash_ticks: 0,
             achievement_flash_ticks: 0,
+            green_coin_flash_ticks: 0,
             border_phase: 0,
             steady_phase: 0,
             purchase_flash_ticks: 0,
@@ -389,9 +461,19 @@ impl Default for GameState {
 impl GameState {
     /// Initialize ephemeral runtime state that `#[serde(skip)]` left empty
     /// after deserialization, and normalize any fields that need live values
-    /// rather than the serde default. Hook point for future shape
-    /// transforms — see CLAUDE.md on the stable-id save policy.
-    pub fn migrate(mut self) -> Self {
+    /// rather than the serde default.
+    ///
+    /// **Runtime-only.** Persisted-shape migrations live in
+    /// `crate::save::versions::vN.rs` (see CLAUDE.md "Save versioning").
+    /// This method runs *after* the migration chain has produced a live
+    /// `GameState`; it must not assume any particular pre-state and must
+    /// be safe to call multiple times.
+    pub fn migrate_runtime(mut self) -> Self {
+        // `aggregate` is `#[serde(skip)]` — rebuild from the persisted
+        // `modifiers` list before any code reads `fps()`.
+        for st in self.fingerers_state.values_mut() {
+            st.aggregate = FingererAggregate::rebuild(&st.modifiers);
+        }
         // Per-catalog flash slots are runtime-only — re-size if the catalog
         // grew/shrank since this save was written.
         if self.fingerer_flash_ticks.len() != fingerer::count() {
@@ -443,7 +525,7 @@ impl GameState {
     // -- Catalog lookups (stable-id keyed) ---------------------------------
 
     pub fn fingerer_count(&self, id: &str) -> u32 {
-        self.fingerers_owned.get(id).copied().unwrap_or(0)
+        self.fingerers_state.get(id).map(|st| st.count).unwrap_or(0)
     }
 
     pub fn fingerer_count_idx(&self, idx: usize) -> u32 {
@@ -454,7 +536,78 @@ impl GameState {
     }
 
     pub fn fingerers_owned_total(&self) -> u32 {
-        self.fingerers_owned.values().sum()
+        self.fingerers_state.values().map(|st| st.count).sum()
+    }
+
+    /// Return the cached modifier aggregate for `id`, or the identity
+    /// (`Default`) if the fingerer has no entry. Hot-path read for `fps()`
+    /// and the sidebar — never iterates the underlying `Vec<Modifier>`.
+    pub fn fingerer_aggregate(&self, id: &str) -> FingererAggregate {
+        self.fingerers_state
+            .get(id)
+            .map(|st| st.aggregate)
+            .unwrap_or_default()
+    }
+
+    /// Attach a modifier to the given fingerer id. Creates the
+    /// `FingererState` entry on the fly if absent (count stays 0). Rebuilds
+    /// the aggregate cache. Use this from goldens, debug cheats, future
+    /// events.
+    pub fn attach_modifier(&mut self, fingerer_id: &str, m: Modifier) {
+        let st = self
+            .fingerers_state
+            .entry(fingerer_id.to_string())
+            .or_default();
+        st.modifiers.push(m);
+        st.aggregate = FingererAggregate::rebuild(&st.modifiers);
+    }
+
+    /// Pick a random fingerer with `count > 0` and attach `m` to it. Returns
+    /// the chosen id, or `None` if no fingerer is owned. Used by the Buff
+    /// Golden (Purple Coin), where targeting an un-owned tier is pointless
+    /// — a temporary x7 multiplier on a count of zero produces zero output.
+    pub fn attach_modifier_random_owned(&mut self, m: Modifier) -> Option<String> {
+        let owned: Vec<String> = self
+            .fingerers_state
+            .iter()
+            .filter(|(_, st)| st.count > 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if owned.is_empty() {
+            return None;
+        }
+        let pick = owned[rand::rng().random_range(0..owned.len())].clone();
+        self.attach_modifier(&pick, m);
+        Some(pick)
+    }
+
+    /// Pick a random fingerer that is currently *visible in the sidebar*
+    /// — by the same `fingerer::visible` rule the UI uses (`idx == 0` ||
+    /// `owned > 0` || `lifetime_cuques >= base_cost * 0.5`) — and attach
+    /// `m` to it.
+    ///
+    /// Used by the Green Coin: a *permanent* +10% boost is still useful on
+    /// a tier the player can see but hasn't bought yet; when they finally
+    /// buy it the boost is already in place. Index Finger is always visible
+    /// (`idx == 0`), so as long as `FINGERERS` is non-empty this picks
+    /// something. Returns `None` only on an empty catalog (never in
+    /// practice).
+    pub fn attach_modifier_random_visible(&mut self, m: Modifier) -> Option<String> {
+        let visible: Vec<String> = FINGERERS
+            .iter()
+            .enumerate()
+            .filter(|(idx, f)| {
+                let owned = self.fingerer_count(f.id);
+                fingerer::visible(*idx, owned, self.lifetime_cuques)
+            })
+            .map(|(_, f)| f.id.to_string())
+            .collect();
+        if visible.is_empty() {
+            return None;
+        }
+        let pick = visible[rand::rng().random_range(0..visible.len())].clone();
+        self.attach_modifier(&pick, m);
+        Some(pick)
     }
 
     pub fn has_upgrade(&self, id: &str) -> bool {
@@ -585,9 +738,8 @@ impl GameState {
             }
         }
         for b in &self.buffs {
-            if let Buff::ClickFrenzy { mult, .. } = b {
-                m *= *mult;
-            }
+            let Buff::ClickFrenzy { mult, .. } = b;
+            m *= *mult;
         }
         m
     }
@@ -607,15 +759,10 @@ impl GameState {
                 _ => {}
             }
         }
-        for b in &self.buffs {
-            if let Buff::FingererBoost {
-                fingerer_id, mult, ..
-            } = b
-                && fingerer_id == target.id
-            {
-                m *= *mult;
-            }
-        }
+        // Per-fingerer Buff golden contributions used to live here as
+        // `Buff::FingererBoost`. They now flow through the modifier
+        // aggregate (see `fingerer_aggregate`), keeping `fingerer_mult`
+        // strictly about upgrades.
         m
     }
 
@@ -635,6 +782,11 @@ impl GameState {
     /// Lucky, Frenzy, or Buff). Applies the variant-specific effect,
     /// increments `golden_caught`, re-rolls the next spawn cooldown, and
     /// returns the flat reward (0.0 for buff variants).
+    ///
+    /// The `Buff` variant attaches a `MulFactor(7.0)` modifier with a
+    /// 60-second `Ticks` duration on a random owned fingerer, sourced as
+    /// `PurpleCoin`. Pre-#21 this was a global `Buff::FingererBoost`; the
+    /// modifier system replaces it.
     pub fn catch_golden(&mut self) -> f64 {
         use crate::game::golden::GoldenVariant;
         let Some(golden) = self.golden.take() else {
@@ -644,6 +796,7 @@ impl GameState {
         self.golden_cooldown = crate::game::golden::next_cooldown();
         let (reward, label) = match golden.variant {
             GoldenVariant::Lucky => {
+                self.lucky_caught += 1;
                 let fps = self.fps();
                 let r = (fps * GOLDEN_REWARD_SECONDS).max(GOLDEN_REWARD_FLAT);
                 self.add_cuques(r);
@@ -652,6 +805,7 @@ impl GameState {
                 (r, format!("+{}", crate::format::big(r)))
             }
             GoldenVariant::Frenzy => {
+                self.frenzy_caught += 1;
                 let dur = TICK_HZ * 13;
                 self.buffs.push(Buff::ClickFrenzy {
                     ticks_remaining: dur,
@@ -661,24 +815,20 @@ impl GameState {
                 (0.0, "FRENZY x777!".into())
             }
             GoldenVariant::Buff => {
-                let active_ids: Vec<&'static str> = FINGERERS
-                    .iter()
-                    .filter(|f| self.fingerer_count(f.id) > 0)
-                    .map(|f| f.id)
-                    .collect();
-                let pick = if active_ids.is_empty() {
-                    FINGERERS[0].id
-                } else {
-                    use rand::RngExt;
-                    active_ids[rand::rng().random_range(0..active_ids.len())]
-                };
+                self.buff_caught += 1;
                 let dur = TICK_HZ * 60;
-                self.buffs.push(Buff::FingererBoost {
-                    ticks_remaining: dur,
-                    initial_ticks: dur,
-                    fingerer_id: pick.to_string(),
-                    mult: 7.0,
-                });
+                let m = Modifier {
+                    source: crate::game::modifier::ModifierSource::PurpleCoin,
+                    effects: vec![crate::game::modifier::ModifierEffect::MulFactor(7.0)],
+                    duration: ModifierDuration::Ticks(dur),
+                    created_at_tick: self.total_play_ticks,
+                };
+                // Fall back to the first catalog tier if the player owns
+                // nothing yet — same defensive behavior the legacy buff had.
+                if self.attach_modifier_random_owned(m.clone()).is_none() {
+                    let pick = FINGERERS[0].id;
+                    self.attach_modifier(pick, m);
+                }
                 (0.0, "BOOSTED x7!".into())
             }
         };
@@ -694,10 +844,20 @@ impl GameState {
     }
 
     pub fn fps(&self) -> f64 {
+        // Per-fingerer formula:
+        //   pre  = (base * count + flat_fps) * upgrades_mult
+        //   post = pre * (1 + add_percent) * mul_factor
+        // Reads use the cached aggregate — never iterate the modifiers Vec.
         let base: f64 = FINGERERS
             .iter()
             .enumerate()
-            .map(|(i, k)| k.fps_per_unit * self.fingerer_count(k.id) as f64 * self.fingerer_mult(i))
+            .map(|(i, k)| {
+                let count = self.fingerer_count(k.id) as f64;
+                let upgrades_mult = self.fingerer_mult(i);
+                let agg = self.fingerer_aggregate(k.id);
+                let pre = (k.fps_per_unit * count + agg.flat_fps) * upgrades_mult;
+                pre * (1.0 + agg.add_percent) * agg.mul_factor
+            })
             .sum();
         base * self.prestige_mult()
     }
@@ -707,8 +867,17 @@ impl GameState {
         for b in &self.buffs {
             match b {
                 Buff::ClickFrenzy { .. } => s = s.max(3),
-                Buff::FingererBoost { .. } => s = s.max(2),
             }
+        }
+        // Active timed per-fingerer modifiers (PurpleCoin and friends)
+        // bump the border one notch — same baseline the old
+        // `Buff::FingererBoost` arm produced.
+        if self.fingerers_state.values().any(|st| {
+            st.modifiers
+                .iter()
+                .any(|m| matches!(m.duration, ModifierDuration::Ticks(_)))
+        }) {
+            s = s.max(2);
         }
         if self.lucky_flash_ticks > 0 {
             s = s.max(4);
@@ -756,19 +925,44 @@ impl GameState {
         // feel. Same for FPS. The red spend-flash is fired below to
         // color the falling counter.
         self.cuques_spend_flash_ticks = HUD_FLASH_TICKS;
-        self.fingerers_owned.clear();
+        // Wipe count AND modifiers — prestige resets the run, which is the
+        // whole point. Permanent Green Coin boosts do not survive a prestige.
+        self.fingerers_state.clear();
         self.upgrades_earned.clear();
         self.buffs.clear();
         self.visual_debt = 0.0;
         self.particles.clear();
         self.misclick_particles.clear();
         self.golden = None;
+        self.green_coin = None;
+        // Pity counter resets too — the new run earns its own Green Coins.
+        self.goldens_since_green_coin = 0;
         self.clench_ticks = 0;
         self.golden_cooldown = crate::game::golden::next_cooldown();
         true
     }
 
     pub fn tick(&mut self) {
+        // Per-fingerer modifier walk: decrement timed durations, drop expired
+        // ones, rebuild the aggregate of any fingerer that lost a modifier.
+        // Permanent modifiers are walked over but untouched. The walk runs
+        // before the `buffs` walk so a coin caught this same tick already
+        // ages by 1 — same convention as Buff::tick.
+        for st in self.fingerers_state.values_mut() {
+            let before = st.modifiers.len();
+            st.modifiers.retain_mut(|m| match &mut m.duration {
+                ModifierDuration::Permanent => true,
+                ModifierDuration::Ticks(0) => false,
+                ModifierDuration::Ticks(n) => {
+                    *n -= 1;
+                    true
+                }
+            });
+            if before != st.modifiers.len() {
+                st.aggregate = FingererAggregate::rebuild(&st.modifiers);
+            }
+        }
+
         for b in self.buffs.iter_mut() {
             b.tick();
         }
@@ -776,6 +970,7 @@ impl GameState {
 
         self.lucky_flash_ticks = self.lucky_flash_ticks.saturating_sub(1);
         self.achievement_flash_ticks = self.achievement_flash_ticks.saturating_sub(1);
+        self.green_coin_flash_ticks = self.green_coin_flash_ticks.saturating_sub(1);
         self.purchase_flash_ticks = self.purchase_flash_ticks.saturating_sub(1);
         if self.purchase_flash_ticks == 0 {
             self.purchase_flash_strength = 1.0;
@@ -958,6 +1153,79 @@ impl GameState {
         }
     }
 
+    /// Lifetime tick for the Green Coin (mirror of `tick_golden`'s coin
+    /// half — Green Coin has no cooldown of its own; spawning is gated on
+    /// regular Golden spawns instead). Decrements `life_ticks` each call,
+    /// clears the slot when it hits 0.
+    pub fn tick_green_coin(&mut self) {
+        if let Some(g) = self.green_coin.as_mut() {
+            if g.life_ticks == 0 {
+                self.green_coin = None;
+            } else {
+                g.life_ticks -= 1;
+            }
+        }
+    }
+
+    /// Catch the on-screen Green Coin if any. Picks a random owned fingerer
+    /// (`count > 0`) and attaches a permanent `+10%` `AddPercent` modifier
+    /// sourced as `GreenCoin`. Returns `true` if a coin was consumed (catch
+    /// or no-op miss because nothing was owned), `false` if there was no
+    /// coin to catch in the first place.
+    ///
+    /// Edge case: if the player owns nothing yet, the coin is consumed but
+    /// no modifier attaches — same defensive behavior as the old Buff
+    /// golden when the catalog was empty. The +10% had nothing to land on.
+    pub fn catch_green_coin(&mut self) -> bool {
+        let Some(g) = self.green_coin.take() else {
+            return false;
+        };
+        let m = Modifier {
+            source: ModifierSource::GreenCoin,
+            effects: vec![ModifierEffect::AddPercent(
+                crate::game::green_coin::GREEN_COIN_ADD_PERCENT,
+            )],
+            duration: ModifierDuration::Permanent,
+            created_at_tick: self.total_play_ticks,
+        };
+        // Visible-set targeting: a permanent +10% can land on a sidebar-
+        // visible tier the player hasn't bought yet, so they get a head
+        // start when they finally afford it. (Buff golden uses
+        // `attach_modifier_random_owned` instead, since its temp x7 only
+        // matters on a tier with non-zero count.)
+        let chosen = self.attach_modifier_random_visible(m);
+        // Counts toward both the all-time rollup and the dedicated
+        // Green Coin counter (V3+). Achievements that gate on
+        // `golden_caught` (e.g. "Golden Touch") still fire because the
+        // rollup keeps incrementing.
+        self.golden_caught += 1;
+        self.green_coin_caught += 1;
+        self.green_coin_flash_ticks = GREEN_COIN_FLASH_TICKS;
+        // Visual feedback: a "+10% <fingerer>" particle anchored at the
+        // coin's position. Phase 5 wraps this with a green border channel
+        // pulse and proper marker rendering.
+        let label = match &chosen {
+            Some(id) => {
+                let idx = FINGERERS.iter().position(|f| f.id == id);
+                let name = idx
+                    .and_then(|i| crate::i18n::t().fingerer_names.get(i).copied())
+                    .unwrap_or("?");
+                format!("+10% {}", name)
+            }
+            // No owned fingerer to host the boost — show a neutral marker.
+            None => "+10% ???".to_string(),
+        };
+        self.particles.push(Particle {
+            frac_x: g.frac_x,
+            frac_y: g.frac_y,
+            life: PARTICLE_LIFE * 2,
+            text: label,
+            kind: ParticleKind::Golden,
+            drift_x: 0.0,
+        });
+        true
+    }
+
     pub fn trigger_clench(&mut self) {
         self.clench_ticks = CLENCH_TICKS;
     }
@@ -1047,7 +1315,10 @@ impl GameState {
             && let Some(f) = FINGERERS.get(idx)
         {
             self.cuques -= c;
-            *self.fingerers_owned.entry(f.id.to_string()).or_insert(0) += 1;
+            self.fingerers_state
+                .entry(f.id.to_string())
+                .or_default()
+                .count += 1;
             true
         } else {
             false
@@ -1168,17 +1439,27 @@ enum PurchaseSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::modifier::{Modifier, ModifierEffect, ModifierSource};
+
+    fn fs_with_count(count: u32) -> FingererState {
+        FingererState {
+            count,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn migrate_is_idempotent_on_current_shape() {
         let state = GameState {
-            fingerers_owned: [("index_finger".to_string(), 9)].into_iter().collect(),
+            fingerers_state: [("index_finger".to_string(), fs_with_count(9))]
+                .into_iter()
+                .collect(),
             upgrades_earned: ["click_mult_1".to_string()].into_iter().collect(),
             achievements_earned: ["first_finger".to_string()].into_iter().collect(),
             ..GameState::default()
         };
 
-        let m = state.migrate();
+        let m = state.migrate_runtime();
 
         assert_eq!(m.fingerer_count("index_finger"), 9);
         assert!(m.has_upgrade("click_mult_1"));
@@ -1191,13 +1472,13 @@ mod tests {
         // catalog, player plays, saves. User downgrades to current version.
         // That unknown id must not crash — it just reads as 0.
         let state = GameState {
-            fingerers_owned: [("giga_finger_from_the_future".to_string(), 42)]
+            fingerers_state: [("giga_finger_from_the_future".to_string(), fs_with_count(42))]
                 .into_iter()
                 .collect(),
             ..GameState::default()
         };
 
-        let m = state.migrate();
+        let m = state.migrate_runtime();
 
         assert_eq!(m.fingerer_count("giga_finger_from_the_future"), 42);
         assert_eq!(m.fingerer_count("index_finger"), 0);
@@ -1211,7 +1492,9 @@ mod tests {
         let state = GameState {
             cuques: 1234.5,
             total_clicks: 99,
-            fingerers_owned: [("index_finger".to_string(), 7)].into_iter().collect(),
+            fingerers_state: [("index_finger".to_string(), fs_with_count(7))]
+                .into_iter()
+                .collect(),
             upgrades_earned: ["click_mult_1".to_string()].into_iter().collect(),
             achievements_earned: ["first_finger".to_string()].into_iter().collect(),
             ..GameState::default()
@@ -1219,7 +1502,7 @@ mod tests {
 
         let json = serde_json::to_string(&state).expect("serialize");
         let roundtripped: GameState = serde_json::from_str(&json).expect("deserialize");
-        let m = roundtripped.migrate();
+        let m = roundtripped.migrate_runtime();
 
         assert_eq!(m.cuques, 1234.5);
         assert_eq!(m.total_clicks, 99);
@@ -1289,8 +1572,8 @@ mod tests {
         // Player clicks an unaffordable fingerer row → buy() returns false
         // AND a red row flash is queued so the rejection is visible. This
         // is the J11 contract; without it the click looks silent.
+        // (Default already zeroes `cuques`; no explicit reset needed.)
         let mut s = GameState::default();
-        s.cuques = 0.0;
         let bought = s.buy(0);
         assert!(!bought);
         assert!(
@@ -1306,7 +1589,6 @@ mod tests {
     #[test]
     fn buy_n_when_broke_sets_unaffordable_flash() {
         let mut s = GameState::default();
-        s.cuques = 0.0;
         let bought = s.buy_n(0, 10);
         assert_eq!(bought, 0);
         assert!(s.fingerer_unaffordable_flash[0] > 0);
@@ -1368,7 +1650,7 @@ mod tests {
         s.upgrade_flash_ticks.clear();
         s.fingerer_unaffordable_flash.clear();
         s.upgrade_unaffordable_flash.clear();
-        let m = s.migrate();
+        let m = s.migrate_runtime();
         assert_eq!(m.fingerer_flash_ticks.len(), fingerer::count());
         assert_eq!(m.upgrade_flash_ticks.len(), UPGRADES.len());
         assert_eq!(m.fingerer_unaffordable_flash.len(), fingerer::count());
@@ -1383,7 +1665,7 @@ mod tests {
             cuques: 5_000.0,
             ..Default::default()
         };
-        let m = s.migrate();
+        let m = s.migrate_runtime();
         assert_eq!(m.displayed_cuques, 5_000.0);
         // displayed_fps starts at 0 and converges over the first few ticks
         // (otherwise we'd snap-show the FPS before any tick has run).
@@ -1404,5 +1686,341 @@ mod tests {
         assert!(s.active_unlock_id.is_some());
         assert!(s.active_unlock_ticks > 0);
         assert!(s.achievement_flash_ticks > 0);
+    }
+
+    // -- Modifier system ----------------------------------------------------
+
+    fn perm_add_percent(pct: f64) -> Modifier {
+        Modifier {
+            source: ModifierSource::GreenCoin,
+            effects: vec![ModifierEffect::AddPercent(pct)],
+            duration: ModifierDuration::Permanent,
+            created_at_tick: 0,
+        }
+    }
+
+    fn timed_mul(mult: f64, ticks: u32) -> Modifier {
+        Modifier {
+            source: ModifierSource::PurpleCoin,
+            effects: vec![ModifierEffect::MulFactor(mult)],
+            duration: ModifierDuration::Ticks(ticks),
+            created_at_tick: 0,
+        }
+    }
+
+    #[test]
+    fn attach_modifier_rebuilds_aggregate() {
+        let mut s = GameState::default();
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        s.attach_modifier("index_finger", perm_add_percent(0.10));
+        let agg = s.fingerer_aggregate("index_finger");
+        assert!((agg.add_percent - 0.10).abs() < 1e-9);
+
+        // Stacking: a second modifier sums into the same aggregate.
+        s.attach_modifier("index_finger", perm_add_percent(0.10));
+        let agg = s.fingerer_aggregate("index_finger");
+        assert!((agg.add_percent - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attach_modifier_creates_state_entry_if_absent() {
+        // Attaching to a fingerer the player doesn't own creates a zero-count
+        // entry rather than silently dropping the modifier. (Production code
+        // pairs `attach_modifier_random_owned` with the count > 0 filter, so
+        // this only matters when something explicitly targets a tier.)
+        let mut s = GameState::default();
+        s.attach_modifier("hand_of_god", perm_add_percent(0.10));
+        let st = s.fingerers_state.get("hand_of_god").expect("entry exists");
+        assert_eq!(st.count, 0);
+        assert_eq!(st.modifiers.len(), 1);
+    }
+
+    #[test]
+    fn attach_modifier_random_owned_picks_only_owned() {
+        let mut s = GameState::default();
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(5));
+        // Add an empty entry for an unowned fingerer; the picker must skip it.
+        s.fingerers_state
+            .insert("hand_of_god".into(), fs_with_count(0));
+        let chosen = s.attach_modifier_random_owned(perm_add_percent(0.10));
+        assert_eq!(chosen.as_deref(), Some("index_finger"));
+    }
+
+    #[test]
+    fn attach_modifier_random_owned_returns_none_when_nothing_owned() {
+        let mut s = GameState::default();
+        let chosen = s.attach_modifier_random_owned(perm_add_percent(0.10));
+        assert!(chosen.is_none());
+        // No entries created — random_owned doesn't have a target to pick.
+        assert!(s.fingerers_state.is_empty());
+    }
+
+    #[test]
+    fn tick_decrements_timed_modifiers() {
+        let mut s = GameState::default();
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        s.attach_modifier("index_finger", timed_mul(2.0, 5));
+        s.tick();
+        let st = s.fingerers_state.get("index_finger").unwrap();
+        assert_eq!(st.modifiers.len(), 1);
+        assert!(matches!(
+            st.modifiers[0].duration,
+            ModifierDuration::Ticks(4)
+        ));
+    }
+
+    #[test]
+    fn tick_removes_expired_and_rebuilds_aggregate() {
+        let mut s = GameState::default();
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        s.attach_modifier("index_finger", timed_mul(2.0, 1));
+        // First tick: Ticks(1) → Ticks(0), still present.
+        s.tick();
+        assert_eq!(
+            s.fingerers_state
+                .get("index_finger")
+                .unwrap()
+                .modifiers
+                .len(),
+            1
+        );
+        // Second tick: Ticks(0) is dropped, aggregate rebuilt to identity.
+        s.tick();
+        let st = s.fingerers_state.get("index_finger").unwrap();
+        assert_eq!(st.modifiers.len(), 0);
+        assert!((st.aggregate.mul_factor - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn permanent_modifier_does_not_decrement() {
+        let mut s = GameState::default();
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        s.attach_modifier("index_finger", perm_add_percent(0.10));
+        for _ in 0..50 {
+            s.tick();
+        }
+        let st = s.fingerers_state.get("index_finger").unwrap();
+        assert_eq!(st.modifiers.len(), 1);
+        assert!(matches!(
+            st.modifiers[0].duration,
+            ModifierDuration::Permanent
+        ));
+        assert!((st.aggregate.add_percent - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prestige_reset_clears_modifiers() {
+        // Prestige resets the run — permanent Green Coin boosts must not
+        // survive. Otherwise a prestiged player would carry +N% on tier-1
+        // forever.
+        let mut s = GameState {
+            lifetime_cuques: 1_000_000_000.0,
+            ..Default::default()
+        };
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(5));
+        s.attach_modifier("index_finger", perm_add_percent(0.30));
+        assert!(s.prestige_reset());
+        assert!(s.fingerers_state.is_empty());
+    }
+
+    #[test]
+    fn fps_uses_aggregate_add_percent() {
+        // Same fingerer count, +10% AddPercent modifier → fps 10% higher.
+        let mut bare = GameState::default();
+        bare.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        let bare_fps = bare.fps();
+
+        let mut boosted = GameState::default();
+        boosted
+            .fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        boosted.attach_modifier("index_finger", perm_add_percent(0.10));
+        let boosted_fps = boosted.fps();
+
+        assert!(bare_fps > 0.0);
+        assert!((boosted_fps - bare_fps * 1.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn migrate_runtime_rebuilds_aggregate_after_serde_skip() {
+        // The aggregate field is `#[serde(skip)]`; a state freshly
+        // deserialized from JSON has it at the identity Default. Running
+        // migrate_runtime() must reconstitute it from the modifier list.
+        let mut s = GameState::default();
+        s.fingerers_state.insert(
+            "index_finger".into(),
+            FingererState {
+                count: 1,
+                modifiers: vec![perm_add_percent(0.25)],
+                aggregate: FingererAggregate::default(), // simulate post-deserialize
+            },
+        );
+        let m = s.migrate_runtime();
+        let agg = m.fingerer_aggregate("index_finger");
+        assert!((agg.add_percent - 0.25).abs() < 1e-9);
+    }
+
+    // -- Green Coin ---------------------------------------------------------
+
+    use crate::game::green_coin::{GREEN_COIN_LIFE_TICKS, GreenCoin};
+
+    fn fake_green_coin() -> GreenCoin {
+        GreenCoin {
+            frac_x: 0.5,
+            frac_y: 0.5,
+            life_ticks: GREEN_COIN_LIFE_TICKS,
+        }
+    }
+
+    #[test]
+    fn catch_green_coin_increments_grand_total_and_per_variant_counter() {
+        let mut s = GameState {
+            green_coin: Some(fake_green_coin()),
+            ..Default::default()
+        };
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        assert!(s.catch_green_coin());
+        assert_eq!(s.golden_caught, 1, "rollup increments");
+        assert_eq!(s.green_coin_caught, 1, "per-variant increments");
+        assert_eq!(s.lucky_caught, 0);
+        assert_eq!(s.frenzy_caught, 0);
+        assert_eq!(s.buff_caught, 0);
+    }
+
+    #[test]
+    fn catch_green_coin_attaches_permanent_modifier() {
+        let mut s = GameState::default();
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(3));
+        s.green_coin = Some(fake_green_coin());
+
+        let caught = s.catch_green_coin();
+
+        assert!(caught);
+        assert!(s.green_coin.is_none());
+        let st = s.fingerers_state.get("index_finger").unwrap();
+        assert_eq!(st.modifiers.len(), 1);
+        let m = &st.modifiers[0];
+        assert!(matches!(m.source, ModifierSource::GreenCoin));
+        assert!(matches!(m.duration, ModifierDuration::Permanent));
+        assert!(matches!(
+            m.effects[0],
+            ModifierEffect::AddPercent(v) if (v - 0.10).abs() < 1e-9
+        ));
+        assert!((st.aggregate.add_percent - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn catch_green_coin_with_no_owned_lands_on_index_finger() {
+        // The visible-set targeting (vs the old owned-only) means even on a
+        // brand-new save, a Green Coin attaches somewhere — Index Finger is
+        // always visible (`idx == 0` short-circuits in `fingerer::visible`).
+        // The previous "consumes without attaching" no-op behavior is gone.
+        let mut s = GameState {
+            green_coin: Some(fake_green_coin()),
+            ..Default::default()
+        };
+
+        let caught = s.catch_green_coin();
+
+        assert!(caught);
+        assert!(s.green_coin.is_none());
+        let st = s
+            .fingerers_state
+            .get(FINGERERS[0].id)
+            .expect("modifier landed on Index Finger");
+        assert_eq!(st.modifiers.len(), 1);
+        assert!((st.aggregate.add_percent - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attach_modifier_random_visible_can_pick_unowned_when_lifetime_unlocks_it() {
+        // Tier 1 (Whole Hand) has base_cost 100; visibility threshold is
+        // 0.5 * base_cost = 50. With lifetime_cuques == 60, Whole Hand is
+        // visible despite being unowned. Index Finger is always visible
+        // (idx == 0). The picker can land on either; with a deterministic
+        // seed we can't pin which, but the modifier lands SOMEWHERE.
+        let mut s = GameState {
+            lifetime_cuques: 60.0,
+            ..Default::default()
+        };
+        let m = perm_add_percent(0.10);
+        let chosen = s.attach_modifier_random_visible(m);
+        let id = chosen.expect("at least one visible fingerer always exists");
+        // Allowed targets at this lifetime: Index Finger + Whole Hand.
+        let visible_ids: Vec<&str> = FINGERERS
+            .iter()
+            .enumerate()
+            .filter(|(idx, f)| {
+                fingerer::visible(*idx, 0, s.lifetime_cuques) && (*idx == 0 || f.id == "whole_hand")
+            })
+            .map(|(_, f)| f.id)
+            .collect();
+        assert!(visible_ids.contains(&id.as_str()));
+    }
+
+    #[test]
+    fn catch_green_coin_returns_false_when_no_coin() {
+        let mut s = GameState::default();
+        assert!(!s.catch_green_coin());
+    }
+
+    #[test]
+    fn tick_green_coin_decrements_lifetime_and_clears_at_zero() {
+        let mut s = GameState {
+            green_coin: Some(GreenCoin {
+                frac_x: 0.5,
+                frac_y: 0.5,
+                life_ticks: 2,
+            }),
+            ..Default::default()
+        };
+        s.tick_green_coin();
+        assert_eq!(s.green_coin.as_ref().unwrap().life_ticks, 1);
+        s.tick_green_coin();
+        // Now `life_ticks` is 0 but slot still occupied.
+        assert_eq!(s.green_coin.as_ref().unwrap().life_ticks, 0);
+        s.tick_green_coin();
+        // The next tick clears it (mirrors `tick_golden`'s convention).
+        assert!(s.green_coin.is_none());
+    }
+
+    #[test]
+    fn green_coin_stacks_additively_on_repeat_catches() {
+        // Two Green Coins on the same fingerer = +20%, not +21%.
+        let mut s = GameState::default();
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        for _ in 0..2 {
+            s.green_coin = Some(fake_green_coin());
+            s.catch_green_coin();
+        }
+        let st = s.fingerers_state.get("index_finger").unwrap();
+        // RNG randomly picks the only owned fingerer both times.
+        assert_eq!(st.modifiers.len(), 2);
+        assert!((st.aggregate.add_percent - 0.20).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prestige_reset_clears_green_coin_state() {
+        let mut s = GameState {
+            lifetime_cuques: 1_000_000_000.0,
+            ..Default::default()
+        };
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        s.goldens_since_green_coin = 7;
+        s.green_coin = Some(fake_green_coin());
+        s.prestige_reset();
+        assert!(s.green_coin.is_none());
+        assert_eq!(s.goldens_since_green_coin, 0);
     }
 }
