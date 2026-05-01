@@ -125,10 +125,10 @@ mod tests {
     }
 
     #[test]
-    fn into_current_preserves_in_flight_fingerer_boost() {
-        // Active per-fingerer Buff in a V1 save survives the conversion
-        // intact. Phase 3 will collapse this variant into a Modifier; until
-        // then the V1→Current path keeps it as a Buff.
+    fn in_flight_fingerer_boost_becomes_purple_modifier() {
+        // Active per-fingerer Buff in a V1 save reaches live state as a
+        // PurpleCoin modifier on the targeted fingerer with remaining time
+        // preserved. The legacy `Buff::FingererBoost` no longer exists.
         let v1 = GameStateV1 {
             buffs: vec![BuffV1::FingererBoost {
                 ticks_remaining: 600,
@@ -153,19 +153,28 @@ mod tests {
 
         let s = v1.into_current();
 
-        assert_eq!(s.buffs.len(), 1);
-        match &s.buffs[0] {
-            Buff::FingererBoost {
-                ticks_remaining,
-                fingerer_id,
-                mult,
-                ..
-            } => {
-                assert_eq!(*ticks_remaining, 600);
-                assert_eq!(fingerer_id, "latex_glove");
-                assert_eq!(*mult, 7.0);
-            }
-            _ => panic!("expected FingererBoost"),
-        }
+        // Live `Buff` enum is now click-only — FingererBoost is gone.
+        assert!(
+            s.buffs
+                .iter()
+                .all(|b| matches!(b, Buff::ClickFrenzy { .. }))
+        );
+
+        let st = s
+            .fingerers_state
+            .get("latex_glove")
+            .expect("modifier attached to target fingerer");
+        assert_eq!(st.modifiers.len(), 1);
+        let m = &st.modifiers[0];
+        assert!(matches!(
+            m.source,
+            crate::game::modifier::ModifierSource::PurpleCoin
+        ));
+        assert!(matches!(
+            m.duration,
+            crate::game::modifier::ModifierDuration::Ticks(600)
+        ));
+        // Remaining time and mult survive.
+        assert!((st.aggregate.mul_factor - 7.0).abs() < 1e-9);
     }
 }

@@ -112,20 +112,15 @@ pub fn biscuit_frac_to_screen(frac_x: f32, frac_y: f32, biscuit: Rect) -> (u16, 
     )
 }
 
+/// Global, click-side buffs. Per-fingerer multipliers (the old
+/// `Buff::FingererBoost`) live on the modifier system in
+/// `crate::game::modifier`; only buffs that affect global click power
+/// belong here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Buff {
     ClickFrenzy {
         ticks_remaining: u32,
         initial_ticks: u32,
-        mult: f64,
-    },
-    /// Fingerer mult buff — applied when a "Buff" golden variant is caught.
-    /// Targets a fingerer by stable id so the buff stays on the right tier
-    /// across catalog changes.
-    FingererBoost {
-        ticks_remaining: u32,
-        initial_ticks: u32,
-        fingerer_id: String,
         mult: f64,
     },
 }
@@ -134,9 +129,6 @@ impl Buff {
     pub fn ticks_remaining(&self) -> u32 {
         match self {
             Buff::ClickFrenzy {
-                ticks_remaining, ..
-            } => *ticks_remaining,
-            Buff::FingererBoost {
                 ticks_remaining, ..
             } => *ticks_remaining,
         }
@@ -159,11 +151,6 @@ impl Buff {
     fn tick(&mut self) {
         match self {
             Buff::ClickFrenzy {
-                ticks_remaining, ..
-            } => {
-                *ticks_remaining = ticks_remaining.saturating_sub(1);
-            }
-            Buff::FingererBoost {
                 ticks_remaining, ..
             } => {
                 *ticks_remaining = ticks_remaining.saturating_sub(1);
@@ -676,9 +663,8 @@ impl GameState {
             }
         }
         for b in &self.buffs {
-            if let Buff::ClickFrenzy { mult, .. } = b {
-                m *= *mult;
-            }
+            let Buff::ClickFrenzy { mult, .. } = b;
+            m *= *mult;
         }
         m
     }
@@ -698,15 +684,10 @@ impl GameState {
                 _ => {}
             }
         }
-        for b in &self.buffs {
-            if let Buff::FingererBoost {
-                fingerer_id, mult, ..
-            } = b
-                && fingerer_id == target.id
-            {
-                m *= *mult;
-            }
-        }
+        // Per-fingerer Buff golden contributions used to live here as
+        // `Buff::FingererBoost`. They now flow through the modifier
+        // aggregate (see `fingerer_aggregate`), keeping `fingerer_mult`
+        // strictly about upgrades.
         m
     }
 
@@ -726,6 +707,11 @@ impl GameState {
     /// Lucky, Frenzy, or Buff). Applies the variant-specific effect,
     /// increments `golden_caught`, re-rolls the next spawn cooldown, and
     /// returns the flat reward (0.0 for buff variants).
+    ///
+    /// The `Buff` variant attaches a `MulFactor(7.0)` modifier with a
+    /// 60-second `Ticks` duration on a random owned fingerer, sourced as
+    /// `PurpleCoin`. Pre-#21 this was a global `Buff::FingererBoost`; the
+    /// modifier system replaces it.
     pub fn catch_golden(&mut self) -> f64 {
         use crate::game::golden::GoldenVariant;
         let Some(golden) = self.golden.take() else {
@@ -752,24 +738,19 @@ impl GameState {
                 (0.0, "FRENZY x777!".into())
             }
             GoldenVariant::Buff => {
-                let active_ids: Vec<&'static str> = FINGERERS
-                    .iter()
-                    .filter(|f| self.fingerer_count(f.id) > 0)
-                    .map(|f| f.id)
-                    .collect();
-                let pick = if active_ids.is_empty() {
-                    FINGERERS[0].id
-                } else {
-                    use rand::RngExt;
-                    active_ids[rand::rng().random_range(0..active_ids.len())]
-                };
                 let dur = TICK_HZ * 60;
-                self.buffs.push(Buff::FingererBoost {
-                    ticks_remaining: dur,
-                    initial_ticks: dur,
-                    fingerer_id: pick.to_string(),
-                    mult: 7.0,
-                });
+                let m = Modifier {
+                    source: crate::game::modifier::ModifierSource::PurpleCoin,
+                    effects: vec![crate::game::modifier::ModifierEffect::MulFactor(7.0)],
+                    duration: ModifierDuration::Ticks(dur),
+                    created_at_tick: self.total_play_ticks,
+                };
+                // Fall back to the first catalog tier if the player owns
+                // nothing yet — same defensive behavior the legacy buff had.
+                if self.attach_modifier_random_owned(m.clone()).is_none() {
+                    let pick = FINGERERS[0].id;
+                    self.attach_modifier(pick, m);
+                }
                 (0.0, "BOOSTED x7!".into())
             }
         };
@@ -808,8 +789,17 @@ impl GameState {
         for b in &self.buffs {
             match b {
                 Buff::ClickFrenzy { .. } => s = s.max(3),
-                Buff::FingererBoost { .. } => s = s.max(2),
             }
+        }
+        // Active timed per-fingerer modifiers (PurpleCoin and friends)
+        // bump the border one notch — same baseline the old
+        // `Buff::FingererBoost` arm produced.
+        if self.fingerers_state.values().any(|st| {
+            st.modifiers
+                .iter()
+                .any(|m| matches!(m.duration, ModifierDuration::Ticks(_)))
+        }) {
+            s = s.max(2);
         }
         if self.lucky_flash_ticks > 0 {
             s = s.max(4);

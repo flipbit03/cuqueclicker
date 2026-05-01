@@ -115,6 +115,29 @@ pub struct Modifier {
     pub created_at_tick: u64,
 }
 
+impl Modifier {
+    /// Plateau-at-1.0 until the last `FADE_TICKS` of the duration, then
+    /// smoothstep-decay to 0. Mirrors `Buff::strength` so border / HUD
+    /// pulse code can blend timed modifiers into the same activity sum
+    /// without a special case. Permanent modifiers always read 1.0
+    /// (they don't fade).
+    pub fn strength(&self) -> f32 {
+        const FADE_TICKS: f32 = 30.0; // ~1.5s at 20Hz
+        match self.duration {
+            ModifierDuration::Permanent => 1.0,
+            ModifierDuration::Ticks(n) => {
+                let remaining = n as f32;
+                if remaining >= FADE_TICKS {
+                    1.0
+                } else {
+                    let t = (remaining / FADE_TICKS).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t)
+                }
+            }
+        }
+    }
+}
+
 /// Pre-computed sum/product of every effect across every modifier on a
 /// fingerer. Read on every FPS calc — the tick path rebuilds this when
 /// modifiers are added, removed, or expire, so reads are O(1).

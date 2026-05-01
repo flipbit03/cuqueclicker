@@ -217,25 +217,48 @@ pub fn draw(
                 format!("  [!! FRENZY x{} {}s]", *mult as u64, secs),
                 Color::Rgb(255, 80, 80),
             ),
-            Buff::FingererBoost {
-                fingerer_id, mult, ..
-            } => {
-                let idx = crate::game::fingerer::FINGERERS
-                    .iter()
-                    .position(|f| f.id == fingerer_id);
-                let name = idx
-                    .and_then(|i| lang.fingerer_names.get(i).copied())
-                    .unwrap_or("?");
-                (
-                    format!("  [++ {} x{} {}s]", name, *mult as u64, secs),
-                    Color::Rgb(220, 140, 255),
-                )
-            }
         };
         hud_spans.push(Span::styled(
             label,
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ));
+    }
+    // Active timed per-fingerer modifiers — Purple Coin Buff golden today,
+    // anything else timed in the future. Phase 5 of #21 will replace this
+    // with a dedicated HUD strip; for now we mirror the legacy chip layout
+    // so UX continuity holds across phases.
+    for (id, st) in &state.fingerers_state {
+        for m in &st.modifiers {
+            let crate::game::modifier::ModifierDuration::Ticks(remaining) = m.duration else {
+                continue;
+            };
+            let secs = remaining.div_ceil(TICK_HZ);
+            let idx = crate::game::fingerer::FINGERERS
+                .iter()
+                .position(|f| f.id == id);
+            let name = idx
+                .and_then(|i| lang.fingerer_names.get(i).copied())
+                .unwrap_or("?");
+            // Pick a number to show: prefer the strongest single MulFactor
+            // effect (matches the old "x7" presentation); fall back to a
+            // count-of-effects marker for purely additive sources.
+            let mul = m.effects.iter().find_map(|e| match e {
+                crate::game::modifier::ModifierEffect::MulFactor(v) => Some(*v),
+                _ => None,
+            });
+            let label = match mul {
+                Some(v) => format!("  [++ {} x{} {}s]", name, v as u64, secs),
+                None => format!("  [++ {} {}s]", name, secs),
+            };
+            let color = match m.source {
+                crate::game::modifier::ModifierSource::PurpleCoin => Color::Rgb(220, 140, 255),
+                crate::game::modifier::ModifierSource::GreenCoin => Color::Rgb(120, 230, 140),
+            };
+            hud_spans.push(Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+        }
     }
     let title = hud_title();
     border::draw_animated(frame, left[0], state, &title);

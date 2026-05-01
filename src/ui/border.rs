@@ -89,21 +89,30 @@ fn cell_color(i: usize, state: &GameState) -> Color {
     let purchase_s = plateau_fade(state.purchase_flash_ticks, PURCHASE_FLASH_TICKS);
     let lucky_s = plateau_fade(state.lucky_flash_ticks, LUCKY_FLASH_TICKS);
     let achievement_s = plateau_fade(state.achievement_flash_ticks, ACHIEVEMENT_FLASH_TICKS);
+    // Single-variant `Buff` today — no need to filter, just pluck the
+    // strongest. (Kept as a fold so adding new global buffs in the future
+    // is a one-arm match update.)
     let frenzy_s = state
         .buffs
         .iter()
-        .filter_map(|b| match b {
-            Buff::ClickFrenzy { .. } => Some(b.strength()),
-            _ => None,
+        .map(|b| {
+            let Buff::ClickFrenzy { .. } = b;
+            b.strength()
         })
         .fold(0.0_f32, f32::max);
+    // Per-fingerer timed modifiers (PurpleCoin Buff golden, future events).
+    // Take the strongest one across all fingerers for the border channel.
     let buff_s = state
-        .buffs
-        .iter()
-        .filter_map(|b| match b {
-            Buff::FingererBoost { .. } => Some(b.strength()),
-            _ => None,
+        .fingerers_state
+        .values()
+        .flat_map(|st| st.modifiers.iter())
+        .filter(|m| {
+            matches!(
+                m.duration,
+                crate::game::modifier::ModifierDuration::Ticks(_)
+            )
         })
+        .map(|m| m.strength())
         .fold(0.0_f32, f32::max);
 
     // Carrier smoothly blends from resting gray to pure white as total
