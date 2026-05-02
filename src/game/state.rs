@@ -258,14 +258,19 @@ pub struct GameState {
     pub misclick_particles: Vec<MisclickParticle>,
     /// Per-variant Golden Cuque slots — `goldens[GoldenVariant::Lucky as usize]`
     /// holds the on-screen Lucky, etc. Each variant has its own independent
-    /// slot so spawning / catching one never clobbers another. The shared
-    /// `golden_cooldown` still throttles the natural spawn rate (one
-    /// roll per cooldown period); the cooldown picks a variant and spawns
-    /// it into its slot only if that slot is empty.
+    /// slot AND its own independent cooldown so spawn timing is fully
+    /// desynchronized — Lucky's clock doesn't gate Frenzy's, and a Buff
+    /// expiring doesn't reset Lucky's cooldown.
     #[serde(skip)]
     pub goldens: [Option<GoldenCuque>; 3],
+    /// Per-variant spawn cooldowns, indexed the same as `goldens`. Each
+    /// freezes while its own slot is occupied (no point counting down
+    /// when there's nowhere to spawn) and rolls a fresh value on
+    /// catch/expiry. Initial values come from `next_cooldown()` in
+    /// `Default`, which already randomizes them so no two variants
+    /// arrive at zero simultaneously on a fresh save.
     #[serde(skip)]
-    pub golden_cooldown: u32,
+    pub golden_cooldowns: [u32; 3],
     /// On-screen Green Coin, if one is currently visible. Lifetime ticked
     /// down by `tick_green_coin`; cleared on catch or expiry. Not persisted
     /// (parallel to `golden`) — closing and reopening the game shouldn't
@@ -443,7 +448,11 @@ impl Default for GameState {
             particles: Vec::new(),
             misclick_particles: Vec::new(),
             goldens: [None, None, None],
-            golden_cooldown: crate::game::golden::next_cooldown(),
+            golden_cooldowns: [
+                crate::game::golden::next_cooldown(),
+                crate::game::golden::next_cooldown(),
+                crate::game::golden::next_cooldown(),
+            ],
             green_coin: None,
             session_ticks: 0,
             newly_unlocked: Vec::new(),
@@ -531,8 +540,13 @@ impl GameState {
                 })
                 .collect();
         }
-        if self.golden_cooldown == 0 {
-            self.golden_cooldown = crate::game::golden::next_cooldown();
+        // Re-seed any cooldown left at 0 by an old save shape (the array
+        // is `#[serde(skip)]` so it's already at default; this is a
+        // defensive guard).
+        for cd in self.golden_cooldowns.iter_mut() {
+            if *cd == 0 {
+                *cd = crate::game::golden::next_cooldown();
+            }
         }
         // Seed the count-up tween at the live values so a freshly-loaded save
         // doesn't animate the HUD "from 0" up to whatever the player had.
@@ -819,7 +833,9 @@ impl GameState {
             return 0.0;
         };
         self.golden_caught += 1;
-        self.golden_cooldown = crate::game::golden::next_cooldown();
+        // Reset only THIS variant's cooldown — sibling variants keep their
+        // own clocks running on independent schedules.
+        self.golden_cooldowns[variant as usize] = crate::game::golden::next_cooldown();
         let (reward, label) = match golden.variant {
             GoldenVariant::Lucky => {
                 self.lucky_caught += 1;
@@ -964,7 +980,11 @@ impl GameState {
         // Pity counter resets too — the new run earns its own Green Coins.
         self.goldens_since_green_coin = 0;
         self.clench_ticks = 0;
-        self.golden_cooldown = crate::game::golden::next_cooldown();
+        // Fresh per-variant cooldowns so the new run has its own
+        // independent rhythm from tick 1.
+        for cd in self.golden_cooldowns.iter_mut() {
+            *cd = crate::game::golden::next_cooldown();
+        }
         true
     }
 
@@ -1170,26 +1190,21 @@ impl GameState {
     }
 
     pub fn tick_golden(&mut self) {
-        // Each variant ages independently. The shared cooldown ticks down
-        // only when EVERY slot is empty — the player isn't punished by a
-        // cooldown reset just because one variant happens to be on screen.
-        let mut any_alive = false;
-        let mut any_just_expired = false;
-        for slot in self.goldens.iter_mut() {
-            if let Some(g) = slot.as_mut() {
+        // Each variant ages on its own clock. Lifetime ticks down per
+        // slot; on expiry, that slot's cooldown rolls fresh. Cooldown
+        // ticks down only when its variant's slot is empty — no point
+        // counting down to zero while there's nowhere to spawn.
+        for i in 0..self.goldens.len() {
+            if let Some(g) = self.goldens[i].as_mut() {
                 if g.life_ticks == 0 {
-                    *slot = None;
-                    any_just_expired = true;
+                    self.goldens[i] = None;
+                    self.golden_cooldowns[i] = crate::game::golden::next_cooldown();
                 } else {
                     g.life_ticks -= 1;
-                    any_alive = true;
                 }
+            } else if self.golden_cooldowns[i] > 0 {
+                self.golden_cooldowns[i] -= 1;
             }
-        }
-        if any_just_expired {
-            self.golden_cooldown = crate::game::golden::next_cooldown();
-        } else if !any_alive && self.golden_cooldown > 0 {
-            self.golden_cooldown -= 1;
         }
     }
 

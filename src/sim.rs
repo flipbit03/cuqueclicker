@@ -193,36 +193,33 @@ fn maybe_spawn_auto_particle(state: &mut GameState, geom: &SimGeometry) {
 }
 
 fn maybe_spawn_golden(state: &mut GameState, geom: &SimGeometry) {
-    if state.golden_cooldown > 0 {
-        return;
-    }
     if geom.biscuit.width < 8 || geom.biscuit.height < 5 {
         return;
     }
-    // Roll a variant; only spawn if THAT variant's slot is empty. Each
-    // variant has its own independent slot, so a Frenzy on screen doesn't
-    // block a Lucky from spawning. If the rolled slot is already
-    // occupied, skip this attempt — the cooldown re-rolls naturally.
-    let variant = GoldenVariant::random();
-    if state.goldens[variant as usize].is_some() {
-        return;
-    }
-    let mut g = golden::spawn_in(geom.biscuit);
-    g.variant = variant;
-    state.goldens[variant as usize] = Some(g);
+    // Each variant runs on its own clock — find the variants whose
+    // cooldown has hit zero and whose slot is empty, and spawn each.
+    // Cooldown reset for that variant happens here too, so a stuck
+    // zero-cooldown can't re-spawn every tick.
+    for variant in GoldenVariant::ALL {
+        let i = variant as usize;
+        if state.golden_cooldowns[i] > 0 || state.goldens[i].is_some() {
+            continue;
+        }
+        let mut g = golden::spawn_in(geom.biscuit);
+        g.variant = variant;
+        state.goldens[i] = Some(g);
+        state.golden_cooldowns[i] = crate::game::golden::next_cooldown();
 
-    // Green Coin spawn pity: each regular Golden spawn bumps the chance
-    // by 1%. The roll fires whether or not a Green Coin slot is currently
-    // free; if one's already on screen, the counter still increments but
-    // the roll is *not* re-cast (the existing coin keeps its turn). The
-    // counter resets the moment a Green Coin appears, regardless of
-    // whether the player catches it or it expires.
-    state.goldens_since_green_coin = state.goldens_since_green_coin.saturating_add(1);
-    if state.green_coin.is_none() {
-        let p = state.goldens_since_green_coin as f64 * 0.01;
-        if rand::rng().random::<f64>() < p {
-            state.green_coin = Some(green_coin::spawn_in(geom.biscuit));
-            state.goldens_since_green_coin = 0;
+        // Green Coin spawn pity: each regular Golden spawn bumps the
+        // chance by 1%. Counter resets the moment a Green Coin appears,
+        // regardless of whether the player catches it or it expires.
+        state.goldens_since_green_coin = state.goldens_since_green_coin.saturating_add(1);
+        if state.green_coin.is_none() {
+            let p = state.goldens_since_green_coin as f64 * 0.01;
+            if rand::rng().random::<f64>() < p {
+                state.green_coin = Some(green_coin::spawn_in(geom.biscuit));
+                state.goldens_since_green_coin = 0;
+            }
         }
     }
 }

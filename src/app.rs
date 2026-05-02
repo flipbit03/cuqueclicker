@@ -284,9 +284,15 @@ fn demo_driver_tick(
     }
 
     // Keep the screen busy with goldens: tighter cooldown than normal.
+    // Force the next-eligible variant slot's cooldown to a short value
+    // so the demo doesn't have to wait the natural per-variant rng.
     let any_golden = state.goldens.iter().any(|g| g.is_some());
-    if !any_golden && state.golden_cooldown == 0 {
-        state.golden_cooldown = DEMO_GOLDEN_COOLDOWN;
+    if !any_golden {
+        for cd in state.golden_cooldowns.iter_mut() {
+            if *cd == 0 {
+                *cd = DEMO_GOLDEN_COOLDOWN;
+            }
+        }
     }
 
     // Force the variant on freshly-spawned goldens so the clip deterministically
@@ -475,10 +481,11 @@ pub fn build_demo_state() -> GameState {
         total_play_ticks: 3600 * TICK_HZ as u64, // pretend we've been at this an hour
         prestige: 3,
         golden_caught: 7,
-        // Default is a random 20-80s wait; force 0 so the first demo golden
-        // (a Buff, per the cycle in demo_driver_tick) spawns on tick 1 —
-        // the purple powerup lands well within the first few seconds of the clip.
-        golden_cooldown: 0,
+        // Default is a random 20-80s wait per slot; force all to 0 so the
+        // first demo golden (a Buff, per the cycle in demo_driver_tick)
+        // spawns on tick 1 — the purple powerup lands well within the
+        // first few seconds of the clip.
+        golden_cooldowns: [0; 3],
         best_fps: 50_000.0,
         ..GameState::default()
     };
