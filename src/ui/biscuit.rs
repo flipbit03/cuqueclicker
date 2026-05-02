@@ -177,6 +177,16 @@ pub fn level_count() -> usize {
     BISCUIT_LEVELS.len()
 }
 
+/// Screen coordinates of the focal cell ("the asshole") for the given
+/// zoom level + biscuit rect. Used by `hands::draw` to orbit the ring
+/// around the visual cuque center rather than the bounding-box center
+/// (which differs by up to 1 column in TINY/FULL because each art's
+/// `asshole_col` isn't exactly `width / 2`).
+pub fn focal_point(zoom_idx: usize, biscuit: Rect) -> (u16, u16) {
+    let level = &BISCUIT_LEVELS[zoom_idx.min(BISCUIT_LEVELS.len() - 1)];
+    (biscuit.x + level.asshole_col, biscuit.y + level.asshole_row)
+}
+
 pub fn level_label(idx: usize) -> Option<&'static str> {
     BISCUIT_LEVELS.get(idx).and_then(|a| a.label)
 }

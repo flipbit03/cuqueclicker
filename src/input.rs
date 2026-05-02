@@ -116,6 +116,10 @@ pub struct InputContext<'a> {
     pub upgrade_rows: &'a [(usize, Rect)],
     pub help_hits: &'a [(HelpAction, Rect)],
     pub biscuit_rect: Rect,
+    /// Screen position of the biscuit's focal cell. See
+    /// [`crate::ui::DrawOutput::biscuit_focal`]. Used by `hands::occupied_at`
+    /// to keep its hit-test math in sync with the visual orbit.
+    pub biscuit_focal: (u16, u16),
     pub golden_rect: Rect,
     /// Hit-test rect for the on-screen Green Coin marker. Zero-rect when
     /// no coin is visible; click-routes through `Action::CatchGolden` (the
@@ -147,6 +151,7 @@ impl<'a> InputContext<'a> {
             upgrade_rows: &layout.upgrade_rows,
             help_hits: &layout.help_hits,
             biscuit_rect: layout.biscuit_rect,
+            biscuit_focal: layout.biscuit_focal,
             golden_rect: layout.golden_rect,
             green_coin_rect: layout.green_coin_rect,
             play_area: layout.play_area,
@@ -364,7 +369,7 @@ fn handle_click(
     if !rect_contains(ctx.play_area, col, row) {
         return;
     }
-    if crate::ui::hands::occupied_at(col, row, ctx.biscuit_rect, ctx.current) {
+    if crate::ui::hands::occupied_at(col, row, ctx.biscuit_rect, ctx.biscuit_focal, ctx.current) {
         return;
     }
     out.push(Action::Misclick { col, row });
@@ -570,6 +575,7 @@ mod tests {
             upgrade_rows,
             help_hits,
             biscuit_rect: biscuit,
+            biscuit_focal: (0, 0),
             golden_rect,
             green_coin_rect: Rect::default(),
             play_area,

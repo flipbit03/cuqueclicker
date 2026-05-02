@@ -72,6 +72,12 @@ pub enum HelpAction {
 #[derive(Default)]
 pub struct DrawOutput {
     pub biscuit_rect: Rect,
+    /// Screen position of the biscuit's focal cell ("the asshole"). Each
+    /// zoom level's art has the focal at a slightly different offset
+    /// inside its bounding box (TINY: col 7 of width 16, FULL: col 31 of
+    /// width 60, etc.), so the bbox center isn't the visual center. This
+    /// drives `hands::draw`'s orbit center.
+    pub biscuit_focal: (u16, u16),
     pub golden_rect: Rect,
     /// On-screen Green Coin marker rect, or zero-rect when no coin is
     /// visible. Hit-tested by the click router exactly like `golden_rect`
@@ -288,7 +294,8 @@ pub fn draw(
     frame.render_widget(hud, hud_inner);
 
     let biscuit_rect = biscuit::draw(frame, left[1], state, zoom_idx);
-    hands::draw(frame, left[1], biscuit_rect, state);
+    let biscuit_focal = biscuit::focal_point(zoom_idx, biscuit_rect);
+    hands::draw(frame, left[1], biscuit_rect, biscuit_focal, state);
     effects::draw_particles(frame, biscuit_rect, &state.particles);
     effects::draw_misclicks(frame, &state.misclick_particles);
     draw_zoom_indicator(
@@ -334,6 +341,7 @@ pub fn draw(
 
     DrawOutput {
         biscuit_rect,
+        biscuit_focal,
         golden_rect,
         green_coin_rect,
         play_area: left[1],
