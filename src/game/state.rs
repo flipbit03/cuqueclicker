@@ -336,6 +336,13 @@ pub struct GameState {
     pub fingerer_unlock_flash: Vec<u32>,
     #[serde(skip)]
     pub upgrade_unlock_flash: Vec<u32>,
+    /// Brief gold shimmer on a fingerer row when a Green Coin catch
+    /// targeted it. Closes the visual loop with the floating "+10%
+    /// <fingerer>" particle and the green-tinted title-border pulse —
+    /// the gold here matches the catch particle, so the player can see
+    /// at a glance which row in the sidebar just took the boost.
+    #[serde(skip)]
+    pub fingerer_green_coin_flash: Vec<u32>,
     /// Previous-tick affordability per row, used to detect the
     /// false→true edge that triggers `*_unlock_flash`. Sized to catalog
     /// length by `migrate()` and seeded at init from the live state, so a
@@ -392,6 +399,11 @@ pub const PURCHASE_FLASH_TICKS: u32 = 20; // 1s at 20Hz
 /// blip lands without lingering for so long it competes with whatever might
 /// be running on top (Frenzy, Buff, Lucky).
 pub const GREEN_COIN_FLASH_TICKS: u32 = 50; // 2.5s at 20Hz
+/// Per-row gold shimmer on the targeted fingerer's sidebar row when a
+/// Green Coin catch lands on it. ~2 seconds — long enough for the eye
+/// to track from the floating "+10% <fingerer>" particle over to the
+/// row, short enough that it doesn't outlive the catch event.
+pub const GREEN_COIN_ROW_FLASH_TICKS: u32 = TICK_HZ * 2; // 2.0s at 20Hz
 
 /// Serde default for `GameState::version`. A direct deserialize of the live
 /// `GameState` from a pre-versioned save (one without the field) still
@@ -445,6 +457,7 @@ impl Default for GameState {
             upgrade_unaffordable_flash: vec![0; UPGRADES.len()],
             fingerer_unlock_flash: vec![0; fingerer::count()],
             upgrade_unlock_flash: vec![0; UPGRADES.len()],
+            fingerer_green_coin_flash: vec![0; fingerer::count()],
             prev_fingerer_affordable: vec![false; fingerer::count()],
             prev_upgrade_affordable: vec![false; UPGRADES.len()],
             space_pressed_this_tick: false,
@@ -493,6 +506,9 @@ impl GameState {
         }
         if self.upgrade_unlock_flash.len() != UPGRADES.len() {
             self.upgrade_unlock_flash = vec![0; UPGRADES.len()];
+        }
+        if self.fingerer_green_coin_flash.len() != fingerer::count() {
+            self.fingerer_green_coin_flash = vec![0; fingerer::count()];
         }
         // Seed `prev_affordable` from the LIVE state so a freshly-loaded
         // save with rows already affordable doesn't fire spurious unlock
@@ -995,6 +1011,9 @@ impl GameState {
         for t in self.upgrade_unlock_flash.iter_mut() {
             *t = t.saturating_sub(1);
         }
+        for t in self.fingerer_green_coin_flash.iter_mut() {
+            *t = t.saturating_sub(1);
+        }
         // Held-spacebar streak with a small grace window. Real key-repeat
         // is bursty (~30Hz nominal but with OS-level jitter), so a strict
         // "every tick must see a press" test breaks on a single missed
@@ -1202,11 +1221,17 @@ impl GameState {
         self.green_coin_caught += 1;
         self.green_coin_flash_ticks = GREEN_COIN_FLASH_TICKS;
         // Visual feedback: a "+10% <fingerer>" particle anchored at the
-        // coin's position. Phase 5 wraps this with a green border channel
-        // pulse and proper marker rendering.
+        // coin's position + a gold sidebar-row shimmer on the targeted
+        // tier (closes the loop between the floating particle and the
+        // sidebar badge that just gained another +10%).
         let label = match &chosen {
             Some(id) => {
                 let idx = FINGERERS.iter().position(|f| f.id == id);
+                if let Some(i) = idx
+                    && let Some(slot) = self.fingerer_green_coin_flash.get_mut(i)
+                {
+                    *slot = GREEN_COIN_ROW_FLASH_TICKS;
+                }
                 let name = idx
                     .and_then(|i| crate::i18n::t().fingerer_names.get(i).copied())
                     .unwrap_or("?");
