@@ -1,10 +1,11 @@
 //! Save schema V2 — adds the `version` field, per-fingerer modifiers, and
 //! Green-Coin spawn pity counter.
 //!
-//! WORK IN PROGRESS until the Green Coin PR (#21) merges. Once that PR
-//! lands on `main` this file is FROZEN: subsequent schema changes go in
-//! `v3.rs` together with a `From<GameStateV2> for GameStateV3` conversion
-//! and a unit test.
+//! FROZEN. Subsequent schema changes go in `v3.rs` together with a
+//! `From<GameStateV2> for GameStateV3` conversion and a unit test. The
+//! only edit allowed here after freeze is making `into_current` chain
+//! through the next version, which we do because the live `GameState`
+//! shape no longer has `goldens_since_green_coin`.
 //!
 //! Each persisted enum/struct has a frozen V2 copy here so future changes
 //! to the live types in `crate::game::modifier` and `crate::game::state`
@@ -190,37 +191,14 @@ pub struct GameStateV2 {
 }
 
 impl GameStateV2 {
-    /// Convert a V2 snapshot into the live `GameState`. Every persisted
-    /// field is copied verbatim; ephemeral state (`#[serde(skip)]` fields)
-    /// stays at its `Default` and gets seeded by `migrate_runtime` after
-    /// the chain finishes.
+    /// Convert a V2 snapshot into the live `GameState` by chaining through
+    /// the next-version conversion. The live state shape evolves with new
+    /// versions, so V2 doesn't try to construct it directly — it delegates
+    /// to `GameStateV3::into_current` (and so on, when V4 lands). This
+    /// keeps the V2 file frozen against live-shape drift while the
+    /// migration tests here continue to exercise the chain end-to-end.
     pub fn into_current(self) -> GameState {
-        let fingerers_state = self
-            .fingerers_state
-            .into_iter()
-            .map(|(id, st)| (id, st.into()))
-            .collect();
-        let buffs = self.buffs.into_iter().map(Into::into).collect();
-        GameState {
-            version: crate::save::CURRENT_VERSION,
-            cuques: self.cuques,
-            total_clicks: self.total_clicks,
-            lifetime_cuques: self.lifetime_cuques,
-            best_fps: self.best_fps,
-            golden_caught: self.golden_caught,
-            lucky_caught: self.lucky_caught,
-            frenzy_caught: self.frenzy_caught,
-            buff_caught: self.buff_caught,
-            green_coin_caught: self.green_coin_caught,
-            fingerers_state,
-            achievements_earned: self.achievements_earned,
-            upgrades_earned: self.upgrades_earned,
-            prestige: self.prestige,
-            total_play_ticks: self.total_play_ticks,
-            buffs,
-            goldens_since_green_coin: self.goldens_since_green_coin,
-            ..GameState::default()
-        }
+        super::v3::GameStateV3::from(self).into_current()
     }
 }
 

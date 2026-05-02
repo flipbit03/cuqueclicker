@@ -27,7 +27,7 @@ Two independent mechanisms decide whether a binary is "dev":
 2. **`build_info::is_dev_build()`** = `VERSION == "0.0.0"`. This, AND NOT the `binary-release` cargo feature, gates dev-only surfaces.
 
 Dev-only surfaces (all require `is_dev_build()`):
-- **Debug pane** (F1 / F2 / F3 spawn Lucky/Frenzy/Buff goldens; F4 gives free cuques). Also requires `!cli.no_debug`. `--no-debug` is opt-**out** on dev; it's labelled "disable" not "hide" because the point is that the cheats are gone, not just invisible.
+- **Debug pane** (F8 / F2 / F3 / F5 force-spawn Lucky / Frenzy / Buff / GreenCoin powerups; F4 gives free cuques). Also requires `!cli.no_debug`. `--no-debug` is opt-**out** on dev; it's labelled "disable" not "hide" because the point is that the cheats are gone, not just invisible.
 - **`--demo-for-recording [SECONDS]`** (hidden from `--help`). Runs the auto-driver on an ephemeral rich state.
 
 The `binary-release` cargo feature is a **different** gate — it only toggles how `cuqueclicker self update` re-installs:
@@ -42,7 +42,7 @@ HUD shows `v0.0.0 (dev)` in dev, plain `vX.Y.Z` in release. The title is built i
 - **Exactly 10 fingerers, aligned to hotkeys `1`–`9`, `0`.** Don't add an 11th without also rethinking keybinds. We explicitly dropped the Singularity tier for this reason.
 - **`--demo-for-recording` must never touch the save file or the lock.** It runs on `build_demo_state()`, skips `save::acquire_lock()`, and the tick loop early-returns before the save-interval check. Two live sessions (one normal, one demo) must coexist.
 - **Single-instance lock uses `std::fs::File::try_lock`** (stdlib, Rust ≥ 1.89). Do **not** reintroduce the `fs4` crate. The `.lock` file on disk is just a handle target — OS releases the lock on process exit, clean or crash. If it ever appears stuck, the fix is "close the other instance or delete the lock file", not new code.
-- **Active buffs persist across quit/restart; goldens and `golden_cooldown` don't.** `buffs` is serialized (click-side only — `Buff::ClickFrenzy`); `golden`, `golden_cooldown`, and `green_coin` are `#[serde(skip)]` and re-seeded on load. Per-fingerer modifiers (Purple Coin, Green Coin, future events) live on `FingererState.modifiers` and ARE persisted; the `aggregate` cache they drive is `#[serde(skip)]` and rebuilt by `migrate_runtime`. The Green-Coin spawn pity counter `goldens_since_green_coin` IS persisted so the timer survives quit/restart.
+- **Active buffs persist across quit/restart; powerups and per-kind cooldowns don't.** `buffs` is serialized (click-side only — `Buff::ClickFrenzy`); the powerup Vec, `next_spawn_id`, and `powerup_cooldowns` are all `#[serde(skip)]` and re-seeded on load (each cooldown rolls a fresh exponential sample in `Default`/`migrate_runtime`). Per-fingerer modifiers (Purple Coin, Green Coin, future events) live on `FingererState.modifiers` and ARE persisted; the `aggregate` cache they drive is `#[serde(skip)]` and rebuilt by `migrate_runtime`.
 - **Per-fingerer modifier source ids are load-bearing forever.** `ModifierSource::id()` strings (`green_coin`, `purple_coin`, ...) appear in serialized saves. Renaming silently invalidates every existing save's modifier list. Treat them like fingerer/upgrade ids: cosmetic names live in `i18n.rs`; the id stays stable.
 
 ## Save versioning
@@ -58,7 +58,8 @@ src/save/
 └── versions/
     ├── mod.rs
     ├── v1.rs           # FROZEN: pre-versioned shape
-    ├── v2.rs           # FROZEN once shipped: per-fingerer modifiers, Green Coin pity
+    ├── v2.rs           # FROZEN: per-fingerer modifiers, Green Coin pity counter
+    ├── v3.rs           # FROZEN once shipped: drops `goldens_since_green_coin`
     └── ...
 ```
 
@@ -101,6 +102,19 @@ The `aggregate: FingererAggregate` cache on `FingererState` is `#[serde(skip)]` 
 
 The `Buff` enum (`src/game/state.rs`) is now click-side only (`ClickFrenzy`). Anything that targets a specific fingerer is a `Modifier`, not a `Buff` — Purple Coin (Buff golden), Green Coin, future Blizzard / RedCoin / etc. The V1→V2 migration absorbs in-flight `BuffV1::FingererBoost` entries into per-fingerer modifiers.
 
+## Powerup system
+
+All on-screen powerups (Lucky / Frenzy / Buff / GreenCoin) live in a single `Vec<Powerup>` on `GameState` keyed by `PowerupKind`. `Powerup` carries a stable `spawn_id: u64` minted from `GameState::next_spawn_id`; click hit-test and the `g` hotkey reference instances by id, never by Vec index. The Vec is unbounded — multiple of any kind can coexist on screen and pile-ups self-resolve via the short (~11s) lifetime.
+
+- **`PowerupKind` is the only discriminator.** Per-kind config (`lifetime_ticks`, `mean_cooldown_ticks`, render palette) lives as methods on the enum; the `Buff::ClickFrenzy` click buff is the only thing that's still a `Buff`. There is no separate `GoldenVariant` or `GreenCoin` type — the kind is the whole story.
+- **`mean_cooldown_ticks(kind)` is the single tuning knob.** Raise to make the kind rarer, lower to see it more often. `min_cooldown_ticks` (5s) and `max_cooldown_ticks` (4×mean) are safety rails on the truncated-exponential sampler in `powerup::next_cooldown`, not gameplay knobs.
+- **Cooldowns are sampled inter-arrival, not rolled per tick.** One RNG draw per spawn (~25 ns). Per-kind clocks tick independently; cooldown does NOT freeze when the kind already has on-screen instances.
+- **Spawns are dispersed**: `sim::pick_dispersed_frac` retries up to 8 times to keep a new powerup ≥ 5% of the biscuit away from existing ones, then accepts a plain-random position (best-effort, not a spatial index). Slight overlap is fine; exact overlap is rejected.
+- **Stacking is unrestricted.** Two Buff catches on one fingerer = `MulFactor(7)² = ×49` for the duration; three = ×343. Multiple Green Coins on one tier sum (+10% each). The modifier system already supports it; we don't add caps. Big numbers are the genre.
+- **Adding a new kind is a single-file change.** Append a variant to `PowerupKind`, add `lifetime_ticks` / `mean_cooldown_ticks` arms, add a render-palette arm in `src/ui/biscuit.rs::powerup_palette`, and add a catch-effect arm in `GameState::catch_powerup`. No new `Action`, no new slot, no new rect array — input routing and tick/spawn loops inherit the new kind unchanged.
+
+The `goldens_since_green_coin` pity counter died with V3 — every kind (including GreenCoin) now uses the same per-kind cooldown mechanism. Truncation in `next_cooldown` already prevents pathological droughts; if we ever miss the "ramp-up after droughts" feel we can re-introduce it as a layered effect on `next_cooldown(GreenCoin)`.
+
 ## Debug pane policy
 
 Any new feature whose trigger depends on RNG, time, or other non-input signal **must** ship with a corresponding F-key in `src/ui/debug_pane.rs::DEBUG_KEYS` that forces the event in dev builds. Gate every dev hotkey behind `is_dev_build() && !cli.no_debug`, same as F2/F3/F4/F5/F8.
@@ -111,11 +125,13 @@ Current dev hotkeys:
 
 | Key | Action |
 |-----|--------|
-| F8  | Spawn Lucky Golden  *(F1 is hijacked by browsers for Help)* |
-| F2  | Spawn Frenzy Golden |
-| F3  | Spawn Buff Golden (Purple Coin → x7 fingerer modifier) |
+| F8  | Force-spawn Lucky powerup  *(F1 is hijacked by browsers for Help)* |
+| F2  | Force-spawn Frenzy powerup |
+| F3  | Force-spawn Buff powerup (Purple Coin → x7 fingerer modifier) |
 | F4  | +1M cuques |
-| F5  | Spawn Green Coin |
+| F5  | Force-spawn Green Coin (permanent +10% on a visible fingerer) |
+
+Each F-key pushes a fresh `Powerup` onto `state.powerups` regardless of how many of that kind are already on screen — pressing F8 twice in a row produces two Lucky's, which is the headline behavior of the Vec-based refactor.
 
 When adding a new key, update both `DEBUG_KEYS` (the rendered list) and the corresponding `KeyCode::F(N)` arm in `src/input.rs`. The two must stay aligned — the pane is the single source of truth for what's advertised.
 
@@ -230,12 +246,11 @@ src/
 │   ├── modifier.rs      # Modifier / Effect / Duration / Source / FingererAggregate
 │   ├── upgrade.rs       # 34 upgrades across tiers
 │   ├── achievement.rs
-│   ├── golden.rs        # Golden Cuque: Lucky | Frenzy | Buff
-│   └── green_coin.rs    # Green Coin: rare powerup, +10% permanent on catch
+│   └── powerup.rs       # PowerupKind (Lucky/Frenzy/Buff/GreenCoin) + truncated-exponential cooldown sampler
 └── ui/
     ├── mod.rs           # top-level draw, HUD title w/ version + (dev)
     ├── border.rs        # casino-style animated border
-    ├── biscuit.rs       # the ASCII ass + draw_golden + draw_green_coin
+    ├── biscuit.rs       # the ASCII ass + draw_powerup (unified across kinds)
     ├── hands.rs         # colored rings of fingerers
     ├── sidebar.rs, stats.rs, upgrades.rs, prestige.rs, achievements.rs, effects.rs
     └── debug_pane.rs    # F-key cheats overlay, dev-only

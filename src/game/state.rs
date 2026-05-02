@@ -6,11 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::game::achievement::ACHIEVEMENTS;
 use crate::game::fingerer::{self, FINGERERS};
-use crate::game::golden::GoldenCuque;
-use crate::game::green_coin::GreenCoin;
 use crate::game::modifier::{
     FingererAggregate, Modifier, ModifierDuration, ModifierEffect, ModifierSource,
 };
+use crate::game::powerup::{self, N_KINDS, Powerup, PowerupKind};
 use crate::game::upgrade::{UPGRADES, UpgradeEffect};
 
 pub const TICK_HZ: u32 = 20;
@@ -67,7 +66,7 @@ pub enum ParticleKind {
 }
 
 /// Position is stored as a fraction of the biscuit rect ([0.0, 1.0] on each
-/// axis), matching `GoldenCuque`. The renderer resolves these fractions
+/// axis), matching `Powerup`. The renderer resolves these fractions
 /// against the *current* biscuit rect every frame, so particles travel with
 /// the biscuit when the terminal resizes or the user zooms.
 #[derive(Clone)]
@@ -240,12 +239,6 @@ pub struct GameState {
     pub total_play_ticks: u64,
     #[serde(default)]
     pub buffs: Vec<Buff>,
-    /// Green Coin pity counter. Increments on every regular Golden spawn,
-    /// drives a `rng < counter * 0.01` roll for an alongside Green Coin
-    /// spawn, and resets the moment a Green Coin appears. Persisted so the
-    /// pity timer survives quit/restart.
-    #[serde(default)]
-    pub goldens_since_green_coin: u32,
 
     #[serde(skip)]
     pub clench_ticks: u32,
@@ -256,27 +249,28 @@ pub struct GameState {
     /// MISSED the biscuit, including the dead zone at low zoom).
     #[serde(skip)]
     pub misclick_particles: Vec<MisclickParticle>,
-    /// Per-variant Golden Cuque slots — `goldens[GoldenVariant::Lucky as usize]`
-    /// holds the on-screen Lucky, etc. Each variant has its own independent
-    /// slot AND its own independent cooldown so spawn timing is fully
-    /// desynchronized — Lucky's clock doesn't gate Frenzy's, and a Buff
-    /// expiring doesn't reset Lucky's cooldown.
+    /// All currently on-screen powerups, regardless of kind. Multiple of
+    /// any kind can coexist — the spawn side has no per-kind slot cap.
+    /// Each entry carries a stable `spawn_id`; click hit-test and the `g`
+    /// hotkey reference instances by id, never by Vec index. Not
+    /// persisted: closing and reopening the game shouldn't preserve frozen
+    /// powerup frames.
     #[serde(skip)]
-    pub goldens: [Option<GoldenCuque>; 3],
-    /// Per-variant spawn cooldowns, indexed the same as `goldens`. Each
-    /// freezes while its own slot is occupied (no point counting down
-    /// when there's nowhere to spawn) and rolls a fresh value on
-    /// catch/expiry. Initial values come from `next_cooldown()` in
-    /// `Default`, which already randomizes them so no two variants
-    /// arrive at zero simultaneously on a fresh save.
+    pub powerups: Vec<Powerup>,
+    /// Monotonic counter that mints `Powerup::spawn_id`. Session-scoped
+    /// (re-seeded to 0 on every load) — ids only need to be stable within
+    /// a single live state, not across restarts.
     #[serde(skip)]
-    pub golden_cooldowns: [u32; 3],
-    /// On-screen Green Coin, if one is currently visible. Lifetime ticked
-    /// down by `tick_green_coin`; cleared on catch or expiry. Not persisted
-    /// (parallel to `golden`) — closing and reopening the game shouldn't
-    /// preserve a frozen coin frame.
+    pub next_spawn_id: u64,
+    /// Per-kind inter-arrival cooldown clocks, indexed by `kind as usize`.
+    /// Each ticks down independently and rolls fresh from
+    /// `powerup::next_cooldown(kind)` on every spawn (including
+    /// force-spawns from the dev cheats). Doesn't freeze when the kind
+    /// already has on-screen instances — pile-ups self-resolve via the
+    /// short lifetime, so the only cost is "another marker on screen for
+    /// 11s".
     #[serde(skip)]
-    pub green_coin: Option<GreenCoin>,
+    pub powerup_cooldowns: [u32; N_KINDS],
     #[serde(skip)]
     pub session_ticks: u64,
     /// Queue of achievement ids that unlocked but haven't yet been shown as a
@@ -415,6 +409,9 @@ pub const GREEN_COIN_FLASH_TICKS: u32 = 50; // 2.5s at 20Hz
 /// to track from the floating `+10% {fingerer}` particle over to the
 /// row, short enough that it doesn't outlive the catch event.
 pub const GREEN_COIN_ROW_FLASH_TICKS: u32 = TICK_HZ * 2; // 2.0s at 20Hz
+/// Permanent AddPercent the Green Coin attaches on catch. Tunable; bumping
+/// it changes the long-term power curve significantly so treat with care.
+pub const GREEN_COIN_ADD_PERCENT: f64 = 0.10;
 
 /// Serde default for `GameState::version`. A direct deserialize of the live
 /// `GameState` from a pre-versioned save (one without the field) still
@@ -443,17 +440,18 @@ impl Default for GameState {
             prestige: 0,
             total_play_ticks: 0,
             buffs: Vec::new(),
-            goldens_since_green_coin: 0,
             clench_ticks: 0,
             particles: Vec::new(),
             misclick_particles: Vec::new(),
-            goldens: [None, None, None],
-            golden_cooldowns: [
-                crate::game::golden::next_cooldown(),
-                crate::game::golden::next_cooldown(),
-                crate::game::golden::next_cooldown(),
-            ],
-            green_coin: None,
+            powerups: Vec::new(),
+            next_spawn_id: 0,
+            powerup_cooldowns: {
+                let mut cds = [0u32; N_KINDS];
+                for kind in PowerupKind::ALL {
+                    cds[kind as usize] = powerup::next_cooldown(kind);
+                }
+                cds
+            },
             session_ticks: 0,
             newly_unlocked: Vec::new(),
             active_unlock_id: None,
@@ -540,12 +538,14 @@ impl GameState {
                 })
                 .collect();
         }
-        // Re-seed any cooldown left at 0 by an old save shape (the array
-        // is `#[serde(skip)]` so it's already at default; this is a
-        // defensive guard).
-        for cd in self.golden_cooldowns.iter_mut() {
-            if *cd == 0 {
-                *cd = crate::game::golden::next_cooldown();
+        // Re-seed any per-kind cooldown left at 0 (the array is
+        // `#[serde(skip)]` so it's already at default after deserialize;
+        // this is a defensive guard against saves that walked through an
+        // older shape that had per-cooldown layout drift).
+        for kind in PowerupKind::ALL {
+            let i = kind as usize;
+            if self.powerup_cooldowns[i] == 0 {
+                self.powerup_cooldowns[i] = powerup::next_cooldown(kind);
             }
         }
         // Seed the count-up tween at the live values so a freshly-loaded save
@@ -814,30 +814,35 @@ impl GameState {
         self.cuques_flash_ticks = HUD_FLASH_TICKS;
     }
 
-    /// Catch the Golden Cuque of the given variant if one is currently
-    /// on screen. Applies the variant-specific effect, increments
-    /// `golden_caught` + the per-variant counter, re-rolls the shared
-    /// spawn cooldown, and returns the flat reward (0.0 for non-Lucky).
+    /// Mint a fresh, monotonic spawn id. Session-scoped — wraps around at
+    /// `u64::MAX` (would take ~5 trillion years at one spawn per nanosecond,
+    /// so wrap collision isn't a real concern).
+    pub fn mint_spawn_id(&mut self) -> u64 {
+        let id = self.next_spawn_id;
+        self.next_spawn_id = self.next_spawn_id.wrapping_add(1);
+        id
+    }
+
+    /// Catch the powerup with the given `spawn_id`, if it's still on
+    /// screen. Applies the kind-specific effect, increments
+    /// `golden_caught` (lifetime grand total — keeps the existing
+    /// achievements working) plus the per-kind counter, and returns the
+    /// flat reward (only Lucky is non-zero).
     ///
-    /// Each variant lives in its own slot of `state.goldens`, so catching
-    /// e.g. a Lucky never disturbs an active Frenzy or Buff. Same applies
-    /// to expiry / cheat spawns.
+    /// The Vec is unbounded; multiple powerups of the same kind can
+    /// coexist. Catching one never disturbs the others — `swap_remove`
+    /// is fine because input routes by `spawn_id`, not by Vec index.
     ///
-    /// The `Buff` variant attaches a `MulFactor(7.0)` modifier with a
-    /// 60-second `Ticks` duration on a random owned fingerer, sourced as
-    /// `PurpleCoin`. Pre-#21 this was a global `Buff::FingererBoost`; the
-    /// modifier system replaces it.
-    pub fn catch_golden(&mut self, variant: crate::game::golden::GoldenVariant) -> f64 {
-        use crate::game::golden::GoldenVariant;
-        let Some(golden) = self.goldens[variant as usize].take() else {
+    /// Per-kind cooldown is NOT touched here — it ticks independently
+    /// from spawns; a catch just removes the on-screen instance.
+    pub fn catch_powerup(&mut self, spawn_id: u64) -> f64 {
+        let Some(idx) = self.powerups.iter().position(|p| p.spawn_id == spawn_id) else {
             return 0.0;
         };
+        let p = self.powerups.swap_remove(idx);
         self.golden_caught += 1;
-        // Reset only THIS variant's cooldown — sibling variants keep their
-        // own clocks running on independent schedules.
-        self.golden_cooldowns[variant as usize] = crate::game::golden::next_cooldown();
-        let (reward, label) = match golden.variant {
-            GoldenVariant::Lucky => {
+        let (reward, label) = match p.kind {
+            PowerupKind::Lucky => {
                 self.lucky_caught += 1;
                 let fps = self.fps();
                 let r = (fps * GOLDEN_REWARD_SECONDS).max(GOLDEN_REWARD_FLAT);
@@ -846,7 +851,7 @@ impl GameState {
                 self.cuques_flash_ticks = HUD_FLASH_TICKS;
                 (r, format!("+{}", crate::format::big(r)))
             }
-            GoldenVariant::Frenzy => {
+            PowerupKind::Frenzy => {
                 self.frenzy_caught += 1;
                 let dur = TICK_HZ * 13;
                 self.buffs.push(Buff::ClickFrenzy {
@@ -856,27 +861,62 @@ impl GameState {
                 });
                 (0.0, "FRENZY x777!".into())
             }
-            GoldenVariant::Buff => {
+            PowerupKind::Buff => {
                 self.buff_caught += 1;
                 let dur = TICK_HZ * 60;
                 let m = Modifier {
-                    source: crate::game::modifier::ModifierSource::PurpleCoin,
-                    effects: vec![crate::game::modifier::ModifierEffect::MulFactor(7.0)],
+                    source: ModifierSource::PurpleCoin,
+                    effects: vec![ModifierEffect::MulFactor(7.0)],
                     duration: ModifierDuration::Ticks(dur),
                     created_at_tick: self.total_play_ticks,
                 };
                 // Fall back to the first catalog tier if the player owns
-                // nothing yet — same defensive behavior the legacy buff had.
+                // nothing yet — same defensive behavior the legacy buff
+                // had: a x7 mul on count=0 is wasted, so just attach
+                // somewhere visible to keep the modifier system honest.
                 if self.attach_modifier_random_owned(m.clone()).is_none() {
                     let pick = FINGERERS[0].id;
                     self.attach_modifier(pick, m);
                 }
                 (0.0, "BOOSTED x7!".into())
             }
+            PowerupKind::GreenCoin => {
+                self.green_coin_caught += 1;
+                self.green_coin_flash_ticks = GREEN_COIN_FLASH_TICKS;
+                let m = Modifier {
+                    source: ModifierSource::GreenCoin,
+                    effects: vec![ModifierEffect::AddPercent(GREEN_COIN_ADD_PERCENT)],
+                    duration: ModifierDuration::Permanent,
+                    created_at_tick: self.total_play_ticks,
+                };
+                // Visible-set targeting: a permanent +10% can land on a
+                // sidebar-visible tier the player hasn't bought yet, so
+                // they get a head start when they finally afford it.
+                let chosen = self.attach_modifier_random_visible(m);
+                let label = match &chosen {
+                    Some(id) => {
+                        let idx = FINGERERS.iter().position(|f| f.id == id);
+                        if let Some(i) = idx
+                            && let Some(slot) = self.fingerer_green_coin_flash.get_mut(i)
+                        {
+                            *slot = GREEN_COIN_ROW_FLASH_TICKS;
+                        }
+                        let name = idx
+                            .and_then(|i| crate::i18n::t().fingerer_names.get(i).copied())
+                            .unwrap_or("?");
+                        format!("+10% {}", name)
+                    }
+                    // No visible fingerer to host the boost — show a
+                    // neutral marker. With Index Finger always visible this
+                    // is unreachable in practice.
+                    None => "+10% ???".to_string(),
+                };
+                (0.0, label)
+            }
         };
         self.particles.push(Particle {
-            frac_x: golden.frac_x,
-            frac_y: golden.frac_y,
+            frac_x: p.frac_x,
+            frac_y: p.frac_y,
             life: PARTICLE_LIFE * 2,
             text: label,
             kind: ParticleKind::Golden,
@@ -975,15 +1015,13 @@ impl GameState {
         self.visual_debt = 0.0;
         self.particles.clear();
         self.misclick_particles.clear();
-        self.goldens = [None, None, None];
-        self.green_coin = None;
-        // Pity counter resets too — the new run earns its own Green Coins.
-        self.goldens_since_green_coin = 0;
+        self.powerups.clear();
+        self.next_spawn_id = 0;
         self.clench_ticks = 0;
-        // Fresh per-variant cooldowns so the new run has its own
-        // independent rhythm from tick 1.
-        for cd in self.golden_cooldowns.iter_mut() {
-            *cd = crate::game::golden::next_cooldown();
+        // Fresh per-kind cooldowns so the new run has its own independent
+        // rhythm from tick 1.
+        for kind in PowerupKind::ALL {
+            self.powerup_cooldowns[kind as usize] = powerup::next_cooldown(kind);
         }
         true
     }
@@ -1189,102 +1227,24 @@ impl GameState {
         }
     }
 
-    pub fn tick_golden(&mut self) {
-        // Each variant ages on its own clock. Lifetime ticks down per
-        // slot; on expiry, that slot's cooldown rolls fresh. Cooldown
-        // ticks down only when its variant's slot is empty — no point
-        // counting down to zero while there's nowhere to spawn.
-        for i in 0..self.goldens.len() {
-            if let Some(g) = self.goldens[i].as_mut() {
-                if g.life_ticks == 0 {
-                    self.goldens[i] = None;
-                    self.golden_cooldowns[i] = crate::game::golden::next_cooldown();
-                } else {
-                    g.life_ticks -= 1;
-                }
-            } else if self.golden_cooldowns[i] > 0 {
-                self.golden_cooldowns[i] -= 1;
-            }
-        }
-    }
-
-    /// Lifetime tick for the Green Coin (mirror of `tick_golden`'s coin
-    /// half — Green Coin has no cooldown of its own; spawning is gated on
-    /// regular Golden spawns instead). Decrements `life_ticks` each call,
-    /// clears the slot when it hits 0.
-    pub fn tick_green_coin(&mut self) {
-        if let Some(g) = self.green_coin.as_mut() {
-            if g.life_ticks == 0 {
-                self.green_coin = None;
+    /// Tick every on-screen powerup down by one frame and decrement every
+    /// per-kind cooldown. Expired entries (those that just hit 0) are
+    /// dropped in place via `retain_mut`. Cooldowns tick **independently**
+    /// of on-screen instances — multiple of the same kind can coexist, so
+    /// freezing the clock while occupied would block the parallelism this
+    /// refactor exists to enable.
+    pub fn tick_powerups(&mut self) {
+        self.powerups.retain_mut(|p| {
+            if p.life_ticks == 0 {
+                false
             } else {
-                g.life_ticks -= 1;
+                p.life_ticks -= 1;
+                true
             }
-        }
-    }
-
-    /// Catch the on-screen Green Coin if any. Picks a random owned fingerer
-    /// (`count > 0`) and attaches a permanent `+10%` `AddPercent` modifier
-    /// sourced as `GreenCoin`. Returns `true` if a coin was consumed (catch
-    /// or no-op miss because nothing was owned), `false` if there was no
-    /// coin to catch in the first place.
-    ///
-    /// Edge case: if the player owns nothing yet, the coin is consumed but
-    /// no modifier attaches — same defensive behavior as the old Buff
-    /// golden when the catalog was empty. The +10% had nothing to land on.
-    pub fn catch_green_coin(&mut self) -> bool {
-        let Some(g) = self.green_coin.take() else {
-            return false;
-        };
-        let m = Modifier {
-            source: ModifierSource::GreenCoin,
-            effects: vec![ModifierEffect::AddPercent(
-                crate::game::green_coin::GREEN_COIN_ADD_PERCENT,
-            )],
-            duration: ModifierDuration::Permanent,
-            created_at_tick: self.total_play_ticks,
-        };
-        // Visible-set targeting: a permanent +10% can land on a sidebar-
-        // visible tier the player hasn't bought yet, so they get a head
-        // start when they finally afford it. (Buff golden uses
-        // `attach_modifier_random_owned` instead, since its temp x7 only
-        // matters on a tier with non-zero count.)
-        let chosen = self.attach_modifier_random_visible(m);
-        // Counts toward both the all-time rollup and the dedicated
-        // Green Coin counter (V3+). Achievements that gate on
-        // `golden_caught` (e.g. "Golden Touch") still fire because the
-        // rollup keeps incrementing.
-        self.golden_caught += 1;
-        self.green_coin_caught += 1;
-        self.green_coin_flash_ticks = GREEN_COIN_FLASH_TICKS;
-        // Visual feedback: a "+10% <fingerer>" particle anchored at the
-        // coin's position + a gold sidebar-row shimmer on the targeted
-        // tier (closes the loop between the floating particle and the
-        // sidebar badge that just gained another +10%).
-        let label = match &chosen {
-            Some(id) => {
-                let idx = FINGERERS.iter().position(|f| f.id == id);
-                if let Some(i) = idx
-                    && let Some(slot) = self.fingerer_green_coin_flash.get_mut(i)
-                {
-                    *slot = GREEN_COIN_ROW_FLASH_TICKS;
-                }
-                let name = idx
-                    .and_then(|i| crate::i18n::t().fingerer_names.get(i).copied())
-                    .unwrap_or("?");
-                format!("+10% {}", name)
-            }
-            // No owned fingerer to host the boost — show a neutral marker.
-            None => "+10% ???".to_string(),
-        };
-        self.particles.push(Particle {
-            frac_x: g.frac_x,
-            frac_y: g.frac_y,
-            life: PARTICLE_LIFE * 2,
-            text: label,
-            kind: ParticleKind::Golden,
-            drift_x: 0.0,
         });
-        true
+        for cd in self.powerup_cooldowns.iter_mut() {
+            *cd = cd.saturating_sub(1);
+        }
     }
 
     pub fn trigger_clench(&mut self) {
@@ -1928,27 +1888,29 @@ mod tests {
         assert!((agg.add_percent - 0.25).abs() < 1e-9);
     }
 
-    // -- Green Coin ---------------------------------------------------------
+    // -- Powerups -----------------------------------------------------------
 
-    use crate::game::green_coin::{GREEN_COIN_LIFE_TICKS, GreenCoin};
+    use crate::game::powerup::{Powerup, PowerupKind};
 
-    fn fake_green_coin() -> GreenCoin {
-        GreenCoin {
+    fn fake_powerup(state: &mut GameState, kind: PowerupKind) -> u64 {
+        let id = state.mint_spawn_id();
+        state.powerups.push(Powerup {
+            kind,
+            spawn_id: id,
             frac_x: 0.5,
             frac_y: 0.5,
-            life_ticks: GREEN_COIN_LIFE_TICKS,
-        }
+            life_ticks: kind.lifetime_ticks(),
+        });
+        id
     }
 
     #[test]
     fn catch_green_coin_increments_grand_total_and_per_variant_counter() {
-        let mut s = GameState {
-            green_coin: Some(fake_green_coin()),
-            ..Default::default()
-        };
+        let mut s = GameState::default();
         s.fingerers_state
             .insert("index_finger".into(), fs_with_count(1));
-        assert!(s.catch_green_coin());
+        let id = fake_powerup(&mut s, PowerupKind::GreenCoin);
+        s.catch_powerup(id);
         assert_eq!(s.golden_caught, 1, "rollup increments");
         assert_eq!(s.green_coin_caught, 1, "per-variant increments");
         assert_eq!(s.lucky_caught, 0);
@@ -1961,12 +1923,11 @@ mod tests {
         let mut s = GameState::default();
         s.fingerers_state
             .insert("index_finger".into(), fs_with_count(3));
-        s.green_coin = Some(fake_green_coin());
+        let id = fake_powerup(&mut s, PowerupKind::GreenCoin);
 
-        let caught = s.catch_green_coin();
+        s.catch_powerup(id);
 
-        assert!(caught);
-        assert!(s.green_coin.is_none());
+        assert!(s.powerups.is_empty());
         let st = s.fingerers_state.get("index_finger").unwrap();
         assert_eq!(st.modifiers.len(), 1);
         let m = &st.modifiers[0];
@@ -1981,19 +1942,15 @@ mod tests {
 
     #[test]
     fn catch_green_coin_with_no_owned_lands_on_index_finger() {
-        // The visible-set targeting (vs the old owned-only) means even on a
-        // brand-new save, a Green Coin attaches somewhere — Index Finger is
-        // always visible (`idx == 0` short-circuits in `fingerer::visible`).
-        // The previous "consumes without attaching" no-op behavior is gone.
-        let mut s = GameState {
-            green_coin: Some(fake_green_coin()),
-            ..Default::default()
-        };
+        // Visible-set targeting means even on a brand-new save a Green Coin
+        // attaches somewhere — Index Finger is always visible (`idx == 0`
+        // short-circuits in `fingerer::visible`).
+        let mut s = GameState::default();
+        let id = fake_powerup(&mut s, PowerupKind::GreenCoin);
 
-        let caught = s.catch_green_coin();
+        s.catch_powerup(id);
 
-        assert!(caught);
-        assert!(s.green_coin.is_none());
+        assert!(s.powerups.is_empty());
         let st = s
             .fingerers_state
             .get(FINGERERS[0].id)
@@ -2004,11 +1961,6 @@ mod tests {
 
     #[test]
     fn attach_modifier_random_visible_can_pick_unowned_when_lifetime_unlocks_it() {
-        // Tier 1 (Whole Hand) has base_cost 100; visibility threshold is
-        // 0.5 * base_cost = 50. With lifetime_cuques == 60, Whole Hand is
-        // visible despite being unowned. Index Finger is always visible
-        // (idx == 0). The picker can land on either; with a deterministic
-        // seed we can't pin which, but the modifier lands SOMEWHERE.
         let mut s = GameState {
             lifetime_cuques: 60.0,
             ..Default::default()
@@ -2016,7 +1968,6 @@ mod tests {
         let m = perm_add_percent(0.10);
         let chosen = s.attach_modifier_random_visible(m);
         let id = chosen.expect("at least one visible fingerer always exists");
-        // Allowed targets at this lifetime: Index Finger + Whole Hand.
         let visible_ids: Vec<&str> = FINGERERS
             .iter()
             .enumerate()
@@ -2029,29 +1980,32 @@ mod tests {
     }
 
     #[test]
-    fn catch_green_coin_returns_false_when_no_coin() {
+    fn catch_powerup_returns_zero_when_id_unknown() {
         let mut s = GameState::default();
-        assert!(!s.catch_green_coin());
+        assert_eq!(s.catch_powerup(9_999), 0.0);
     }
 
     #[test]
-    fn tick_green_coin_decrements_lifetime_and_clears_at_zero() {
-        let mut s = GameState {
-            green_coin: Some(GreenCoin {
-                frac_x: 0.5,
-                frac_y: 0.5,
-                life_ticks: 2,
-            }),
-            ..Default::default()
-        };
-        s.tick_green_coin();
-        assert_eq!(s.green_coin.as_ref().unwrap().life_ticks, 1);
-        s.tick_green_coin();
-        // Now `life_ticks` is 0 but slot still occupied.
-        assert_eq!(s.green_coin.as_ref().unwrap().life_ticks, 0);
-        s.tick_green_coin();
-        // The next tick clears it (mirrors `tick_golden`'s convention).
-        assert!(s.green_coin.is_none());
+    fn tick_powerups_decrements_lifetime_and_drops_at_zero() {
+        let mut s = GameState::default();
+        let id = s.mint_spawn_id();
+        s.powerups.push(Powerup {
+            kind: PowerupKind::GreenCoin,
+            spawn_id: id,
+            frac_x: 0.5,
+            frac_y: 0.5,
+            life_ticks: 2,
+        });
+        // Mirrors the legacy `tick_golden` cadence: each tick decrements
+        // by 1; the entry survives the tick that brings life_ticks to 0,
+        // and the *next* tick drops it. Same convention the renderer
+        // relied on (one final visible frame before disappearance).
+        s.tick_powerups();
+        assert_eq!(s.powerups[0].life_ticks, 1);
+        s.tick_powerups();
+        assert_eq!(s.powerups[0].life_ticks, 0);
+        s.tick_powerups();
+        assert!(s.powerups.is_empty());
     }
 
     #[test]
@@ -2061,8 +2015,8 @@ mod tests {
         s.fingerers_state
             .insert("index_finger".into(), fs_with_count(1));
         for _ in 0..2 {
-            s.green_coin = Some(fake_green_coin());
-            s.catch_green_coin();
+            let id = fake_powerup(&mut s, PowerupKind::GreenCoin);
+            s.catch_powerup(id);
         }
         let st = s.fingerers_state.get("index_finger").unwrap();
         // RNG randomly picks the only owned fingerer both times.
@@ -2071,17 +2025,62 @@ mod tests {
     }
 
     #[test]
-    fn prestige_reset_clears_green_coin_state() {
+    fn prestige_reset_clears_powerup_state() {
         let mut s = GameState {
             lifetime_cuques: 1_000_000_000.0,
             ..Default::default()
         };
         s.fingerers_state
             .insert("index_finger".into(), fs_with_count(1));
-        s.goldens_since_green_coin = 7;
-        s.green_coin = Some(fake_green_coin());
+        let _ = fake_powerup(&mut s, PowerupKind::Lucky);
+        let _ = fake_powerup(&mut s, PowerupKind::GreenCoin);
         s.prestige_reset();
-        assert!(s.green_coin.is_none());
-        assert_eq!(s.goldens_since_green_coin, 0);
+        assert!(s.powerups.is_empty());
+        assert_eq!(s.next_spawn_id, 0);
+    }
+
+    #[test]
+    fn catch_powerup_only_removes_targeted_id() {
+        // Multiple powerups of mixed kinds coexist; catching one by id
+        // leaves the others untouched (no Vec-index aliasing).
+        let mut s = GameState::default();
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        let lucky_id = fake_powerup(&mut s, PowerupKind::Lucky);
+        let frenzy_id = fake_powerup(&mut s, PowerupKind::Frenzy);
+        let buff_id = fake_powerup(&mut s, PowerupKind::Buff);
+        s.catch_powerup(frenzy_id);
+        let remaining: Vec<u64> = s.powerups.iter().map(|p| p.spawn_id).collect();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&lucky_id));
+        assert!(remaining.contains(&buff_id));
+    }
+
+    #[test]
+    fn buff_stacks_multiplicatively_on_same_fingerer() {
+        // Two Buff catches on one fingerer = MulFactor 7² = 49 for the
+        // duration. The modifier system already supports this; assert at
+        // this layer that nothing in the catch path caps it.
+        let mut s = GameState::default();
+        s.fingerers_state
+            .insert("index_finger".into(), fs_with_count(1));
+        for _ in 0..2 {
+            let id = fake_powerup(&mut s, PowerupKind::Buff);
+            s.catch_powerup(id);
+        }
+        let st = s.fingerers_state.get("index_finger").unwrap();
+        assert_eq!(st.modifiers.len(), 2);
+        assert!((st.aggregate.mul_factor - 49.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mint_spawn_id_is_monotonic() {
+        let mut s = GameState::default();
+        let a = s.mint_spawn_id();
+        let b = s.mint_spawn_id();
+        let c = s.mint_spawn_id();
+        assert_eq!(a, 0);
+        assert_eq!(b, 1);
+        assert_eq!(c, 2);
     }
 }

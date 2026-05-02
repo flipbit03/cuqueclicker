@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use crate::game::achievement::ACHIEVEMENTS;
 use crate::game::fingerer;
 use crate::game::fingerer::FINGERERS;
-use crate::game::golden::{self, GoldenVariant};
+use crate::game::powerup::{self, Powerup, PowerupKind};
 use crate::game::state::{GameState, TICK_HZ};
 use crate::game::upgrade::UPGRADES;
 use crate::input::{
@@ -283,55 +283,44 @@ fn demo_driver_tick(
         }
     }
 
-    // Keep the screen busy with goldens: tighter cooldown than normal.
-    // Force the next-eligible variant slot's cooldown to a short value
-    // so the demo doesn't have to wait the natural per-variant rng.
-    let any_golden = state.goldens.iter().any(|g| g.is_some());
-    if !any_golden {
-        for cd in state.golden_cooldowns.iter_mut() {
-            if *cd == 0 {
-                *cd = DEMO_GOLDEN_COOLDOWN;
-            }
+    // Keep the screen busy with powerups: deterministically cycle
+    // Buff → Frenzy → Lucky on a tight cadence so the clip definitely
+    // catches each variant. Skip GreenCoin in the cycle — it's the
+    // rarest variant in real play, but the demo is short and the green
+    // catch shows up just fine via the natural Vec-based spawn path
+    // when its cooldown rolls in. We push directly so we don't have to
+    // race the cooldowns in `maybe_spawn_powerups`.
+    if state.powerups.is_empty() && (*demo_ticks).is_multiple_of(DEMO_GOLDEN_COOLDOWN as u64) {
+        let kind = match *demo_golden_spawns % 3 {
+            0 => PowerupKind::Buff,
+            1 => PowerupKind::Frenzy,
+            _ => PowerupKind::Lucky,
+        };
+        *demo_golden_spawns += 1;
+        let r = geom.biscuit;
+        if r.width >= 8 && r.height >= 5 {
+            let spawn_id = state.mint_spawn_id();
+            state.powerups.push(Powerup {
+                kind,
+                spawn_id,
+                frac_x: 0.5,
+                frac_y: 0.4,
+                life_ticks: kind.lifetime_ticks(),
+            });
         }
     }
 
-    // Force the variant on freshly-spawned goldens so the clip deterministically
-    // cycles Buff → Frenzy → Lucky. Buff comes first so a viewer definitely
-    // sees the purple powerup. After spawn we MOVE the slot to the
-    // chosen variant's index so the rest of the game's per-variant
-    // routing keeps working.
-    for slot_idx in 0..state.goldens.len() {
-        if let Some(g) = state.goldens[slot_idx].as_ref()
-            && g.life_ticks == golden::GOLDEN_LIFE_TICKS
-        {
-            let target = match *demo_golden_spawns % 3 {
-                0 => GoldenVariant::Buff,
-                1 => GoldenVariant::Frenzy,
-                _ => GoldenVariant::Lucky,
-            };
-            *demo_golden_spawns += 1;
-            if slot_idx != target as usize {
-                let mut g = state.goldens[slot_idx].take().unwrap();
-                g.variant = target;
-                state.goldens[target as usize] = Some(g);
-            } else if let Some(g) = state.goldens[slot_idx].as_mut() {
-                g.variant = target;
-            }
-            break;
-        }
-    }
-
-    // Auto-catch whatever golden has been on screen long enough so the
-    // marker is actually visible before disappearing. Iterate every
-    // variant slot independently.
-    for variant in GoldenVariant::ALL {
-        let alive = state.goldens[variant as usize]
-            .as_ref()
-            .map(|g| g.life_ticks + 20 < golden::GOLDEN_LIFE_TICKS)
-            .unwrap_or(false);
-        if alive {
-            state.catch_golden(variant);
-        }
+    // Auto-catch any powerup that's been on screen long enough so the
+    // marker reads on camera before disappearing. Iterate by spawn_id
+    // so a swap_remove inside the loop doesn't trip us up.
+    let to_catch: Vec<u64> = state
+        .powerups
+        .iter()
+        .filter(|p| p.life_ticks + 20 < p.kind.lifetime_ticks())
+        .map(|p| p.spawn_id)
+        .collect();
+    for id in to_catch {
+        state.catch_powerup(id);
     }
 
     // Every ~4s, buy 1-2 of a random affordable fingerer.
@@ -481,11 +470,11 @@ pub fn build_demo_state() -> GameState {
         total_play_ticks: 3600 * TICK_HZ as u64, // pretend we've been at this an hour
         prestige: 3,
         golden_caught: 7,
-        // Default is a random 20-80s wait per slot; force all to 0 so the
-        // first demo golden (a Buff, per the cycle in demo_driver_tick)
-        // spawns on tick 1 — the purple powerup lands well within the
-        // first few seconds of the clip.
-        golden_cooldowns: [0; 3],
+        // Default seeds each per-kind cooldown from a fresh exponential
+        // sample (60-240s mean depending on kind). For the demo we zero
+        // them all so the first powerup (a Buff, per the cycle in
+        // demo_driver_tick) lands well within the first few seconds.
+        powerup_cooldowns: [0; powerup::N_KINDS],
         best_fps: 50_000.0,
         ..GameState::default()
     };
