@@ -191,12 +191,21 @@ fn maybe_spawn_auto_particle(state: &mut GameState, geom: &SimGeometry) {
 /// marker geometry.
 const SPAWN_INSET_X: f32 = 0.08;
 const SPAWN_INSET_Y: f32 = 0.10;
-/// Minimum biscuit-fractional distance between two on-screen powerups.
-/// Slight overlap is acceptable visually; *exact* overlap loses the
-/// parallelism feature (two markers in one cell read as one). 5% of the
-/// biscuit dimension is empirically enough that the 5×3 markers stay
-/// distinguishable.
-const POWERUP_MIN_DIST: f32 = 0.05;
+/// Minimum cell-space distance between two on-screen powerup centers,
+/// measured in biscuit-cell units (NOT fractional units). The 5×3 marker
+/// is 5 cells wide and 3 tall, so a 4-cell minimum keeps two markers
+/// from sharing any of their interior cells while still allowing tight
+/// neighbors that read as distinct.
+const POWERUP_MIN_CELL_DIST: f32 = 4.0;
+/// Approximate biscuit cell aspect ratio (width / height of a terminal
+/// cell). Most monospace fonts render cells ~2× taller than wide; the
+/// FULL biscuit's bounding box is ~60×30 (cell ratio 2:1), MEDIUM is
+/// 40×18 (~2.2:1), TINY is 16×8 (2:1). Using 2.0 here keeps the
+/// dispersion check working in cell space, so the same fractional gap
+/// in `frac_y` covers more visual cells than in `frac_x` — without this
+/// correction, two markers separated only vertically would read as
+/// overlapping while passing the dispersion filter.
+const BISCUIT_CELL_ASPECT: f32 = 2.0;
 /// Best-effort retry budget for dispersion. Eight tries is plenty when the
 /// Vec is short (the expected ~0.2 concurrent per kind average); on a
 /// pile-up the fall-through to plain-random keeps the spawn happening
@@ -207,15 +216,28 @@ const POWERUP_DISPERSION_TRIES: u32 = 8;
 /// existing powerup in `existing`. Best-effort: up to
 /// `POWERUP_DISPERSION_TRIES` retries, then accept a plain-random position
 /// (acceptable to the issue spec — exact overlap is rare in practice).
-fn pick_dispersed_frac(existing: &[Powerup]) -> (f32, f32) {
+///
+/// `biscuit_cells` is `(width, height)` of the live biscuit rect. The
+/// dispersion check works in CELL SPACE — `dx_cells² + dy_cells² ≥
+/// POWERUP_MIN_CELL_DIST²` — because the biscuit is roughly 2:1 in cell
+/// aspect (terminal cells are ~2× tall as wide), and a pure-fractional
+/// distance would over-allow vertical overlap.
+fn pick_dispersed_frac(existing: &[Powerup], biscuit_cells: (u16, u16)) -> (f32, f32) {
+    let (bw, bh) = biscuit_cells;
+    let bw = bw.max(1) as f32;
+    let bh = bh.max(1) as f32;
+    let min_sq = POWERUP_MIN_CELL_DIST * POWERUP_MIN_CELL_DIST;
     let mut rng = rand::rng();
     for _ in 0..POWERUP_DISPERSION_TRIES {
         let fx = rng.random_range(SPAWN_INSET_X..=(1.0 - SPAWN_INSET_X));
         let fy = rng.random_range(SPAWN_INSET_Y..=(1.0 - SPAWN_INSET_Y));
         let too_close = existing.iter().any(|p| {
-            let dx = p.frac_x - fx;
-            let dy = p.frac_y - fy;
-            (dx * dx + dy * dy).sqrt() < POWERUP_MIN_DIST
+            // Convert fractional deltas to cell-space deltas. Y is
+            // multiplied by BISCUIT_CELL_ASPECT to compensate for the
+            // tall terminal cell — one row visually equals ~2 cols.
+            let dx_cells = (p.frac_x - fx) * bw;
+            let dy_cells = (p.frac_y - fy) * bh * BISCUIT_CELL_ASPECT;
+            dx_cells * dx_cells + dy_cells * dy_cells < min_sq
         });
         if !too_close {
             return (fx, fy);
@@ -230,6 +252,7 @@ fn maybe_spawn_powerups(state: &mut GameState, geom: &SimGeometry) {
     if geom.biscuit.width < 8 || geom.biscuit.height < 5 {
         return;
     }
+    let cells = (geom.biscuit.width, geom.biscuit.height);
     // Each kind runs on its own clock. Cooldown is reset to a fresh
     // exponential sample on every spawn (regardless of how many of the
     // same kind are already on screen — the parallelism is the whole
@@ -240,7 +263,7 @@ fn maybe_spawn_powerups(state: &mut GameState, geom: &SimGeometry) {
         if state.powerup_cooldowns[i] > 0 {
             continue;
         }
-        spawn_powerup(state, kind);
+        spawn_powerup(state, kind, cells);
         state.powerup_cooldowns[i] = powerup::next_cooldown(kind);
     }
 }
@@ -248,17 +271,26 @@ fn maybe_spawn_powerups(state: &mut GameState, geom: &SimGeometry) {
 /// Push a fresh powerup of `kind` onto `state.powerups`. Position is
 /// picked with the dispersion helper so back-to-back spawns don't land in
 /// the exact same cell. Cooldown management is the caller's responsibility
-/// (`maybe_spawn_powerups` resets the kind's clock; the dev cheats don't,
-/// so pressing F8 twice in quick succession really does push two Lucky's).
-fn spawn_powerup(state: &mut GameState, kind: PowerupKind) {
-    let (frac_x, frac_y) = pick_dispersed_frac(&state.powerups);
+/// (`maybe_spawn_powerups` resets the kind's clock; the dev cheats don't —
+/// pressing F8 twice in quick succession really does push two Lucky's, AND
+/// the natural Lucky cooldown keeps ticking down independently, so a dev
+/// spawn followed shortly by a natural spawn is expected and intentional).
+fn spawn_powerup(state: &mut GameState, kind: PowerupKind, biscuit_cells: (u16, u16)) {
+    // Defensive: every spawn site uses the kind's full lifetime. If a
+    // future caller passes a Powerup with `life_ticks: 0` directly,
+    // `tick_powerups` would still drop it on the next tick — but the
+    // marker would briefly render at near-zero life, hitting the
+    // alarm-mode shimmer immediately. Catch that misuse here.
+    let life_ticks = kind.lifetime_ticks();
+    debug_assert!(life_ticks > 0, "PowerupKind::lifetime_ticks must be > 0");
+    let (frac_x, frac_y) = pick_dispersed_frac(&state.powerups, biscuit_cells);
     let spawn_id = state.mint_spawn_id();
     state.powerups.push(Powerup {
         kind,
         spawn_id,
         frac_x,
         frac_y,
-        life_ticks: kind.lifetime_ticks(),
+        life_ticks,
     });
 }
 
@@ -272,7 +304,7 @@ fn force_spawn_powerup(state: &mut GameState, geom: &SimGeometry, kind: PowerupK
     if geom.biscuit.width < 8 || geom.biscuit.height < 5 {
         return;
     }
-    spawn_powerup(state, kind);
+    spawn_powerup(state, kind, (geom.biscuit.width, geom.biscuit.height));
 }
 
 #[cfg(test)]
@@ -341,5 +373,55 @@ mod tests {
         // Allow a generous floor: dispersion fall-through can produce a
         // single near-overlap, but not zero.
         assert!(dist > 0.0, "two spawns landed at the exact same point");
+    }
+
+    #[test]
+    fn spawn_dispersion_keeps_cell_distance_in_typical_layout() {
+        // Statistical: across 1000 fresh-state pair spawns on a normal
+        // 60×30 biscuit, the cell-space distance between the two
+        // markers should clear `POWERUP_MIN_CELL_DIST` the vast
+        // majority of the time (only the fall-through path violates,
+        // and that fires once per ~8 retries × dense neighborhood,
+        // which is rare for a single existing point on a 50-cell-wide
+        // free area). Asserting a 90%+ pass rate is generous.
+        let mut clear = 0;
+        let trials = 1000;
+        let geom = SimGeometry {
+            biscuit: Rect::new(0, 0, 60, 30),
+        };
+        for _ in 0..trials {
+            let mut state = GameState::default();
+            force_spawn_powerup(&mut state, &geom, PowerupKind::Lucky);
+            force_spawn_powerup(&mut state, &geom, PowerupKind::Lucky);
+            let a = &state.powerups[0];
+            let b = &state.powerups[1];
+            let dx_cells = (a.frac_x - b.frac_x) * geom.biscuit.width as f32;
+            let dy_cells = (a.frac_y - b.frac_y) * geom.biscuit.height as f32 * BISCUIT_CELL_ASPECT;
+            let cell_dist = (dx_cells * dx_cells + dy_cells * dy_cells).sqrt();
+            if cell_dist >= POWERUP_MIN_CELL_DIST {
+                clear += 1;
+            }
+        }
+        let ratio = clear as f32 / trials as f32;
+        assert!(
+            ratio > 0.90,
+            "expected ≥90% of pair spawns to clear cell distance; got {clear}/{trials} = {ratio}"
+        );
+    }
+
+    #[test]
+    fn spawn_dispersion_handles_tiny_biscuit_without_panic() {
+        // Edge case: at TINY zoom (16×8) the biscuit is barely large
+        // enough for the marker. The dispersion helper must not divide
+        // by zero or panic, even when the size guard in
+        // `maybe_spawn_powerups` would normally reject.
+        let mut state = GameState::default();
+        // Just above the size guard so force_spawn_powerup goes through.
+        let geom = SimGeometry {
+            biscuit: Rect::new(0, 0, 16, 8),
+        };
+        force_spawn_powerup(&mut state, &geom, PowerupKind::Lucky);
+        force_spawn_powerup(&mut state, &geom, PowerupKind::Frenzy);
+        assert_eq!(state.powerups.len(), 2);
     }
 }

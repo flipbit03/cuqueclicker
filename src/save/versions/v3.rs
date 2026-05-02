@@ -156,12 +156,20 @@ mod tests {
 
     #[test]
     fn v2_to_v3_drops_pity_counter() {
-        // V2 has the field; V3's struct shape doesn't, so any non-zero
-        // pity value just disappears. The rest of the persisted state
-        // must round-trip unchanged.
+        // V2 has `goldens_since_green_coin: 7`; the conversion must
+        // produce a V3 with no such field (verified by it not appearing
+        // in the V3 struct at all — the JSON round-trip below proves it
+        // doesn't sneak through serde) and stamp the new version.
         let v2 = empty_v2_with_pity(7);
         let v3: GameStateV3 = v2.into();
         assert_eq!(v3.version, 3);
+        // Round-trip through JSON to verify the pity field is gone from
+        // the on-disk form too — not just absent from the struct.
+        let json = serde_json::to_string(&v3).expect("serialize");
+        assert!(
+            !json.contains("goldens_since_green_coin"),
+            "pity counter must not appear in V3 JSON: {json}"
+        );
     }
 
     #[test]
@@ -227,11 +235,21 @@ mod tests {
     #[test]
     fn v3_into_current_zero_inits_powerup_runtime_fields() {
         // V3 doesn't persist any powerup-on-screen state; `into_current`
-        // must produce a live state whose `powerups` Vec is empty and
-        // whose `next_spawn_id` is 0.
+        // must produce a live state whose `powerups` Vec is empty,
+        // `next_spawn_id` is 0, and every per-kind cooldown is seeded
+        // with a non-zero value (via `Default` → `next_cooldown`).
+        // Catching the third one is important: a kind with cooldown=0
+        // would spawn on tick 1 instead of waiting out an exponential
+        // sample.
         let v3 = empty_v2_with_pity(0).into();
         let live = GameStateV3::into_current(v3);
         assert!(live.powerups.is_empty());
         assert_eq!(live.next_spawn_id, 0);
+        for (i, &cd) in live.powerup_cooldowns.iter().enumerate() {
+            assert!(
+                cd > 0,
+                "powerup_cooldowns[{i}] must be seeded non-zero by Default, got {cd}"
+            );
+        }
     }
 }

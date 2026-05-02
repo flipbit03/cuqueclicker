@@ -47,6 +47,13 @@ pub enum PowerupKind {
 /// Used to size `GameState::powerup_cooldowns`.
 pub const N_KINDS: usize = 4;
 
+/// Compile-time guard against `N_KINDS` drifting out of sync with the
+/// `PowerupKind::ALL` array. If a new variant is added to `PowerupKind`
+/// and `ALL` is updated but `N_KINDS` isn't (or vice versa), the build
+/// fails here instead of producing silent index-out-of-bounds at runtime
+/// against `GameState::powerup_cooldowns: [u32; N_KINDS]`.
+const _: () = assert!(PowerupKind::ALL.len() == N_KINDS);
+
 impl PowerupKind {
     /// Stable iteration order. Mirrors discriminant order so
     /// `kind as usize` indexes into anything sized to `N_KINDS`.

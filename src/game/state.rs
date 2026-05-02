@@ -893,6 +893,19 @@ impl GameState {
                 // sidebar-visible tier the player hasn't bought yet, so
                 // they get a head start when they finally afford it.
                 let chosen = self.attach_modifier_random_visible(m);
+                // `attach_modifier_random_visible` is only `None` if the
+                // visible set is empty, which requires both an empty
+                // `FINGERERS` catalog AND `lifetime_cuques < 0.5 * cost`
+                // for every tier. Index Finger is always visible
+                // (`fingerer::visible` short-circuits on `idx == 0`), so
+                // as long as `FINGERERS` is non-empty (currently 10
+                // entries, asserted as a project invariant in CLAUDE.md)
+                // this branch can't fire. Fail loud in dev so we notice
+                // if that invariant ever shifts.
+                debug_assert!(
+                    chosen.is_some(),
+                    "Green Coin catch found no visible fingerer — Index Finger should always be visible"
+                );
                 let label = match &chosen {
                     Some(id) => {
                         let idx = FINGERERS.iter().position(|f| f.id == id);
@@ -906,9 +919,10 @@ impl GameState {
                             .unwrap_or("?");
                         format!("+10% {}", name)
                     }
-                    // No visible fingerer to host the boost — show a
-                    // neutral marker. With Index Finger always visible this
-                    // is unreachable in practice.
+                    // Defensive fallback for release builds — render a
+                    // neutral marker rather than panic if the invariant
+                    // ever breaks. The debug_assert above catches it in
+                    // dev.
                     None => "+10% ???".to_string(),
                 };
                 (0.0, label)
@@ -2082,5 +2096,50 @@ mod tests {
         assert_eq!(a, 0);
         assert_eq!(b, 1);
         assert_eq!(c, 2);
+    }
+
+    #[test]
+    fn green_coin_catch_always_has_a_target_on_fresh_state() {
+        // Index Finger is always visible by the `idx == 0` short-circuit
+        // in `fingerer::visible`, so the Green Coin catch path's
+        // attach-modifier-random-visible branch never returns None. This
+        // test enforces the invariant: the catch's particle label must
+        // never be the "+10% ???" fallback for a default game state.
+        // (The debug_assert in catch_powerup also guards this in dev,
+        // but a unit test catches it in release builds too.)
+        let mut s = GameState::default();
+        let id = fake_powerup(&mut s, PowerupKind::GreenCoin);
+        s.catch_powerup(id);
+        // The most recent particle is the catch label.
+        let label = &s.particles.last().expect("catch spawns a particle").text;
+        assert!(
+            !label.contains("???"),
+            "GreenCoin catch produced unreachable '+10% ???' fallback: {label}"
+        );
+        assert!(
+            label.starts_with("+10% "),
+            "GreenCoin catch label must start with '+10% ', got {label}"
+        );
+    }
+
+    #[test]
+    fn catch_powerup_increments_grand_total_for_every_kind() {
+        // Achievements like "Golden Touch" gate on `golden_caught`
+        // (lifetime grand total). The catch path must bump it
+        // regardless of kind, otherwise GreenCoin catches stop counting
+        // toward the rollup that pre-V3 saves rely on.
+        for kind in PowerupKind::ALL {
+            let mut s = GameState::default();
+            s.fingerers_state
+                .insert("index_finger".into(), fs_with_count(1));
+            let id = fake_powerup(&mut s, kind);
+            let prior = s.golden_caught;
+            s.catch_powerup(id);
+            assert_eq!(
+                s.golden_caught,
+                prior + 1,
+                "{kind:?} catch must bump golden_caught"
+            );
+        }
     }
 }
