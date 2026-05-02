@@ -256,8 +256,14 @@ pub struct GameState {
     /// MISSED the biscuit, including the dead zone at low zoom).
     #[serde(skip)]
     pub misclick_particles: Vec<MisclickParticle>,
+    /// Per-variant Golden Cuque slots — `goldens[GoldenVariant::Lucky as usize]`
+    /// holds the on-screen Lucky, etc. Each variant has its own independent
+    /// slot so spawning / catching one never clobbers another. The shared
+    /// `golden_cooldown` still throttles the natural spawn rate (one
+    /// roll per cooldown period); the cooldown picks a variant and spawns
+    /// it into its slot only if that slot is empty.
     #[serde(skip)]
-    pub golden: Option<GoldenCuque>,
+    pub goldens: [Option<GoldenCuque>; 3],
     #[serde(skip)]
     pub golden_cooldown: u32,
     /// On-screen Green Coin, if one is currently visible. Lifetime ticked
@@ -436,7 +442,7 @@ impl Default for GameState {
             clench_ticks: 0,
             particles: Vec::new(),
             misclick_particles: Vec::new(),
-            golden: None,
+            goldens: [None, None, None],
             golden_cooldown: crate::game::golden::next_cooldown(),
             green_coin: None,
             session_ticks: 0,
@@ -794,18 +800,22 @@ impl GameState {
         self.cuques_flash_ticks = HUD_FLASH_TICKS;
     }
 
-    /// Catch whatever Golden Cuque is currently on screen (any variant:
-    /// Lucky, Frenzy, or Buff). Applies the variant-specific effect,
-    /// increments `golden_caught`, re-rolls the next spawn cooldown, and
-    /// returns the flat reward (0.0 for buff variants).
+    /// Catch the Golden Cuque of the given variant if one is currently
+    /// on screen. Applies the variant-specific effect, increments
+    /// `golden_caught` + the per-variant counter, re-rolls the shared
+    /// spawn cooldown, and returns the flat reward (0.0 for non-Lucky).
+    ///
+    /// Each variant lives in its own slot of `state.goldens`, so catching
+    /// e.g. a Lucky never disturbs an active Frenzy or Buff. Same applies
+    /// to expiry / cheat spawns.
     ///
     /// The `Buff` variant attaches a `MulFactor(7.0)` modifier with a
     /// 60-second `Ticks` duration on a random owned fingerer, sourced as
     /// `PurpleCoin`. Pre-#21 this was a global `Buff::FingererBoost`; the
     /// modifier system replaces it.
-    pub fn catch_golden(&mut self) -> f64 {
+    pub fn catch_golden(&mut self, variant: crate::game::golden::GoldenVariant) -> f64 {
         use crate::game::golden::GoldenVariant;
-        let Some(golden) = self.golden.take() else {
+        let Some(golden) = self.goldens[variant as usize].take() else {
             return 0.0;
         };
         self.golden_caught += 1;
@@ -949,7 +959,7 @@ impl GameState {
         self.visual_debt = 0.0;
         self.particles.clear();
         self.misclick_particles.clear();
-        self.golden = None;
+        self.goldens = [None, None, None];
         self.green_coin = None;
         // Pity counter resets too — the new run earns its own Green Coins.
         self.goldens_since_green_coin = 0;
@@ -1160,14 +1170,25 @@ impl GameState {
     }
 
     pub fn tick_golden(&mut self) {
-        if let Some(g) = self.golden.as_mut() {
-            if g.life_ticks == 0 {
-                self.golden = None;
-                self.golden_cooldown = crate::game::golden::next_cooldown();
-            } else {
-                g.life_ticks -= 1;
+        // Each variant ages independently. The shared cooldown ticks down
+        // only when EVERY slot is empty — the player isn't punished by a
+        // cooldown reset just because one variant happens to be on screen.
+        let mut any_alive = false;
+        let mut any_just_expired = false;
+        for slot in self.goldens.iter_mut() {
+            if let Some(g) = slot.as_mut() {
+                if g.life_ticks == 0 {
+                    *slot = None;
+                    any_just_expired = true;
+                } else {
+                    g.life_ticks -= 1;
+                    any_alive = true;
+                }
             }
-        } else if self.golden_cooldown > 0 {
+        }
+        if any_just_expired {
+            self.golden_cooldown = crate::game::golden::next_cooldown();
+        } else if !any_alive && self.golden_cooldown > 0 {
             self.golden_cooldown -= 1;
         }
     }

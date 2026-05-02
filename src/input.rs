@@ -120,10 +120,12 @@ pub struct InputContext<'a> {
     /// [`crate::ui::DrawOutput::biscuit_focal`]. Used by `hands::occupied_at`
     /// to keep its hit-test math in sync with the visual orbit.
     pub biscuit_focal: (u16, u16),
-    pub golden_rect: Rect,
+    /// One rect per Golden variant slot (Lucky/Frenzy/Buff), indexed by
+    /// `GoldenVariant as usize`. Each is hit-tested independently so
+    /// clicking one variant catches only that variant.
+    pub golden_rects: [Rect; 3],
     /// Hit-test rect for the on-screen Green Coin marker. Zero-rect when
-    /// no coin is visible; click-routes through `Action::CatchGolden` (the
-    /// sim resolves both Golden and Green Coin from that single action).
+    /// no coin is visible; click-routes through `Action::CatchGreenCoin`.
     pub green_coin_rect: Rect,
     pub play_area: Rect,
     pub prestige_reset_rect: Rect,
@@ -152,7 +154,7 @@ impl<'a> InputContext<'a> {
             help_hits: &layout.help_hits,
             biscuit_rect: layout.biscuit_rect,
             biscuit_focal: layout.biscuit_focal,
-            golden_rect: layout.golden_rect,
+            golden_rects: layout.golden_rects,
             green_coin_rect: layout.green_coin_rect,
             play_area: layout.play_area,
             prestige_reset_rect: layout.prestige_reset_rect,
@@ -237,6 +239,34 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
         && row < rect.y + rect.height
 }
 
+/// Push the catch action for whichever on-screen powerup has the fewest
+/// life ticks remaining (most-urgent across Lucky / Frenzy / Buff /
+/// Green Coin). No-op if nothing is on screen. Shared by the keyboard
+/// `g` handler and the help-bar `[g]` click.
+fn push_grab_most_urgent(ctx: &InputContext, out: &mut Vec<Action>) {
+    use crate::game::golden::GoldenVariant;
+    let mut best: Option<(u32, Action)> = None;
+    for variant in GoldenVariant::ALL {
+        if let Some(g) = ctx.current.goldens[variant as usize].as_ref() {
+            let action = Action::CatchGolden(variant);
+            best = match best {
+                Some((life, _)) if life <= g.life_ticks => best,
+                _ => Some((g.life_ticks, action)),
+            };
+        }
+    }
+    if let Some(c) = ctx.current.green_coin.as_ref() {
+        let action = Action::CatchGreenCoin;
+        best = match best {
+            Some((life, _)) if life <= c.life_ticks => best,
+            _ => Some((c.life_ticks, action)),
+        };
+    }
+    if let Some((_, a)) = best {
+        out.push(a);
+    }
+}
+
 fn click_buy_qty(mods: Modifiers) -> BuyQty {
     if mods.alt || mods.ctrl {
         BuyQty::Max
@@ -280,9 +310,9 @@ fn try_help_click(
                 };
             }
             HelpAction::GrabGolden => {
-                if ctx.current.golden.is_some() {
-                    out.push(Action::CatchGolden);
-                }
+                // Help-bar `[g]` click — grab the most-urgent powerup
+                // currently on screen, identical to the keyboard 'g'.
+                push_grab_most_urgent(ctx, out);
             }
             HelpAction::PrestigeReset => {
                 if ctx.current.prestige_available() > 0 {
@@ -312,8 +342,18 @@ fn handle_click(
     // behavior, which has no mode guard. The marker still renders on the
     // biscuit while a non-Game panel is open. Right-click on a golden
     // also catches.
-    if rect_contains(ctx.golden_rect, col, row) || rect_contains(ctx.green_coin_rect, col, row) {
-        out.push(Action::CatchGolden);
+    // Each powerup marker is its own click target — clicking on the
+    // golden does NOT also vacuum up an adjacent green coin or sibling
+    // golden variant. Lucky/Frenzy/Buff/GreenCoin can all coexist on
+    // screen; each one catches only itself.
+    for variant in crate::game::golden::GoldenVariant::ALL {
+        if rect_contains(ctx.golden_rects[variant as usize], col, row) {
+            out.push(Action::CatchGolden(variant));
+            return;
+        }
+    }
+    if rect_contains(ctx.green_coin_rect, col, row) {
+        out.push(Action::CatchGreenCoin);
         return;
     }
     // Clicking the biscuit itself is also mode-agnostic. Right-click on
@@ -417,12 +457,13 @@ fn handle_key(
                 Mode::Upgrades
             };
         }
-        // [g] catches any Golden Cuque variant. Guard on the latest snapshot
-        // to avoid sending a noop CatchGolden when nothing is on screen.
-        KeyCode::Char('g') | KeyCode::Char('G')
-            if ctx.current.golden.is_some() || ctx.current.green_coin.is_some() =>
-        {
-            out.push(Action::CatchGolden);
+        // [g] catches the most-urgent powerup (lowest remaining life
+        // ticks) across all four slots — Lucky, Frenzy, Buff, and
+        // Green Coin. A second [g] press grabs the next-most-urgent.
+        // Lets the player race against expiry without the keyboard
+        // accidentally vacuuming up siblings.
+        KeyCode::Char('g') | KeyCode::Char('G') => {
+            push_grab_most_urgent(ctx, out);
         }
         // Debug/testing: gated by `debug`. See src/ui/debug_pane.rs for the
         // advertised key list. F8 (not F1) is Lucky because Chrome / Edge /
@@ -570,13 +611,17 @@ mod tests {
         debug: bool,
         current: &'a GameState,
     ) -> InputContext<'a> {
+        // Helper places `golden_rect` in the Lucky slot; tests targeting
+        // a different variant can mutate `golden_rects` after construction.
+        let mut golden_rects = [Rect::default(); 3];
+        golden_rects[GoldenVariant::Lucky as usize] = golden_rect;
         InputContext {
             fingerer_rows,
             upgrade_rows,
             help_hits,
             biscuit_rect: biscuit,
             biscuit_focal: (0, 0),
-            golden_rect,
+            golden_rects,
             green_coin_rect: Rect::default(),
             play_area,
             prestige_reset_rect,
@@ -599,15 +644,14 @@ mod tests {
         )
     }
 
-    /// State with a golden cuque on screen, so [g] / golden-rect clicks have
-    /// something to catch.
+    /// State with a Lucky golden in its dedicated slot, so [g] /
+    /// golden-rect clicks have something to catch.
     fn state_with_golden() -> GameState {
         let mut g = golden::spawn_in(rect(10, 10, 20, 10));
         g.variant = GoldenVariant::Lucky;
-        GameState {
-            golden: Some(g),
-            ..GameState::default()
-        }
+        let mut s = GameState::default();
+        s.goldens[GoldenVariant::Lucky as usize] = Some(g);
+        s
     }
 
     /// State with enough lifetime cuques to make `prestige_available()` > 0,
@@ -715,7 +759,7 @@ mod tests {
         let mut ui = UiState::new();
         let mut out = Vec::new();
         process_input_event(key(KeyCode::Char('g')), &mut ui, &empty_ctx(&s), &mut out);
-        assert!(matches!(out.as_slice(), [Action::CatchGolden]));
+        assert!(matches!(out.as_slice(), [Action::CatchGolden(_)]));
     }
 
     #[test]
@@ -961,7 +1005,79 @@ mod tests {
             &c,
             &mut out,
         );
-        assert!(matches!(out.as_slice(), [Action::CatchGolden]));
+        assert!(matches!(out.as_slice(), [Action::CatchGolden(_)]));
+    }
+
+    #[test]
+    fn left_click_on_green_coin_emits_green_catch_only() {
+        // Regression: clicking the green-coin marker used to emit
+        // `Action::CatchGolden`, which would catch BOTH a Golden and a
+        // Green Coin if both were on screen. They're separate now.
+        let mut s = state_with_golden();
+        s.green_coin = Some(crate::game::green_coin::GreenCoin {
+            frac_x: 0.5,
+            frac_y: 0.5,
+            life_ticks: 100,
+        });
+        let mut ui = UiState::new();
+        let mut c = ctx(
+            Rect::default(),
+            rect(50, 12, 4, 2),
+            rect(0, 0, 100, 30),
+            Rect::default(),
+            &[],
+            &[],
+            &[],
+            false,
+            &s,
+        );
+        c.green_coin_rect = rect(70, 12, 5, 3);
+        let mut out = Vec::new();
+        process_input_event(
+            mouse_down(72, 13, MouseButton::Left, Modifiers::default()),
+            &mut ui,
+            &c,
+            &mut out,
+        );
+        assert!(matches!(out.as_slice(), [Action::CatchGreenCoin]));
+    }
+
+    #[test]
+    fn g_with_both_powerups_picks_lower_life_ticks() {
+        // [g] should grab the most-urgent powerup first when both are on
+        // screen, then a follow-up [g] press grabs the leftover. Tie
+        // (g_life == c_life) goes to the regular Golden as a tiebreak.
+        let mut s = state_with_golden();
+        // Pin life_ticks so we control the ordering.
+        if let Some(g) = s.goldens[GoldenVariant::Lucky as usize].as_mut() {
+            g.life_ticks = 50;
+        }
+        s.green_coin = Some(crate::game::green_coin::GreenCoin {
+            frac_x: 0.5,
+            frac_y: 0.5,
+            life_ticks: 200,
+        });
+        let c = empty_ctx(&s);
+        let mut ui = UiState::new();
+        let mut out = Vec::new();
+        process_input_event(key(KeyCode::Char('g')), &mut ui, &c, &mut out);
+        // Golden has 50 ticks left, green has 200 — Golden is more urgent.
+        assert!(matches!(out.as_slice(), [Action::CatchGolden(_)]));
+
+        // Flip the lifetimes — green is now the urgent one.
+        let mut s = state_with_golden();
+        if let Some(g) = s.goldens[GoldenVariant::Lucky as usize].as_mut() {
+            g.life_ticks = 200;
+        }
+        s.green_coin = Some(crate::game::green_coin::GreenCoin {
+            frac_x: 0.5,
+            frac_y: 0.5,
+            life_ticks: 50,
+        });
+        let c = empty_ctx(&s);
+        let mut out = Vec::new();
+        process_input_event(key(KeyCode::Char('g')), &mut ui, &c, &mut out);
+        assert!(matches!(out.as_slice(), [Action::CatchGreenCoin]));
     }
 
     #[test]
@@ -987,7 +1103,7 @@ mod tests {
             &c,
             &mut out,
         );
-        assert!(matches!(out.as_slice(), [Action::CatchGolden]));
+        assert!(matches!(out.as_slice(), [Action::CatchGolden(_)]));
     }
 
     #[test]
