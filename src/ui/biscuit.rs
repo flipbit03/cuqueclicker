@@ -40,16 +40,28 @@ fn prestige_body_tint(prestige: u64) -> ((f32, f32, f32), f32) {
 // `replace('O', '|')` collateral-damaging the `|` walls on rows 9-21,
 // and the burning-pulse overpaint also got fooled into picking the
 // wrong row when searching for a stand-in glyph.
+// Body walls at cols 1 and 59 → visual center column 30. The right-side
+// curve rows (2-8 top, 21-27 bottom) used to extend 1 column further from
+// center than their left-side mirrors, so the right wall `|` sat at the
+// same column as the curve `\` above it (no rounding offset) while the
+// left side had `/` 1 col inside the wall — visibly asymmetric. Shifted
+// the right cluster on each curve row 1 col left so the right contour now
+// rounds into the wall the same way the left does.
+//
+// Rows 0, 1, 28, 29 (the underscore row + adjacent `__,-~~` row) sit at
+// half-column offsets from the body center; their |L|/|R| asymmetry is
+// inherent to the even-width middle gap, and a 1-col shift just flips
+// which side is shorter. Left as-is.
 const BISCUIT_FULL: &[&str] = &[
     r"                    ____________________                    ",
     r"              __,-~~                    ~~-,__              ",
-    r"           ,-~'                                `~-,         ",
-    r"        ,-'                                        `-,      ",
-    r"      ,'                                              `.    ",
-    r"     /         -~-~-~-              -~-~-~-             \   ",
-    r"    /                                                    \  ",
-    r"   /             -~~-~-~~-                                \ ",
-    r"  /                                                        \",
+    r"           ,-~'                               `~-,          ",
+    r"        ,-'                                       `-,       ",
+    r"      ,'                                             `.     ",
+    r"     /         -~-~-~-              -~-~-~-            \    ",
+    r"    /                                                   \   ",
+    r"   /             -~~-~-~~-                               \  ",
+    r"  /                                                       \ ",
     r" |          -~-~-~-~-             -~-~-~-~-                |",
     r" |                                                         |",
     r" |                                                         |",
@@ -62,13 +74,13 @@ const BISCUIT_FULL: &[&str] = &[
     r" |                  ////////   |   \\\\\\\\                |",
     r" |                                                         |",
     r" |          -~-~-~-~-             -~-~-~-~-                |",
-    r"  \                                                        /",
-    r"   \             -~~-~-~~-                                / ",
-    r"    \                                                    /  ",
-    r"     \         -~-~-~-              -~-~-~-             /   ",
-    r"      `.                                              ,'    ",
-    r"        `-,                                        ,-'      ",
-    r"           `~-,                                ,-~'         ",
+    r"  \                                                       / ",
+    r"   \             -~~-~-~~-                               /  ",
+    r"    \                                                   /   ",
+    r"     \         -~-~-~-              -~-~-~-            /    ",
+    r"      `.                                             ,'     ",
+    r"        `-,                                       ,-'       ",
+    r"           `~-,                               ,-~'          ",
     r"              `~-,,_                      _,,-~'            ",
     r"                   `~-,,______________,,-~'                 ",
 ];
