@@ -1,7 +1,6 @@
 use ratatui::{prelude::*, widgets::*};
 
-use crate::game::golden::{GOLDEN_LIFE_TICKS, GoldenCuque, GoldenVariant};
-use crate::game::green_coin::{GREEN_COIN_LIFE_TICKS, GreenCoin};
+use crate::game::powerup::{Powerup, PowerupKind};
 use crate::game::state::{Buff, CLENCH_SQUASH_TICKS, CLENCH_TICKS, GameState};
 
 /// Asshole-spin animation frames. Cycled by `total_clicks % N` while a
@@ -436,54 +435,84 @@ fn squashed_art(art: &[&str], asshole_row: usize) -> Vec<String> {
     out
 }
 
+/// Per-kind palette/glyph table. `bright`/`dim`/`accent` are the three
+/// colors the shimmer wave samples; `bg` stays low-key so the eye reads
+/// the *text* sliding through hues, not a blinking box. Centralized here
+/// so a new `PowerupKind` is one extra arm.
+struct PowerupPalette {
+    center: char,
+    bright: (f32, f32, f32),
+    dim: (f32, f32, f32),
+    accent: (f32, f32, f32),
+    bg: Color,
+}
+
+fn powerup_palette(kind: PowerupKind) -> PowerupPalette {
+    match kind {
+        PowerupKind::Lucky => PowerupPalette {
+            center: '$',
+            bright: (255.0, 230.0, 80.0),
+            dim: (140.0, 90.0, 0.0),
+            accent: (255.0, 170.0, 30.0),
+            bg: Color::Rgb(40, 25, 0),
+        },
+        PowerupKind::Frenzy => PowerupPalette {
+            center: '!',
+            bright: (255.0, 110.0, 110.0),
+            dim: (120.0, 0.0, 0.0),
+            accent: (255.0, 200.0, 60.0),
+            bg: Color::Rgb(50, 0, 0),
+        },
+        PowerupKind::Buff => PowerupPalette {
+            center: '+',
+            bright: (230.0, 160.0, 255.0),
+            dim: (80.0, 20.0, 110.0),
+            accent: (140.0, 220.0, 255.0),
+            bg: Color::Rgb(35, 0, 45),
+        },
+        PowerupKind::GreenCoin => PowerupPalette {
+            center: '$',
+            bright: (140.0, 255.0, 160.0),
+            dim: (10.0, 80.0, 30.0),
+            accent: (200.0, 255.0, 110.0),
+            bg: Color::Rgb(0, 30, 10),
+        },
+    }
+}
+
 /// J9 juice: the marker shimmers. Each character of the 5-wide marker
 /// samples its own foreground color from a horizontally-traveling wave
 /// between a `bright` peak, a `dim` trough, and an `accent` highlight on
 /// the off-phase. The bg stays a constant low-key tint, so what the player
 /// sees is the TEXT itself sliding through colors — not a flashing box.
 /// In the final 20% of life the wave speeds up and the trough darkens so
-/// a soon-to-expire golden visibly accelerates without losing legibility.
-pub fn draw_golden(frame: &mut Frame, golden: &GoldenCuque, biscuit: Rect) -> Rect {
+/// a soon-to-expire powerup visibly accelerates without losing legibility.
+///
+/// Unified across kinds: `Lucky`/`Frenzy`/`Buff`/`GreenCoin` differ only
+/// in their `powerup_palette` entry. Adding a new kind = add a palette
+/// arm; this function inherits it.
+pub fn draw_powerup(frame: &mut Frame, powerup: &Powerup, biscuit: Rect) -> Rect {
     let buf = frame.buffer_mut();
-    // `bright` and `dim` define the gradient endpoints the wave swings
-    // between. `accent` is a third color woven in on the off-phase so the
-    // shimmer reads chromatic, not just bright/dark.
-    let (center, bright, dim, accent, bg) = match golden.variant {
-        GoldenVariant::Lucky => (
-            '$',
-            (255.0_f32, 230.0, 80.0),
-            (140.0_f32, 90.0, 0.0),
-            (255.0_f32, 170.0, 30.0),
-            Color::Rgb(40, 25, 0),
-        ),
-        GoldenVariant::Frenzy => (
-            '!',
-            (255.0, 110.0, 110.0),
-            (120.0, 0.0, 0.0),
-            (255.0, 200.0, 60.0),
-            Color::Rgb(50, 0, 0),
-        ),
-        GoldenVariant::Buff => (
-            '+',
-            (230.0, 160.0, 255.0),
-            (80.0, 20.0, 110.0),
-            (140.0, 220.0, 255.0),
-            Color::Rgb(35, 0, 45),
-        ),
-    };
+    let PowerupPalette {
+        center,
+        bright,
+        dim,
+        accent,
+        bg,
+    } = powerup_palette(powerup.kind);
 
     // Wave speed (rad/tick) and trough depth both bump in alarm mode. The
     // normal phase pulses at ~1.9 Hz (0.6 rad/tick × 20 ticks/s ÷ TAU);
-    // the alarm phase doubles to ~4.8 Hz so a soon-to-expire golden
-    // visibly speeds up. Earlier values (0.22 / 0.55) read as too sleepy
-    // — easy to miss the marker pulsing at all on a single playthrough.
-    let life_frac = (golden.life_ticks as f32 / GOLDEN_LIFE_TICKS as f32).clamp(0.0, 1.0);
+    // the alarm phase doubles to ~4.8 Hz so a soon-to-expire powerup
+    // visibly speeds up. Earlier values (0.22 / 0.55) read as too sleepy.
+    let life_total = powerup.kind.lifetime_ticks();
+    let life_frac = (powerup.life_ticks as f32 / life_total as f32).clamp(0.0, 1.0);
     let alarm = life_frac < 0.20;
     let speed = if alarm { 1.5 } else { 0.6 };
     let dim_pull = if alarm { 1.0 } else { 0.6 };
     // Phase advances every tick; per-cell offset shifts the wave across the
     // 5-cell width so neighbors land at different points of the gradient.
-    let phase = (GOLDEN_LIFE_TICKS - golden.life_ticks) as f32 * speed;
+    let phase = (life_total - powerup.life_ticks) as f32 * speed;
     let cell_offset = std::f32::consts::TAU / 5.0; // one full cycle across width
 
     let lines: [String; 3] = [
@@ -500,7 +529,7 @@ pub fn draw_golden(frame: &mut Frame, golden: &GoldenCuque, biscuit: Rect) -> Re
     }
 
     let (anchor_col, anchor_row) =
-        crate::game::state::biscuit_frac_to_screen(golden.frac_x, golden.frac_y, biscuit);
+        crate::game::state::biscuit_frac_to_screen(powerup.frac_x, powerup.frac_y, biscuit);
     let mut col = anchor_col;
     let mut row = anchor_row;
     // Keep the 5x3 marker fully inside the biscuit so it never overlaps the
@@ -554,109 +583,6 @@ pub fn draw_golden(frame: &mut Frame, golden: &GoldenCuque, biscuit: Rect) -> Re
             let main_b = dim_dim.2 + (bright.2 - dim_dim.2) * wave_main;
             // Cap accent contribution at 35% so it tints without washing
             // out the bright peak.
-            let accent_w = wave_accent * 0.35;
-            let r = main_r + (accent.0 - main_r) * accent_w;
-            let g = main_g + (accent.1 - main_g) * accent_w;
-            let b = main_b + (accent.2 - main_b) * accent_w;
-            let style = Style::default()
-                .fg(Color::Rgb(
-                    r.clamp(0.0, 255.0) as u8,
-                    g.clamp(0.0, 255.0) as u8,
-                    b.clamp(0.0, 255.0) as u8,
-                ))
-                .bg(bg)
-                .add_modifier(Modifier::BOLD);
-            buf.set_string(x, y, ch.to_string(), style);
-        }
-    }
-
-    Rect {
-        x: col,
-        y: row,
-        width: w,
-        height: h,
-    }
-}
-
-/// Render the Green Coin marker. Same shimmer model as `draw_golden` but
-/// a fixed green palette + `$` glyph (the Green Coin is sourced from the
-/// "Moeda Verde" idea — a money coin, hence the dollar sign). Independent
-/// from `GoldenVariant` because Green Coin has its own lifetime constant
-/// and lives in `GameState::green_coin` (parallel slot to `golden`), so
-/// folding it into the variant enum would tangle two unrelated entities.
-pub fn draw_green_coin(frame: &mut Frame, coin: &GreenCoin, biscuit: Rect) -> Rect {
-    let buf = frame.buffer_mut();
-    let center = '$';
-    // Green palette — clearly distinct from Lucky's gold and Buff's purple.
-    let bright = (140.0_f32, 255.0, 160.0);
-    let dim = (10.0_f32, 80.0, 30.0);
-    let accent = (200.0_f32, 255.0, 110.0);
-    let bg = Color::Rgb(0, 30, 10);
-
-    let life_frac = (coin.life_ticks as f32 / GREEN_COIN_LIFE_TICKS as f32).clamp(0.0, 1.0);
-    let alarm = life_frac < 0.20;
-    let speed = if alarm { 1.5 } else { 0.6 };
-    let dim_pull = if alarm { 1.0 } else { 0.6 };
-    let phase = (GREEN_COIN_LIFE_TICKS - coin.life_ticks) as f32 * speed;
-    let cell_offset = std::f32::consts::TAU / 5.0;
-
-    let lines: [String; 3] = [
-        ".---.".to_string(),
-        format!("( {} )", center),
-        "`---'".to_string(),
-    ];
-    let w: u16 = 5;
-    let h: u16 = 3;
-
-    let area = buf.area;
-    if area.width == 0 || area.height == 0 || biscuit.width < w || biscuit.height < h {
-        return Rect::default();
-    }
-
-    let (anchor_col, anchor_row) =
-        crate::game::state::biscuit_frac_to_screen(coin.frac_x, coin.frac_y, biscuit);
-    let mut col = anchor_col;
-    let mut row = anchor_row;
-    if col + w > biscuit.x + biscuit.width {
-        col = (biscuit.x + biscuit.width).saturating_sub(w);
-    }
-    if row + h > biscuit.y + biscuit.height {
-        row = (biscuit.y + biscuit.height).saturating_sub(h);
-    }
-    if col < biscuit.x {
-        col = biscuit.x;
-    }
-    if row < biscuit.y {
-        row = biscuit.y;
-    }
-    if col + w > area.x + area.width {
-        col = (area.x + area.width).saturating_sub(w);
-    }
-    if row + h > area.y + area.height {
-        row = (area.y + area.height).saturating_sub(h);
-    }
-
-    for (dy, line) in lines.iter().enumerate() {
-        let y = row + dy as u16;
-        if y >= area.y + area.height {
-            break;
-        }
-        for (i, ch) in line.chars().enumerate() {
-            let x = col + i as u16;
-            if x >= area.x + area.width {
-                break;
-            }
-            let arg = phase + i as f32 * cell_offset;
-            let wave_main = (arg.sin() + 1.0) * 0.5;
-            let wave_accent = ((arg + std::f32::consts::FRAC_PI_2).sin() + 1.0) * 0.5;
-            let dim_dim = (
-                dim.0 * (1.0 - 0.4 * dim_pull),
-                dim.1 * (1.0 - 0.4 * dim_pull),
-                dim.2 * (1.0 - 0.4 * dim_pull),
-            );
-            let main_r = dim_dim.0 + (bright.0 - dim_dim.0) * wave_main;
-            let main_g = dim_dim.1 + (bright.1 - dim_dim.1) * wave_main;
-            let main_b = dim_dim.2 + (bright.2 - dim_dim.2) * wave_main;
             let accent_w = wave_accent * 0.35;
             let r = main_r + (accent.0 - main_r) * accent_w;
             let g = main_g + (accent.1 - main_g) * accent_w;

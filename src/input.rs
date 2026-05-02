@@ -120,13 +120,12 @@ pub struct InputContext<'a> {
     /// [`crate::ui::DrawOutput::biscuit_focal`]. Used by `hands::occupied_at`
     /// to keep its hit-test math in sync with the visual orbit.
     pub biscuit_focal: (u16, u16),
-    /// One rect per Golden variant slot (Lucky/Frenzy/Buff), indexed by
-    /// `GoldenVariant as usize`. Each is hit-tested independently so
-    /// clicking one variant catches only that variant.
-    pub golden_rects: [Rect; 3],
-    /// Hit-test rect for the on-screen Green Coin marker. Zero-rect when
-    /// no coin is visible; click-routes through `Action::CatchGreenCoin`.
-    pub green_coin_rect: Rect,
+    /// `(spawn_id, rect)` for every on-screen powerup. Click hit-test
+    /// walks this list and routes the first match to
+    /// `Action::CatchPowerup(spawn_id)`. The `g` hotkey min_by_key's it
+    /// for the most-urgent. Both reference instances by id, never by
+    /// Vec index — `swap_remove` on catch is safe.
+    pub powerup_rects: &'a [(u64, Rect)],
     pub play_area: Rect,
     pub prestige_reset_rect: Rect,
     pub debug: bool,
@@ -154,8 +153,7 @@ impl<'a> InputContext<'a> {
             help_hits: &layout.help_hits,
             biscuit_rect: layout.biscuit_rect,
             biscuit_focal: layout.biscuit_focal,
-            golden_rects: layout.golden_rects,
-            green_coin_rect: layout.green_coin_rect,
+            powerup_rects: &layout.powerup_rects,
             play_area: layout.play_area,
             prestige_reset_rect: layout.prestige_reset_rect,
             debug,
@@ -166,7 +164,7 @@ impl<'a> InputContext<'a> {
 
 /// Process one [`InputEvent`]. Mutates [`UiState`]; appends produced actions
 /// to `out`. Pure data — does no I/O. The router *reads* `GameState` (via
-/// `ctx.current` for `prestige_available()` / `golden.is_some()` and via
+/// `ctx.current` for `prestige_available()` / `powerups.iter()` and via
 /// `ui::hands::occupied_at` for misclick gating) but never mutates it; all
 /// mutation flows through the produced [`Action`]s and `apply_action`.
 pub fn process_input_event(
@@ -240,30 +238,12 @@ fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
 }
 
 /// Push the catch action for whichever on-screen powerup has the fewest
-/// life ticks remaining (most-urgent across Lucky / Frenzy / Buff /
-/// Green Coin). No-op if nothing is on screen. Shared by the keyboard
-/// `g` handler and the help-bar `[g]` click.
+/// life ticks remaining (most-urgent across every kind). No-op if nothing
+/// is on screen. Shared by the keyboard `g` handler and the help-bar
+/// `[g]` click.
 fn push_grab_most_urgent(ctx: &InputContext, out: &mut Vec<Action>) {
-    use crate::game::golden::GoldenVariant;
-    let mut best: Option<(u32, Action)> = None;
-    for variant in GoldenVariant::ALL {
-        if let Some(g) = ctx.current.goldens[variant as usize].as_ref() {
-            let action = Action::CatchGolden(variant);
-            best = match best {
-                Some((life, _)) if life <= g.life_ticks => best,
-                _ => Some((g.life_ticks, action)),
-            };
-        }
-    }
-    if let Some(c) = ctx.current.green_coin.as_ref() {
-        let action = Action::CatchGreenCoin;
-        best = match best {
-            Some((life, _)) if life <= c.life_ticks => best,
-            _ => Some((c.life_ticks, action)),
-        };
-    }
-    if let Some((_, a)) = best {
-        out.push(a);
+    if let Some(p) = ctx.current.powerups.iter().min_by_key(|p| p.life_ticks) {
+        out.push(Action::CatchPowerup(p.spawn_id));
     }
 }
 
@@ -338,23 +318,19 @@ fn handle_click(
     ctx: &InputContext,
     out: &mut Vec<Action>,
 ) {
-    // Golden cuques are catchable from ANY panel — match the keyboard 'g'
+    // Powerups are catchable from ANY panel — match the keyboard 'g'
     // behavior, which has no mode guard. The marker still renders on the
-    // biscuit while a non-Game panel is open. Right-click on a golden
+    // biscuit while a non-Game panel is open. Right-click on a powerup
     // also catches.
-    // Each powerup marker is its own click target — clicking on the
-    // golden does NOT also vacuum up an adjacent green coin or sibling
-    // golden variant. Lucky/Frenzy/Buff/GreenCoin can all coexist on
-    // screen; each one catches only itself.
-    for variant in crate::game::golden::GoldenVariant::ALL {
-        if rect_contains(ctx.golden_rects[variant as usize], col, row) {
-            out.push(Action::CatchGolden(variant));
+    //
+    // Each powerup is its own click target — clicking one does NOT vacuum
+    // up an adjacent or overlapping powerup. Multiple of any kind coexist
+    // freely; each one catches only itself, by spawn_id.
+    for &(id, rect) in ctx.powerup_rects {
+        if rect_contains(rect, col, row) {
+            out.push(Action::CatchPowerup(id));
             return;
         }
-    }
-    if rect_contains(ctx.green_coin_rect, col, row) {
-        out.push(Action::CatchGreenCoin);
-        return;
     }
     // Clicking the biscuit itself is also mode-agnostic. Right-click on
     // the biscuit is a no-op so a player can't accidentally finger the
@@ -471,25 +447,27 @@ fn handle_key(
         // to the wasm page; F8 has no default browser binding outside of
         // an open DevTools instance.
         KeyCode::F(8) if ctx.debug => {
-            out.push(Action::DevForceGolden(
-                crate::game::golden::GoldenVariant::Lucky,
+            out.push(Action::DevForcePowerup(
+                crate::game::powerup::PowerupKind::Lucky,
             ));
         }
         KeyCode::F(2) if ctx.debug => {
-            out.push(Action::DevForceGolden(
-                crate::game::golden::GoldenVariant::Frenzy,
+            out.push(Action::DevForcePowerup(
+                crate::game::powerup::PowerupKind::Frenzy,
             ));
         }
         KeyCode::F(3) if ctx.debug => {
-            out.push(Action::DevForceGolden(
-                crate::game::golden::GoldenVariant::Buff,
+            out.push(Action::DevForcePowerup(
+                crate::game::powerup::PowerupKind::Buff,
             ));
         }
         KeyCode::F(4) if ctx.debug => {
             out.push(Action::DevAddCuques(1_000_000.0));
         }
         KeyCode::F(5) if ctx.debug => {
-            out.push(Action::DevSpawnGreenCoin);
+            out.push(Action::DevForcePowerup(
+                crate::game::powerup::PowerupKind::GreenCoin,
+            ));
         }
         KeyCode::Char('p') | KeyCode::Char('P') => {
             ui.mode = if matches!(ui.mode, Mode::Prestige) {
@@ -584,10 +562,10 @@ mod tests {
     //!
     //! Constructing an `InputContext` requires stubs for the per-frame rects
     //! and a borrowed `GameState`; helpers below collapse the boilerplate.
-    //! `state_with_golden()` and `state_with_prestige()` mutate just enough
+    //! `state_with_lucky()` and `state_with_prestige()` mutate just enough
     //! of the default to exercise the gates the router cares about.
     use super::*;
-    use crate::game::golden::{self, GoldenVariant};
+    use crate::game::powerup::{Powerup, PowerupKind};
     use crate::sim::{Action, BuyQty};
     use ratatui::layout::Rect;
     use std::mem::discriminant;
@@ -602,7 +580,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn ctx<'a>(
         biscuit: Rect,
-        golden_rect: Rect,
+        powerup_rects: &'a [(u64, Rect)],
         play_area: Rect,
         prestige_reset_rect: Rect,
         fingerer_rows: &'a [(usize, Rect)],
@@ -611,18 +589,13 @@ mod tests {
         debug: bool,
         current: &'a GameState,
     ) -> InputContext<'a> {
-        // Helper places `golden_rect` in the Lucky slot; tests targeting
-        // a different variant can mutate `golden_rects` after construction.
-        let mut golden_rects = [Rect::default(); 3];
-        golden_rects[GoldenVariant::Lucky as usize] = golden_rect;
         InputContext {
             fingerer_rows,
             upgrade_rows,
             help_hits,
             biscuit_rect: biscuit,
             biscuit_focal: (0, 0),
-            golden_rects,
-            green_coin_rect: Rect::default(),
+            powerup_rects,
             play_area,
             prestige_reset_rect,
             debug,
@@ -633,7 +606,7 @@ mod tests {
     fn empty_ctx<'a>(state: &'a GameState) -> InputContext<'a> {
         ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             Rect::default(),
             Rect::default(),
             &[],
@@ -644,14 +617,20 @@ mod tests {
         )
     }
 
-    /// State with a Lucky golden in its dedicated slot, so [g] /
-    /// golden-rect clicks have something to catch.
-    fn state_with_golden() -> GameState {
-        let mut g = golden::spawn_in(rect(10, 10, 20, 10));
-        g.variant = GoldenVariant::Lucky;
+    /// State with a Lucky powerup queued so `[g]` / hit-test clicks have
+    /// something to catch. Returns the `(state, spawn_id)` pair so tests
+    /// that need to override `life_ticks` or hit-test can do so by id.
+    fn state_with_lucky() -> (GameState, u64) {
         let mut s = GameState::default();
-        s.goldens[GoldenVariant::Lucky as usize] = Some(g);
-        s
+        let id = s.mint_spawn_id();
+        s.powerups.push(Powerup {
+            kind: PowerupKind::Lucky,
+            spawn_id: id,
+            frac_x: 0.5,
+            frac_y: 0.5,
+            life_ticks: PowerupKind::Lucky.lifetime_ticks(),
+        });
+        (s, id)
     }
 
     /// State with enough lifetime cuques to make `prestige_available()` > 0,
@@ -745,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn g_with_no_golden_is_silent() {
+    fn g_with_no_powerup_is_silent() {
         let s = GameState::default();
         let mut ui = UiState::new();
         let mut out = Vec::new();
@@ -754,12 +733,15 @@ mod tests {
     }
 
     #[test]
-    fn g_with_golden_emits_catch() {
-        let s = state_with_golden();
+    fn g_with_powerup_emits_catch() {
+        let (s, id) = state_with_lucky();
         let mut ui = UiState::new();
         let mut out = Vec::new();
         process_input_event(key(KeyCode::Char('g')), &mut ui, &empty_ctx(&s), &mut out);
-        assert!(matches!(out.as_slice(), [Action::CatchGolden(_)]));
+        assert!(
+            matches!(out.as_slice(), [Action::CatchPowerup(spawn_id)] if *spawn_id == id),
+            "expected CatchPowerup({id}), got {out:?}"
+        );
     }
 
     #[test]
@@ -773,6 +755,7 @@ mod tests {
         process_input_event(key(KeyCode::F(2)), &mut ui, &c, &mut out);
         process_input_event(key(KeyCode::F(3)), &mut ui, &c, &mut out);
         process_input_event(key(KeyCode::F(4)), &mut ui, &c, &mut out);
+        process_input_event(key(KeyCode::F(5)), &mut ui, &c, &mut out);
         assert!(out.is_empty(), "F-keys must be silent when debug=false");
     }
 
@@ -782,7 +765,7 @@ mod tests {
         let mut ui = UiState::new();
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             Rect::default(),
             Rect::default(),
             &[],
@@ -794,11 +777,16 @@ mod tests {
         let mut out = Vec::new();
         process_input_event(key(KeyCode::F(8)), &mut ui, &c, &mut out);
         process_input_event(key(KeyCode::F(4)), &mut ui, &c, &mut out);
+        process_input_event(key(KeyCode::F(5)), &mut ui, &c, &mut out);
         assert!(matches!(
             out[0],
-            Action::DevForceGolden(GoldenVariant::Lucky)
+            Action::DevForcePowerup(PowerupKind::Lucky)
         ));
         assert!(matches!(out[1], Action::DevAddCuques(_)));
+        assert!(matches!(
+            out[2],
+            Action::DevForcePowerup(PowerupKind::GreenCoin)
+        ));
     }
 
     // -- Digit shortcuts: modifier→BuyQty ----------------------------------
@@ -806,7 +794,7 @@ mod tests {
     fn fingerer_row_ctx<'a>(state: &'a GameState, rows: &'a [(usize, Rect)]) -> InputContext<'a> {
         ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             Rect::default(),
             Rect::default(),
             rows,
@@ -933,7 +921,7 @@ mod tests {
         let mut ui = UiState::new();
         let c = ctx(
             rect(10, 5, 30, 20),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -964,7 +952,7 @@ mod tests {
         let mut ui = UiState::new();
         let c = ctx(
             rect(10, 5, 30, 20),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -984,12 +972,13 @@ mod tests {
     }
 
     #[test]
-    fn left_click_on_golden_emits_catch() {
-        let s = state_with_golden();
+    fn left_click_on_powerup_emits_catch() {
+        let (s, id) = state_with_lucky();
         let mut ui = UiState::new();
+        let powerup_rects = [(id, rect(50, 12, 4, 2))];
         let c = ctx(
             Rect::default(),
-            rect(50, 12, 4, 2),
+            &powerup_rects,
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -1005,24 +994,42 @@ mod tests {
             &c,
             &mut out,
         );
-        assert!(matches!(out.as_slice(), [Action::CatchGolden(_)]));
+        assert!(
+            matches!(out.as_slice(), [Action::CatchPowerup(spawn_id)] if *spawn_id == id),
+            "got {out:?}"
+        );
     }
 
     #[test]
-    fn left_click_on_green_coin_emits_green_catch_only() {
-        // Regression: clicking the green-coin marker used to emit
-        // `Action::CatchGolden`, which would catch BOTH a Golden and a
-        // Green Coin if both were on screen. They're separate now.
-        let mut s = state_with_golden();
-        s.green_coin = Some(crate::game::green_coin::GreenCoin {
+    fn left_click_on_powerup_only_catches_one_under_cursor() {
+        // Two powerups on screen; clicking the second's rect catches only
+        // it. Multiple powerups coexist — clicking one doesn't vacuum up
+        // any others, regardless of kind.
+        let mut s = GameState::default();
+        let lucky_id = s.mint_spawn_id();
+        s.powerups.push(Powerup {
+            kind: PowerupKind::Lucky,
+            spawn_id: lucky_id,
+            frac_x: 0.5,
+            frac_y: 0.5,
+            life_ticks: 100,
+        });
+        let green_id = s.mint_spawn_id();
+        s.powerups.push(Powerup {
+            kind: PowerupKind::GreenCoin,
+            spawn_id: green_id,
             frac_x: 0.5,
             frac_y: 0.5,
             life_ticks: 100,
         });
         let mut ui = UiState::new();
-        let mut c = ctx(
+        let powerup_rects = [
+            (lucky_id, rect(50, 12, 5, 3)),
+            (green_id, rect(70, 12, 5, 3)),
+        ];
+        let c = ctx(
             Rect::default(),
-            rect(50, 12, 4, 2),
+            &powerup_rects,
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -1031,7 +1038,6 @@ mod tests {
             false,
             &s,
         );
-        c.green_coin_rect = rect(70, 12, 5, 3);
         let mut out = Vec::new();
         process_input_event(
             mouse_down(72, 13, MouseButton::Left, Modifiers::default()),
@@ -1039,20 +1045,29 @@ mod tests {
             &c,
             &mut out,
         );
-        assert!(matches!(out.as_slice(), [Action::CatchGreenCoin]));
+        assert!(
+            matches!(out.as_slice(), [Action::CatchPowerup(id)] if *id == green_id),
+            "got {out:?}"
+        );
     }
 
     #[test]
-    fn g_with_both_powerups_picks_lower_life_ticks() {
-        // [g] should grab the most-urgent powerup first when both are on
-        // screen, then a follow-up [g] press grabs the leftover. Tie
-        // (g_life == c_life) goes to the regular Golden as a tiebreak.
-        let mut s = state_with_golden();
-        // Pin life_ticks so we control the ordering.
-        if let Some(g) = s.goldens[GoldenVariant::Lucky as usize].as_mut() {
-            g.life_ticks = 50;
-        }
-        s.green_coin = Some(crate::game::green_coin::GreenCoin {
+    fn g_with_two_kinds_picks_lower_life_ticks() {
+        // `g` should grab the most-urgent powerup first when multiples are
+        // on screen, regardless of kind. Min by `life_ticks`.
+        let mut s = GameState::default();
+        let lucky_id = s.mint_spawn_id();
+        s.powerups.push(Powerup {
+            kind: PowerupKind::Lucky,
+            spawn_id: lucky_id,
+            frac_x: 0.5,
+            frac_y: 0.5,
+            life_ticks: 50,
+        });
+        let green_id = s.mint_spawn_id();
+        s.powerups.push(Powerup {
+            kind: PowerupKind::GreenCoin,
+            spawn_id: green_id,
             frac_x: 0.5,
             frac_y: 0.5,
             life_ticks: 200,
@@ -1061,15 +1076,25 @@ mod tests {
         let mut ui = UiState::new();
         let mut out = Vec::new();
         process_input_event(key(KeyCode::Char('g')), &mut ui, &c, &mut out);
-        // Golden has 50 ticks left, green has 200 — Golden is more urgent.
-        assert!(matches!(out.as_slice(), [Action::CatchGolden(_)]));
+        assert!(
+            matches!(out.as_slice(), [Action::CatchPowerup(id)] if *id == lucky_id),
+            "lower-life Lucky should win, got {out:?}"
+        );
 
         // Flip the lifetimes — green is now the urgent one.
-        let mut s = state_with_golden();
-        if let Some(g) = s.goldens[GoldenVariant::Lucky as usize].as_mut() {
-            g.life_ticks = 200;
-        }
-        s.green_coin = Some(crate::game::green_coin::GreenCoin {
+        let mut s = GameState::default();
+        let lucky_id = s.mint_spawn_id();
+        s.powerups.push(Powerup {
+            kind: PowerupKind::Lucky,
+            spawn_id: lucky_id,
+            frac_x: 0.5,
+            frac_y: 0.5,
+            life_ticks: 200,
+        });
+        let green_id = s.mint_spawn_id();
+        s.powerups.push(Powerup {
+            kind: PowerupKind::GreenCoin,
+            spawn_id: green_id,
             frac_x: 0.5,
             frac_y: 0.5,
             life_ticks: 50,
@@ -1077,17 +1102,21 @@ mod tests {
         let c = empty_ctx(&s);
         let mut out = Vec::new();
         process_input_event(key(KeyCode::Char('g')), &mut ui, &c, &mut out);
-        assert!(matches!(out.as_slice(), [Action::CatchGreenCoin]));
+        assert!(
+            matches!(out.as_slice(), [Action::CatchPowerup(id)] if *id == green_id),
+            "lower-life GreenCoin should win, got {out:?}"
+        );
     }
 
     #[test]
-    fn right_click_on_golden_also_catches() {
+    fn right_click_on_powerup_also_catches() {
         // The marker is small and reflex right-clicks shouldn't waste it.
-        let s = state_with_golden();
+        let (s, id) = state_with_lucky();
         let mut ui = UiState::new();
+        let powerup_rects = [(id, rect(50, 12, 4, 2))];
         let c = ctx(
             Rect::default(),
-            rect(50, 12, 4, 2),
+            &powerup_rects,
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -1103,7 +1132,10 @@ mod tests {
             &c,
             &mut out,
         );
-        assert!(matches!(out.as_slice(), [Action::CatchGolden(_)]));
+        assert!(
+            matches!(out.as_slice(), [Action::CatchPowerup(spawn_id)] if *spawn_id == id),
+            "got {out:?}"
+        );
     }
 
     #[test]
@@ -1113,7 +1145,7 @@ mod tests {
         let rows = [(2_usize, rect(100, 5, 38, 3))];
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             Rect::default(),
             Rect::default(),
             &rows,
@@ -1146,7 +1178,7 @@ mod tests {
         let rows = [(2_usize, rect(100, 5, 38, 3))];
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             Rect::default(),
             Rect::default(),
             &rows,
@@ -1178,7 +1210,7 @@ mod tests {
         let rows = [(2_usize, rect(100, 5, 38, 3))];
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             Rect::default(),
             Rect::default(),
             &rows,
@@ -1216,7 +1248,7 @@ mod tests {
         let mut ui = UiState::new();
         let c = ctx(
             rect(40, 10, 20, 10), // biscuit far from click
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30), // play_area covers the click
             Rect::default(),
             &[],
@@ -1247,7 +1279,7 @@ mod tests {
         let mut ui = UiState::new();
         let c = ctx(
             rect(40, 10, 20, 10),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30), // play area capped at col 100
             Rect::default(),
             &[],
@@ -1273,7 +1305,7 @@ mod tests {
         let mut ui = UiState::new();
         let c = ctx(
             rect(40, 10, 20, 10),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -1301,7 +1333,7 @@ mod tests {
         let hits = [(HelpAction::Quit, rect(50, 29, 8, 1))];
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -1328,7 +1360,7 @@ mod tests {
         let hits = [(HelpAction::OpenMode(Mode::Stats), rect(50, 29, 8, 1))];
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -1359,7 +1391,7 @@ mod tests {
         let mut ui = UiState::new();
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             rect(40, 15, 30, 1), // prestige_reset_rect at this position
             &[],
@@ -1390,7 +1422,7 @@ mod tests {
         ui.mode = Mode::Prestige;
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             rect(40, 15, 30, 1),
             &[],
@@ -1423,7 +1455,7 @@ mod tests {
         let mut ui = UiState::new();
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -1453,7 +1485,7 @@ mod tests {
         let mut ui = UiState::new();
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -1483,7 +1515,7 @@ mod tests {
         ui.zoom_idx = 0;
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -1514,7 +1546,7 @@ mod tests {
         ui.zoom_idx = last;
         let c = ctx(
             Rect::default(),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],
@@ -1563,7 +1595,7 @@ mod tests {
         let mut ui = UiState::new();
         let c = ctx(
             rect(40, 10, 20, 10),
-            Rect::default(),
+            &[],
             rect(0, 0, 100, 30),
             Rect::default(),
             &[],

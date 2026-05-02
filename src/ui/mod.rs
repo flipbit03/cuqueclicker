@@ -66,9 +66,7 @@ pub enum HelpAction {
 /// and call [`crate::input::InputContext::from_layout`] to project it
 /// into the per-event input context. Adding a new clickable region only
 /// touches this struct + `InputContext` + the projection — never the
-/// platform code. (We were burned by the alternative once: a missing
-/// `green_coin_rect` field on the wasm-side `InputContext` constructor
-/// crashed the wasm build after the native code shipped just fine.)
+/// platform code.
 #[derive(Default)]
 pub struct DrawOutput {
     pub biscuit_rect: Rect,
@@ -78,14 +76,12 @@ pub struct DrawOutput {
     /// width 60, etc.), so the bbox center isn't the visual center. This
     /// drives `hands::draw`'s orbit center.
     pub biscuit_focal: (u16, u16),
-    /// One rect per Golden variant slot, indexed by `GoldenVariant as usize`
-    /// (Lucky=0, Frenzy=1, Buff=2). Zero-rect when that slot is empty.
-    /// Each is hit-tested independently — clicking one variant doesn't
-    /// vacuum up an active sibling.
-    pub golden_rects: [Rect; 3],
-    /// On-screen Green Coin marker rect, or zero-rect when no coin is
-    /// visible. Click-routes through `Action::CatchGreenCoin`.
-    pub green_coin_rect: Rect,
+    /// `(spawn_id, screen_rect)` for every on-screen powerup, in render
+    /// order. Click hit-test and the `g` hotkey BOTH reference instances
+    /// by `spawn_id` (not by Vec index) so a `swap_remove` on catch is
+    /// safe even when multiple events hold layout snapshots between
+    /// frames. Empty when no powerups are visible.
+    pub powerup_rects: Vec<(u64, Rect)>,
     /// The whole left column where the biscuit + hands + particles live —
     /// i.e. "the box that displays the ass." Used by the input router so
     /// the scroll-wheel zoom fires anywhere in this region (including the
@@ -237,10 +233,13 @@ pub fn draw(
     for b in &state.buffs {
         let secs = b.ticks_remaining().div_ceil(TICK_HZ);
         let (label, color) = match b {
-            Buff::ClickFrenzy { mult, .. } => (
-                format!("  [!! FRENZY x{} {}s]", *mult as u64, secs),
-                Color::Rgb(255, 80, 80),
-            ),
+            // The legacy `mult` field is no longer the actual click
+            // multiplier (per-click yield is FPS-scaled now); just label
+            // the buff and show its remaining time. Cleaner than showing
+            // a number that doesn't reflect the real bonus.
+            Buff::ClickFrenzy { .. } => {
+                (format!("  [!! FRENZY {}s]", secs), Color::Rgb(255, 80, 80))
+            }
         };
         hud_spans.push(Span::styled(
             label,
@@ -309,24 +308,20 @@ pub fn draw(
     if debug {
         debug_pane::draw(frame, left[1]);
     }
-    // Each variant is rendered independently from its own slot. Order
-    // doesn't matter for the visual result — they're at different
-    // fractional positions on the biscuit (sometimes overlapping at
-    // random; that's fine).
-    let mut golden_rects: [Rect; 3] = [Rect::default(); 3];
-    for (i, slot) in state.goldens.iter().enumerate() {
-        if let Some(g) = slot {
-            golden_rects[i] = biscuit::draw_golden(frame, g, biscuit_rect);
-        }
+    // Render every on-screen powerup; collect (spawn_id, rect) pairs so
+    // hit-testing remains stable across catches/swap_removes. Order is
+    // render order (Vec order); the click router walks the list and
+    // routes the first match, which is fine because the dispersion
+    // helper keeps positions distinct.
+    let mut powerup_rects: Vec<(u64, Rect)> = Vec::with_capacity(state.powerups.len());
+    for p in &state.powerups {
+        let r = biscuit::draw_powerup(frame, p, biscuit_rect);
+        powerup_rects.push((p.spawn_id, r));
     }
-    let green_coin_rect = match &state.green_coin {
-        Some(c) => biscuit::draw_green_coin(frame, c, biscuit_rect),
-        None => Rect::default(),
-    };
 
     // J1: achievement toast overlay. Lives in `left[1]` (biscuit/main area)
     // so it covers nothing important on the right; auto-dismisses after
-    // TOAST_TICKS via the sim. We render *after* biscuit/golden so it
+    // TOAST_TICKS via the sim. We render *after* biscuit/powerups so it
     // always sits on top.
     toast::draw(frame, left[1], state);
 
@@ -350,8 +345,7 @@ pub fn draw(
     DrawOutput {
         biscuit_rect,
         biscuit_focal,
-        golden_rects,
-        green_coin_rect,
+        powerup_rects,
         play_area: left[1],
         upgrade_rows,
         fingerer_rows,
