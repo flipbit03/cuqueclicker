@@ -284,30 +284,54 @@ fn demo_driver_tick(
     }
 
     // Keep the screen busy with goldens: tighter cooldown than normal.
-    if state.golden.is_none() && state.golden_cooldown == 0 {
-        state.golden_cooldown = DEMO_GOLDEN_COOLDOWN;
+    // Force the next-eligible variant slot's cooldown to a short value
+    // so the demo doesn't have to wait the natural per-variant rng.
+    let any_golden = state.goldens.iter().any(|g| g.is_some());
+    if !any_golden {
+        for cd in state.golden_cooldowns.iter_mut() {
+            if *cd == 0 {
+                *cd = DEMO_GOLDEN_COOLDOWN;
+            }
+        }
     }
 
     // Force the variant on freshly-spawned goldens so the clip deterministically
     // cycles Buff → Frenzy → Lucky. Buff comes first so a viewer definitely
-    // sees the purple powerup.
-    if let Some(g) = &mut state.golden
-        && g.life_ticks == golden::GOLDEN_LIFE_TICKS
-    {
-        g.variant = match *demo_golden_spawns % 3 {
-            0 => GoldenVariant::Buff,
-            1 => GoldenVariant::Frenzy,
-            _ => GoldenVariant::Lucky,
-        };
-        *demo_golden_spawns += 1;
+    // sees the purple powerup. After spawn we MOVE the slot to the
+    // chosen variant's index so the rest of the game's per-variant
+    // routing keeps working.
+    for slot_idx in 0..state.goldens.len() {
+        if let Some(g) = state.goldens[slot_idx].as_ref()
+            && g.life_ticks == golden::GOLDEN_LIFE_TICKS
+        {
+            let target = match *demo_golden_spawns % 3 {
+                0 => GoldenVariant::Buff,
+                1 => GoldenVariant::Frenzy,
+                _ => GoldenVariant::Lucky,
+            };
+            *demo_golden_spawns += 1;
+            if slot_idx != target as usize {
+                let mut g = state.goldens[slot_idx].take().unwrap();
+                g.variant = target;
+                state.goldens[target as usize] = Some(g);
+            } else if let Some(g) = state.goldens[slot_idx].as_mut() {
+                g.variant = target;
+            }
+            break;
+        }
     }
 
-    // Auto-catch whatever golden is on screen after a brief "reaction
-    // time" so the marker is actually visible before disappearing.
-    if let Some(g) = &state.golden
-        && g.life_ticks + 20 < golden::GOLDEN_LIFE_TICKS
-    {
-        state.catch_golden();
+    // Auto-catch whatever golden has been on screen long enough so the
+    // marker is actually visible before disappearing. Iterate every
+    // variant slot independently.
+    for variant in GoldenVariant::ALL {
+        let alive = state.goldens[variant as usize]
+            .as_ref()
+            .map(|g| g.life_ticks + 20 < golden::GOLDEN_LIFE_TICKS)
+            .unwrap_or(false);
+        if alive {
+            state.catch_golden(variant);
+        }
     }
 
     // Every ~4s, buy 1-2 of a random affordable fingerer.
@@ -457,10 +481,11 @@ pub fn build_demo_state() -> GameState {
         total_play_ticks: 3600 * TICK_HZ as u64, // pretend we've been at this an hour
         prestige: 3,
         golden_caught: 7,
-        // Default is a random 20-80s wait; force 0 so the first demo golden
-        // (a Buff, per the cycle in demo_driver_tick) spawns on tick 1 —
-        // the purple powerup lands well within the first few seconds of the clip.
-        golden_cooldown: 0,
+        // Default is a random 20-80s wait per slot; force all to 0 so the
+        // first demo golden (a Buff, per the cycle in demo_driver_tick)
+        // spawns on tick 1 — the purple powerup lands well within the
+        // first few seconds of the clip.
+        golden_cooldowns: [0; 3],
         best_fps: 50_000.0,
         ..GameState::default()
     };

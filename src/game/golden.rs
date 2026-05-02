@@ -17,6 +17,11 @@ pub enum GoldenVariant {
 }
 
 impl GoldenVariant {
+    /// All variants, in stable discriminant order. `GoldenVariant as usize`
+    /// indexes into `state.goldens` — keep the order in sync with that
+    /// array's slot semantics.
+    pub const ALL: [Self; 3] = [Self::Lucky, Self::Frenzy, Self::Buff];
+
     pub fn random() -> Self {
         let r: f64 = rand::rng().random();
         if r < 0.6 {

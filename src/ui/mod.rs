@@ -72,11 +72,19 @@ pub enum HelpAction {
 #[derive(Default)]
 pub struct DrawOutput {
     pub biscuit_rect: Rect,
-    pub golden_rect: Rect,
+    /// Screen position of the biscuit's focal cell ("the asshole"). Each
+    /// zoom level's art has the focal at a slightly different offset
+    /// inside its bounding box (TINY: col 7 of width 16, FULL: col 31 of
+    /// width 60, etc.), so the bbox center isn't the visual center. This
+    /// drives `hands::draw`'s orbit center.
+    pub biscuit_focal: (u16, u16),
+    /// One rect per Golden variant slot, indexed by `GoldenVariant as usize`
+    /// (Lucky=0, Frenzy=1, Buff=2). Zero-rect when that slot is empty.
+    /// Each is hit-tested independently — clicking one variant doesn't
+    /// vacuum up an active sibling.
+    pub golden_rects: [Rect; 3],
     /// On-screen Green Coin marker rect, or zero-rect when no coin is
-    /// visible. Hit-tested by the click router exactly like `golden_rect`
-    /// — clicking either one routes through `Action::CatchGolden`, which
-    /// the sim resolves by trying both catch paths.
+    /// visible. Click-routes through `Action::CatchGreenCoin`.
     pub green_coin_rect: Rect,
     /// The whole left column where the biscuit + hands + particles live —
     /// i.e. "the box that displays the ass." Used by the input router so
@@ -288,7 +296,8 @@ pub fn draw(
     frame.render_widget(hud, hud_inner);
 
     let biscuit_rect = biscuit::draw(frame, left[1], state, zoom_idx);
-    hands::draw(frame, left[1], biscuit_rect, state);
+    let biscuit_focal = biscuit::focal_point(zoom_idx, biscuit_rect);
+    hands::draw(frame, left[1], biscuit_rect, biscuit_focal, state);
     effects::draw_particles(frame, biscuit_rect, &state.particles);
     effects::draw_misclicks(frame, &state.misclick_particles);
     draw_zoom_indicator(
@@ -300,10 +309,16 @@ pub fn draw(
     if debug {
         debug_pane::draw(frame, left[1]);
     }
-    let golden_rect = match &state.golden {
-        Some(g) => biscuit::draw_golden(frame, g, biscuit_rect),
-        None => Rect::default(),
-    };
+    // Each variant is rendered independently from its own slot. Order
+    // doesn't matter for the visual result — they're at different
+    // fractional positions on the biscuit (sometimes overlapping at
+    // random; that's fine).
+    let mut golden_rects: [Rect; 3] = [Rect::default(); 3];
+    for (i, slot) in state.goldens.iter().enumerate() {
+        if let Some(g) = slot {
+            golden_rects[i] = biscuit::draw_golden(frame, g, biscuit_rect);
+        }
+    }
     let green_coin_rect = match &state.green_coin {
         Some(c) => biscuit::draw_green_coin(frame, c, biscuit_rect),
         None => Rect::default(),
@@ -334,7 +349,8 @@ pub fn draw(
 
     DrawOutput {
         biscuit_rect,
-        golden_rect,
+        biscuit_focal,
+        golden_rects,
         green_coin_rect,
         play_area: left[1],
         upgrade_rows,

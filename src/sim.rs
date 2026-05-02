@@ -43,7 +43,12 @@ pub enum Action {
         row: u16,
     },
     ClickCenter,
-    CatchGolden,
+    /// Catch the Golden Cuque of the given variant. Each variant has its
+    /// own independent on-screen slot, so this only catches the targeted
+    /// one — never vacuums up a neighbor.
+    CatchGolden(GoldenVariant),
+    /// Catch the on-screen Green Coin specifically.
+    CatchGreenCoin,
     BuyFingerer {
         idx: usize,
         qty: BuyQty,
@@ -106,12 +111,10 @@ pub fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometr
             // key (terminal repeat) → streak climbs over time.
             state.space_pressed_this_tick = true;
         }
-        Action::CatchGolden => {
-            // Catch button is unified across the on-screen powerups — try
-            // both and let whichever's present consume the press. Order
-            // doesn't matter (independent slots) but Golden goes first to
-            // match the legacy code path.
-            state.catch_golden();
+        Action::CatchGolden(variant) => {
+            state.catch_golden(variant);
+        }
+        Action::CatchGreenCoin => {
             state.catch_green_coin();
         }
         Action::BuyFingerer { idx, qty } => match qty {
@@ -190,26 +193,33 @@ fn maybe_spawn_auto_particle(state: &mut GameState, geom: &SimGeometry) {
 }
 
 fn maybe_spawn_golden(state: &mut GameState, geom: &SimGeometry) {
-    if state.golden.is_some() || state.golden_cooldown > 0 {
-        return;
-    }
     if geom.biscuit.width < 8 || geom.biscuit.height < 5 {
         return;
     }
-    state.golden = Some(golden::spawn_in(geom.biscuit));
+    // Each variant runs on its own clock — find the variants whose
+    // cooldown has hit zero and whose slot is empty, and spawn each.
+    // Cooldown reset for that variant happens here too, so a stuck
+    // zero-cooldown can't re-spawn every tick.
+    for variant in GoldenVariant::ALL {
+        let i = variant as usize;
+        if state.golden_cooldowns[i] > 0 || state.goldens[i].is_some() {
+            continue;
+        }
+        let mut g = golden::spawn_in(geom.biscuit);
+        g.variant = variant;
+        state.goldens[i] = Some(g);
+        state.golden_cooldowns[i] = crate::game::golden::next_cooldown();
 
-    // Green Coin spawn pity: each regular Golden spawn bumps the chance
-    // by 1%. The roll fires whether or not a Green Coin slot is currently
-    // free; if one's already on screen, the counter still increments but
-    // the roll is *not* re-cast (the existing coin keeps its turn). The
-    // counter resets the moment a Green Coin appears, regardless of
-    // whether the player catches it or it expires.
-    state.goldens_since_green_coin = state.goldens_since_green_coin.saturating_add(1);
-    if state.green_coin.is_none() {
-        let p = state.goldens_since_green_coin as f64 * 0.01;
-        if rand::rng().random::<f64>() < p {
-            state.green_coin = Some(green_coin::spawn_in(geom.biscuit));
-            state.goldens_since_green_coin = 0;
+        // Green Coin spawn pity: each regular Golden spawn bumps the
+        // chance by 1%. Counter resets the moment a Green Coin appears,
+        // regardless of whether the player catches it or it expires.
+        state.goldens_since_green_coin = state.goldens_since_green_coin.saturating_add(1);
+        if state.green_coin.is_none() {
+            let p = state.goldens_since_green_coin as f64 * 0.01;
+            if rand::rng().random::<f64>() < p {
+                state.green_coin = Some(green_coin::spawn_in(geom.biscuit));
+                state.goldens_since_green_coin = 0;
+            }
         }
     }
 }
@@ -218,9 +228,15 @@ fn force_spawn_golden(state: &mut GameState, geom: &SimGeometry, variant: Golden
     if geom.biscuit.width < 8 || geom.biscuit.height < 5 {
         return;
     }
+    // Per-variant slot: F-key cheats only spawn into their own slot —
+    // pressing F2 (Frenzy) never displaces an active Lucky, etc. If
+    // that slot is already occupied, the press is a no-op.
+    if state.goldens[variant as usize].is_some() {
+        return;
+    }
     let mut g = golden::spawn_in(geom.biscuit);
     g.variant = variant;
-    state.golden = Some(g);
+    state.goldens[variant as usize] = Some(g);
 }
 
 fn force_spawn_green_coin(state: &mut GameState, geom: &SimGeometry) {
@@ -231,4 +247,44 @@ fn force_spawn_green_coin(state: &mut GameState, geom: &SimGeometry) {
         return;
     }
     state.green_coin = Some(green_coin::spawn_in(geom.biscuit));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::state::GameState;
+    use ratatui::layout::Rect;
+
+    fn geom_with_biscuit() -> SimGeometry {
+        SimGeometry {
+            biscuit: Rect::new(0, 0, 40, 20),
+        }
+    }
+
+    #[test]
+    fn force_spawn_does_not_clobber_other_variants() {
+        // Regression: prior to per-variant slots, pressing F2 (Frenzy)
+        // would replace an existing Lucky on screen. With per-variant
+        // slots, every variant has independent state.
+        let mut state = GameState::default();
+        let geom = geom_with_biscuit();
+        force_spawn_golden(&mut state, &geom, GoldenVariant::Lucky);
+        force_spawn_golden(&mut state, &geom, GoldenVariant::Frenzy);
+        force_spawn_golden(&mut state, &geom, GoldenVariant::Buff);
+        assert!(state.goldens[GoldenVariant::Lucky as usize].is_some());
+        assert!(state.goldens[GoldenVariant::Frenzy as usize].is_some());
+        assert!(state.goldens[GoldenVariant::Buff as usize].is_some());
+    }
+
+    #[test]
+    fn catch_golden_only_consumes_targeted_variant() {
+        let mut state = GameState::default();
+        let geom = geom_with_biscuit();
+        force_spawn_golden(&mut state, &geom, GoldenVariant::Lucky);
+        force_spawn_golden(&mut state, &geom, GoldenVariant::Frenzy);
+        // Catching Lucky leaves Frenzy alone.
+        state.catch_golden(GoldenVariant::Lucky);
+        assert!(state.goldens[GoldenVariant::Lucky as usize].is_none());
+        assert!(state.goldens[GoldenVariant::Frenzy as usize].is_some());
+    }
 }

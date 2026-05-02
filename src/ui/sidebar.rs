@@ -2,7 +2,9 @@ use ratatui::{prelude::*, widgets::*};
 
 use crate::format;
 use crate::game::fingerer::{self, FINGERERS};
-use crate::game::state::{GameState, PURCHASE_FLASH_TICKS, UNLOCK_FLASH_TICKS};
+use crate::game::state::{
+    GREEN_COIN_ROW_FLASH_TICKS, GameState, PURCHASE_FLASH_TICKS, UNLOCK_FLASH_TICKS,
+};
 use crate::i18n::t;
 use crate::ui::border;
 
@@ -13,6 +15,10 @@ const UNAFFORDABLE_TINT: (f32, f32, f32) = (255.0, 60.0, 60.0);
 /// sits a notch above the regular purchase flash hue so the player can
 /// tell the two events apart on glance.
 const UNLOCK_TINT: (f32, f32, f32) = (120.0, 255.0, 140.0);
+/// Warm gold for the row that just received a Green Coin boost.
+/// Matches the "+10% <fingerer>" particle hue (`ParticleKind::Golden`),
+/// so the eye can track the floating label down to the sidebar row.
+const GREEN_COIN_ROW_TINT: (f32, f32, f32) = (255.0, 215.0, 0.0);
 // Resting color the flash starts from / returns to (neutral gray similar to
 // default terminal text, so the transition in and out is gentle).
 const FLASH_REST: (f32, f32, f32) = (200.0, 200.0, 210.0);
@@ -280,10 +286,16 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
             .get(fingerer_idx)
             .copied()
             .unwrap_or(0);
+        let green_coin_ticks = state
+            .fingerer_green_coin_flash
+            .get(fingerer_idx)
+            .copied()
+            .unwrap_or(0);
         // Per-row tint priority:
-        //   purchase    (you just bought)        — wins, longest, with bulk amp
+        //   purchase     (you just bought)        — wins, longest, with bulk amp
         //   unaffordable (you tried + failed)    — wins over unlock
-        //   unlock      (just became affordable) — quietly announces the row
+        //   green-coin   (Green Coin landed here) — gold shimmer, ~2s
+        //   unlock       (just became affordable) — quietly announces the row
         // `strength` is the carrier blend (timing only, 0..1); `amp`
         // boosts the wave's tint contribution for bulk buys.
         let (strength, tint, amp) = if purchase_ticks > 0 {
@@ -296,6 +308,12 @@ fn paint_flashes(frame: &mut Frame, area: Rect, state: &GameState, visible: &[us
             (
                 smoothstep(unaff_ticks as f32 / (PURCHASE_FLASH_TICKS as f32 / 2.0)),
                 UNAFFORDABLE_TINT,
+                1.0,
+            )
+        } else if green_coin_ticks > 0 {
+            (
+                smoothstep(green_coin_ticks as f32 / GREEN_COIN_ROW_FLASH_TICKS as f32),
+                GREEN_COIN_ROW_TINT,
                 1.0,
             )
         } else if unlock_ticks > 0 {

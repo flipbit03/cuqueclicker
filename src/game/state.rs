@@ -256,10 +256,21 @@ pub struct GameState {
     /// MISSED the biscuit, including the dead zone at low zoom).
     #[serde(skip)]
     pub misclick_particles: Vec<MisclickParticle>,
+    /// Per-variant Golden Cuque slots — `goldens[GoldenVariant::Lucky as usize]`
+    /// holds the on-screen Lucky, etc. Each variant has its own independent
+    /// slot AND its own independent cooldown so spawn timing is fully
+    /// desynchronized — Lucky's clock doesn't gate Frenzy's, and a Buff
+    /// expiring doesn't reset Lucky's cooldown.
     #[serde(skip)]
-    pub golden: Option<GoldenCuque>,
+    pub goldens: [Option<GoldenCuque>; 3],
+    /// Per-variant spawn cooldowns, indexed the same as `goldens`. Each
+    /// freezes while its own slot is occupied (no point counting down
+    /// when there's nowhere to spawn) and rolls a fresh value on
+    /// catch/expiry. Initial values come from `next_cooldown()` in
+    /// `Default`, which already randomizes them so no two variants
+    /// arrive at zero simultaneously on a fresh save.
     #[serde(skip)]
-    pub golden_cooldown: u32,
+    pub golden_cooldowns: [u32; 3],
     /// On-screen Green Coin, if one is currently visible. Lifetime ticked
     /// down by `tick_green_coin`; cleared on catch or expiry. Not persisted
     /// (parallel to `golden`) — closing and reopening the game shouldn't
@@ -336,6 +347,13 @@ pub struct GameState {
     pub fingerer_unlock_flash: Vec<u32>,
     #[serde(skip)]
     pub upgrade_unlock_flash: Vec<u32>,
+    /// Brief gold shimmer on a fingerer row when a Green Coin catch
+    /// targeted it. Closes the visual loop with the floating
+    /// `+10% {fingerer}` particle and the green-tinted title-border
+    /// pulse — the gold here matches the catch particle, so the player
+    /// can see at a glance which row in the sidebar just took the boost.
+    #[serde(skip)]
+    pub fingerer_green_coin_flash: Vec<u32>,
     /// Previous-tick affordability per row, used to detect the
     /// false→true edge that triggers `*_unlock_flash`. Sized to catalog
     /// length by `migrate()` and seeded at init from the live state, so a
@@ -392,6 +410,11 @@ pub const PURCHASE_FLASH_TICKS: u32 = 20; // 1s at 20Hz
 /// blip lands without lingering for so long it competes with whatever might
 /// be running on top (Frenzy, Buff, Lucky).
 pub const GREEN_COIN_FLASH_TICKS: u32 = 50; // 2.5s at 20Hz
+/// Per-row gold shimmer on the targeted fingerer's sidebar row when a
+/// Green Coin catch lands on it. ~2 seconds — long enough for the eye
+/// to track from the floating `+10% {fingerer}` particle over to the
+/// row, short enough that it doesn't outlive the catch event.
+pub const GREEN_COIN_ROW_FLASH_TICKS: u32 = TICK_HZ * 2; // 2.0s at 20Hz
 
 /// Serde default for `GameState::version`. A direct deserialize of the live
 /// `GameState` from a pre-versioned save (one without the field) still
@@ -424,8 +447,12 @@ impl Default for GameState {
             clench_ticks: 0,
             particles: Vec::new(),
             misclick_particles: Vec::new(),
-            golden: None,
-            golden_cooldown: crate::game::golden::next_cooldown(),
+            goldens: [None, None, None],
+            golden_cooldowns: [
+                crate::game::golden::next_cooldown(),
+                crate::game::golden::next_cooldown(),
+                crate::game::golden::next_cooldown(),
+            ],
             green_coin: None,
             session_ticks: 0,
             newly_unlocked: Vec::new(),
@@ -445,6 +472,7 @@ impl Default for GameState {
             upgrade_unaffordable_flash: vec![0; UPGRADES.len()],
             fingerer_unlock_flash: vec![0; fingerer::count()],
             upgrade_unlock_flash: vec![0; UPGRADES.len()],
+            fingerer_green_coin_flash: vec![0; fingerer::count()],
             prev_fingerer_affordable: vec![false; fingerer::count()],
             prev_upgrade_affordable: vec![false; UPGRADES.len()],
             space_pressed_this_tick: false,
@@ -494,6 +522,9 @@ impl GameState {
         if self.upgrade_unlock_flash.len() != UPGRADES.len() {
             self.upgrade_unlock_flash = vec![0; UPGRADES.len()];
         }
+        if self.fingerer_green_coin_flash.len() != fingerer::count() {
+            self.fingerer_green_coin_flash = vec![0; fingerer::count()];
+        }
         // Seed `prev_affordable` from the LIVE state so a freshly-loaded
         // save with rows already affordable doesn't fire spurious unlock
         // flashes on tick 1. Resize if catalog grew/shrank.
@@ -509,8 +540,13 @@ impl GameState {
                 })
                 .collect();
         }
-        if self.golden_cooldown == 0 {
-            self.golden_cooldown = crate::game::golden::next_cooldown();
+        // Re-seed any cooldown left at 0 by an old save shape (the array
+        // is `#[serde(skip)]` so it's already at default; this is a
+        // defensive guard).
+        for cd in self.golden_cooldowns.iter_mut() {
+            if *cd == 0 {
+                *cd = crate::game::golden::next_cooldown();
+            }
         }
         // Seed the count-up tween at the live values so a freshly-loaded save
         // doesn't animate the HUD "from 0" up to whatever the player had.
@@ -778,22 +814,28 @@ impl GameState {
         self.cuques_flash_ticks = HUD_FLASH_TICKS;
     }
 
-    /// Catch whatever Golden Cuque is currently on screen (any variant:
-    /// Lucky, Frenzy, or Buff). Applies the variant-specific effect,
-    /// increments `golden_caught`, re-rolls the next spawn cooldown, and
-    /// returns the flat reward (0.0 for buff variants).
+    /// Catch the Golden Cuque of the given variant if one is currently
+    /// on screen. Applies the variant-specific effect, increments
+    /// `golden_caught` + the per-variant counter, re-rolls the shared
+    /// spawn cooldown, and returns the flat reward (0.0 for non-Lucky).
+    ///
+    /// Each variant lives in its own slot of `state.goldens`, so catching
+    /// e.g. a Lucky never disturbs an active Frenzy or Buff. Same applies
+    /// to expiry / cheat spawns.
     ///
     /// The `Buff` variant attaches a `MulFactor(7.0)` modifier with a
     /// 60-second `Ticks` duration on a random owned fingerer, sourced as
     /// `PurpleCoin`. Pre-#21 this was a global `Buff::FingererBoost`; the
     /// modifier system replaces it.
-    pub fn catch_golden(&mut self) -> f64 {
+    pub fn catch_golden(&mut self, variant: crate::game::golden::GoldenVariant) -> f64 {
         use crate::game::golden::GoldenVariant;
-        let Some(golden) = self.golden.take() else {
+        let Some(golden) = self.goldens[variant as usize].take() else {
             return 0.0;
         };
         self.golden_caught += 1;
-        self.golden_cooldown = crate::game::golden::next_cooldown();
+        // Reset only THIS variant's cooldown — sibling variants keep their
+        // own clocks running on independent schedules.
+        self.golden_cooldowns[variant as usize] = crate::game::golden::next_cooldown();
         let (reward, label) = match golden.variant {
             GoldenVariant::Lucky => {
                 self.lucky_caught += 1;
@@ -933,12 +975,16 @@ impl GameState {
         self.visual_debt = 0.0;
         self.particles.clear();
         self.misclick_particles.clear();
-        self.golden = None;
+        self.goldens = [None, None, None];
         self.green_coin = None;
         // Pity counter resets too — the new run earns its own Green Coins.
         self.goldens_since_green_coin = 0;
         self.clench_ticks = 0;
-        self.golden_cooldown = crate::game::golden::next_cooldown();
+        // Fresh per-variant cooldowns so the new run has its own
+        // independent rhythm from tick 1.
+        for cd in self.golden_cooldowns.iter_mut() {
+            *cd = crate::game::golden::next_cooldown();
+        }
         true
     }
 
@@ -993,6 +1039,9 @@ impl GameState {
             *t = t.saturating_sub(1);
         }
         for t in self.upgrade_unlock_flash.iter_mut() {
+            *t = t.saturating_sub(1);
+        }
+        for t in self.fingerer_green_coin_flash.iter_mut() {
             *t = t.saturating_sub(1);
         }
         // Held-spacebar streak with a small grace window. Real key-repeat
@@ -1141,15 +1190,21 @@ impl GameState {
     }
 
     pub fn tick_golden(&mut self) {
-        if let Some(g) = self.golden.as_mut() {
-            if g.life_ticks == 0 {
-                self.golden = None;
-                self.golden_cooldown = crate::game::golden::next_cooldown();
-            } else {
-                g.life_ticks -= 1;
+        // Each variant ages on its own clock. Lifetime ticks down per
+        // slot; on expiry, that slot's cooldown rolls fresh. Cooldown
+        // ticks down only when its variant's slot is empty — no point
+        // counting down to zero while there's nowhere to spawn.
+        for i in 0..self.goldens.len() {
+            if let Some(g) = self.goldens[i].as_mut() {
+                if g.life_ticks == 0 {
+                    self.goldens[i] = None;
+                    self.golden_cooldowns[i] = crate::game::golden::next_cooldown();
+                } else {
+                    g.life_ticks -= 1;
+                }
+            } else if self.golden_cooldowns[i] > 0 {
+                self.golden_cooldowns[i] -= 1;
             }
-        } else if self.golden_cooldown > 0 {
-            self.golden_cooldown -= 1;
         }
     }
 
@@ -1202,11 +1257,17 @@ impl GameState {
         self.green_coin_caught += 1;
         self.green_coin_flash_ticks = GREEN_COIN_FLASH_TICKS;
         // Visual feedback: a "+10% <fingerer>" particle anchored at the
-        // coin's position. Phase 5 wraps this with a green border channel
-        // pulse and proper marker rendering.
+        // coin's position + a gold sidebar-row shimmer on the targeted
+        // tier (closes the loop between the floating particle and the
+        // sidebar badge that just gained another +10%).
         let label = match &chosen {
             Some(id) => {
                 let idx = FINGERERS.iter().position(|f| f.id == id);
+                if let Some(i) = idx
+                    && let Some(slot) = self.fingerer_green_coin_flash.get_mut(i)
+                {
+                    *slot = GREEN_COIN_ROW_FLASH_TICKS;
+                }
                 let name = idx
                     .and_then(|i| crate::i18n::t().fingerer_names.get(i).copied())
                     .unwrap_or("?");

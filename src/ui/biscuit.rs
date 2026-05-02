@@ -40,16 +40,28 @@ fn prestige_body_tint(prestige: u64) -> ((f32, f32, f32), f32) {
 // `replace('O', '|')` collateral-damaging the `|` walls on rows 9-21,
 // and the burning-pulse overpaint also got fooled into picking the
 // wrong row when searching for a stand-in glyph.
+// Body walls at cols 1 and 59 → visual center column 30. The right-side
+// curve rows (2-8 top, 21-27 bottom) used to extend 1 column further from
+// center than their left-side mirrors, so the right wall `|` sat at the
+// same column as the curve `\` above it (no rounding offset) while the
+// left side had `/` 1 col inside the wall — visibly asymmetric. Shifted
+// the right cluster on each curve row 1 col left so the right contour now
+// rounds into the wall the same way the left does.
+//
+// Rows 0, 1, 28, 29 (the underscore row + adjacent `__,-~~` row) sit at
+// half-column offsets from the body center; their |L|/|R| asymmetry is
+// inherent to the even-width middle gap, and a 1-col shift just flips
+// which side is shorter. Left as-is.
 const BISCUIT_FULL: &[&str] = &[
     r"                    ____________________                    ",
     r"              __,-~~                    ~~-,__              ",
-    r"           ,-~'                                `~-,         ",
-    r"        ,-'                                        `-,      ",
-    r"      ,'                                              `.    ",
-    r"     /         -~-~-~-              -~-~-~-             \   ",
-    r"    /                                                    \  ",
-    r"   /             -~~-~-~~-                                \ ",
-    r"  /                                                        \",
+    r"           ,-~'                               `~-,          ",
+    r"        ,-'                                       `-,       ",
+    r"      ,'                                             `.     ",
+    r"     /         -~-~-~-              -~-~-~-            \    ",
+    r"    /                                                   \   ",
+    r"   /             -~~-~-~~-                               \  ",
+    r"  /                                                       \ ",
     r" |          -~-~-~-~-             -~-~-~-~-                |",
     r" |                                                         |",
     r" |                                                         |",
@@ -62,13 +74,13 @@ const BISCUIT_FULL: &[&str] = &[
     r" |                  ////////   |   \\\\\\\\                |",
     r" |                                                         |",
     r" |          -~-~-~-~-             -~-~-~-~-                |",
-    r"  \                                                        /",
-    r"   \             -~~-~-~~-                                / ",
-    r"    \                                                    /  ",
-    r"     \         -~-~-~-              -~-~-~-             /   ",
-    r"      `.                                              ,'    ",
-    r"        `-,                                        ,-'      ",
-    r"           `~-,                                ,-~'         ",
+    r"  \                                                       / ",
+    r"   \             -~~-~-~~-                               /  ",
+    r"    \                                                   /   ",
+    r"     \         -~-~-~-              -~-~-~-            /    ",
+    r"      `.                                             ,'     ",
+    r"        `-,                                       ,-'       ",
+    r"           `~-,                               ,-~'          ",
     r"              `~-,,_                      _,,-~'            ",
     r"                   `~-,,______________,,-~'                 ",
 ];
@@ -94,19 +106,24 @@ const BISCUIT_MEDIUM: &[&str] = &[
     r"         `~-,,_______________,,-~'      ",
 ];
 
+// Body walls sit at cols 1 and 25 → visual center column 13. The rounded
+// contour rows (0-3, 9-11) used to terminate one column short of the wall
+// on the right side, leaving a 2-column gap between e.g. `\` (row 3) and
+// `|` (row 4). Symmetrized around col 13 so each row's left margin and
+// right margin are equal — same shape now reads as a closed oval.
 const BISCUIT_SMALL: &[&str] = &[
-    r"        __________        ",
-    r"     ,-~          ~-,     ",
-    r"   ,'                `.   ",
-    r"  /    -~-~-  -~-~-    \  ",
+    r"        ___________       ",
+    r"     ,-~           ~-,    ",
+    r"   ,'                 `.  ",
+    r"  /    -~-~-  -~-~-     \ ",
     r" |       \\\ | ///       | ",
     r" |        \\\|///        | ",
     r" | ~ - -           - - ~ | ",
     r" |        ///|\\\        | ",
     r" |       /// | \\\       | ",
-    r"  \    -~-~-  -~-~-    /  ",
-    r"   `.                ,'   ",
-    r"     `-,,________,,-'     ",
+    r"  \    -~-~-  -~-~-     / ",
+    r"   `.                 ,'  ",
+    r"     `-,,_________,,-'    ",
 ];
 
 const BISCUIT_TINY: &[&str] = &[
@@ -170,6 +187,16 @@ const BISCUIT_LEVELS: &[BiscuitArt] = &[
 
 pub fn level_count() -> usize {
     BISCUIT_LEVELS.len()
+}
+
+/// Screen coordinates of the focal cell ("the asshole") for the given
+/// zoom level + biscuit rect. Used by `hands::draw` to orbit the ring
+/// around the visual cuque center rather than the bounding-box center
+/// (which differs by up to 1 column in TINY/FULL because each art's
+/// `asshole_col` isn't exactly `width / 2`).
+pub fn focal_point(zoom_idx: usize, biscuit: Rect) -> (u16, u16) {
+    let level = &BISCUIT_LEVELS[zoom_idx.min(BISCUIT_LEVELS.len() - 1)];
+    (biscuit.x + level.asshole_col, biscuit.y + level.asshole_row)
 }
 
 pub fn level_label(idx: usize) -> Option<&'static str> {

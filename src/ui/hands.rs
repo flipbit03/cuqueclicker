@@ -15,12 +15,23 @@ const PER_RING: usize = 48;
 /// Mirrors the placement math in `draw()` exactly — keep in sync if either
 /// changes. Cheap: at most `PER_TYPE_CAP * FINGERERS.len()` hand
 /// candidates, and we early-return on the first match.
-pub fn occupied_at(col: u16, row: u16, biscuit: Rect, state: &GameState) -> bool {
+pub fn occupied_at(
+    col: u16,
+    row: u16,
+    biscuit: Rect,
+    focal: (u16, u16),
+    state: &GameState,
+) -> bool {
     if biscuit.width == 0 || biscuit.height == 0 {
         return false;
     }
-    let cx = biscuit.x as f32 + biscuit.width as f32 / 2.0;
-    let cy = biscuit.y as f32 + biscuit.height as f32 / 2.0;
+    // Orbit around the focal cell ("the asshole"), NOT the bbox center.
+    // Each zoom art's `asshole_col` differs from `width / 2` by up to 1
+    // column (TINY: 7 vs 8, FULL: 31 vs 30, etc.), and using the bbox
+    // center makes the ring visibly lopsided around the cuque. Radii
+    // still derive from bbox dimensions — that's the right scale.
+    let cx = focal.0 as f32;
+    let cy = focal.1 as f32;
     let base_rx = (biscuit.width as f32 / 2.0 + 3.0).max(6.0);
     let base_ry = (biscuit.height as f32 / 2.0 + 2.0).max(3.0);
 
@@ -84,13 +95,20 @@ pub fn occupied_at(col: u16, row: u16, biscuit: Rect, state: &GameState) -> bool
     false
 }
 
-pub fn draw(frame: &mut Frame, play_area: Rect, biscuit: Rect, state: &GameState) {
+pub fn draw(
+    frame: &mut Frame,
+    play_area: Rect,
+    biscuit: Rect,
+    focal: (u16, u16),
+    state: &GameState,
+) {
     if play_area.width == 0 || play_area.height == 0 {
         return;
     }
     let buf = frame.buffer_mut();
-    let cx = biscuit.x as f32 + biscuit.width as f32 / 2.0;
-    let cy = biscuit.y as f32 + biscuit.height as f32 / 2.0;
+    // Orbit around the visual focal cell — see comment in `occupied_at`.
+    let cx = focal.0 as f32;
+    let cy = focal.1 as f32;
 
     let base_rx = (biscuit.width as f32 / 2.0 + 3.0).max(6.0);
     let base_ry = (biscuit.height as f32 / 2.0 + 2.0).max(3.0);
