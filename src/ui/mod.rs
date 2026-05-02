@@ -233,10 +233,13 @@ pub fn draw(
     for b in &state.buffs {
         let secs = b.ticks_remaining().div_ceil(TICK_HZ);
         let (label, color) = match b {
-            Buff::ClickFrenzy { mult, .. } => (
-                format!("  [!! FRENZY x{} {}s]", *mult as u64, secs),
-                Color::Rgb(255, 80, 80),
-            ),
+            // The legacy `mult` field is no longer the actual click
+            // multiplier (per-click yield is FPS-scaled now); just label
+            // the buff and show its remaining time. Cleaner than showing
+            // a number that doesn't reflect the real bonus.
+            Buff::ClickFrenzy { .. } => {
+                (format!("  [!! FRENZY {}s]", secs), Color::Rgb(255, 80, 80))
+            }
         };
         hud_spans.push(Span::styled(
             label,

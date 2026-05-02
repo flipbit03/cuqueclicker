@@ -46,6 +46,19 @@ pub const UNLOCK_FLASH_TICKS: u32 = TICK_HZ / 2; // 0.5s
 const PARTICLE_FRAC_RISE: f32 = 0.006;
 const GOLDEN_REWARD_SECONDS: f64 = 60.0;
 const GOLDEN_REWARD_FLAT: f64 = 10.0;
+/// Per-click Frenzy bonus: each click during a `Buff::ClickFrenzy` adds
+/// `max(FRENZY_FLAT_PER_CLICK, fps * FRENZY_FPS_SECONDS_PER_CLICK)` cuques
+/// on top of the regular click power. The FPS-scaled term is what makes
+/// late-game Frenzy still feel huge; the flat floor is what keeps an
+/// early-game Frenzy from trivializing the cost ladder. Same shape as
+/// Lucky's reward formula, but per-click instead of per-catch.
+///
+/// 5 seconds of FPS per click × ~30 clicks in the 13s buff = ~150 seconds
+/// of FPS in 13 seconds = ~12× normal income rate during the buff. Real
+/// boost without breaking the early game (where FPS ≈ 0 and the floor
+/// caps each click at 10 cuques regardless of how fast you spam).
+const FRENZY_FPS_SECONDS_PER_CLICK: f64 = 5.0;
+const FRENZY_FLAT_PER_CLICK: f64 = 10.0;
 
 /// Visual flavor for a particle. Drives color/weight in the renderer; the
 /// motion model (rise + horizontal drift) is identical across kinds.
@@ -53,12 +66,12 @@ const GOLDEN_REWARD_FLAT: f64 = 10.0;
 pub enum ParticleKind {
     /// Default `+1` from a normal click — white→red fade.
     Click,
-    /// High-power click (Frenzy x777, big mults). Bold + warm-yellow accent
-    /// so it stands out from a swarm of `+1`s.
+    /// High-power click (Frenzy active, big upgrade mults). Bold +
+    /// warm-yellow accent so it stands out from a swarm of `+1`s.
     ClickBig,
     /// Auto-fingerer income particle.
     Auto,
-    /// Golden-catch label ("FRENZY x777!", "+1.2k", etc). Longer life,
+    /// Golden-catch label ("FRENZY!", "+1.2k", etc). Longer life,
     /// brighter palette.
     Golden,
     /// Bulk-buy confetti pop. Coloured glyphs, shorter than a click.
@@ -123,6 +136,12 @@ pub enum Buff {
     ClickFrenzy {
         ticks_remaining: u32,
         initial_ticks: u32,
+        /// Legacy field, retained for V2/V3 save compatibility but no
+        /// longer read by `click_power()`. The per-click Frenzy bonus
+        /// is FPS-scaled (see `FRENZY_FPS_SECONDS_PER_CLICK` /
+        /// `FRENZY_FLAT_PER_CLICK` in this module). A future V4
+        /// migration can drop this field outright; today it just
+        /// serializes as 777.0 and gets ignored.
         mult: f64,
     },
 }
@@ -669,7 +688,8 @@ impl GameState {
         self.clench_ticks = CLENCH_TICKS;
         // Click that meaningfully grows the counter also flashes the HUD
         // digits — a single +1 doesn't deserve the green tint, but a
-        // Frenzy +777 (or any bulk jump) does.
+        // Frenzy click (FPS-scaled bonus, often hundreds-to-millions) or
+        // any bulk jump does.
         if power >= 50.0 {
             self.cuques_flash_ticks = HUD_FLASH_TICKS;
         }
@@ -773,11 +793,25 @@ impl GameState {
                 m *= f;
             }
         }
-        for b in &self.buffs {
-            let Buff::ClickFrenzy { mult, .. } = b;
-            m *= *mult;
+        // Per-click Frenzy bonus, FPS-scaled. The legacy `mult: 777.0`
+        // on `Buff::ClickFrenzy` is now ignored at click-time (kept on
+        // the struct only for V2/V3 save compatibility); each click
+        // during Frenzy adds a flat-or-fps-scaled bonus instead. This
+        // is what keeps an early-game Frenzy (FPS ≈ 0) capped at the
+        // FRENZY_FLAT floor (10 cuques/click) instead of trivializing
+        // the cost ladder via ×777, while a late-game Frenzy still
+        // delivers a ~12× income-rate boost during the buff via the
+        // FRENZY_FPS_SECONDS_PER_CLICK term.
+        let frenzy_active = self
+            .buffs
+            .iter()
+            .any(|b| matches!(b, Buff::ClickFrenzy { .. }));
+        if frenzy_active {
+            let bonus = (self.fps() * FRENZY_FPS_SECONDS_PER_CLICK).max(FRENZY_FLAT_PER_CLICK);
+            m + bonus
+        } else {
+            m
         }
-        m
     }
 
     pub fn fingerer_mult(&self, idx: usize) -> f64 {
@@ -854,12 +888,17 @@ impl GameState {
             PowerupKind::Frenzy => {
                 self.frenzy_caught += 1;
                 let dur = TICK_HZ * 13;
+                // `mult: 777.0` is a legacy field — `click_power()` no
+                // longer reads it. The per-click Frenzy bonus is FPS-
+                // scaled via `FRENZY_FPS_SECONDS_PER_CLICK` /
+                // `FRENZY_FLAT_PER_CLICK`. Kept on the struct so V2/V3
+                // saves with this field deserialize cleanly.
                 self.buffs.push(Buff::ClickFrenzy {
                     ticks_remaining: dur,
                     initial_ticks: dur,
                     mult: 777.0,
                 });
-                (0.0, "FRENZY x777!".into())
+                (0.0, "FRENZY!".into())
             }
             PowerupKind::Buff => {
                 self.buff_caught += 1;
@@ -2120,6 +2159,102 @@ mod tests {
             label.starts_with("+10% "),
             "GreenCoin catch label must start with '+10% ', got {label}"
         );
+    }
+
+    #[test]
+    fn frenzy_click_yield_is_bounded_in_early_game() {
+        // Balance regression guard. A single Frenzy on a fresh save
+        // (FPS=0, click_power=1) used to mint ~30k cuques across 13s of
+        // clicks — enough to unlock 5-6 fingerer tiers, trivializing
+        // the cost ladder. With the FPS-scaled per-click bonus, the
+        // floor is `FRENZY_FLAT_PER_CLICK` (10/click). 13s ≈ 39 clicks
+        // → ~390 cuques cap. That's enough to buy Index Finger and a
+        // couple of Tier-1s, but Tier 2+ (cost 1100+) stays gated until
+        // FPS comes online.
+        let mut s = GameState::default();
+        let biscuit = r(0, 0, 40, 20);
+        // Activate Frenzy, then simulate 13s × 20Hz = 260 ticks of
+        // clicking once per tick (40 clicks at 3 clicks/sec ≈ 39, but
+        // we click every tick to be conservative — that's actually
+        // 260 clicks if we let it run a full buff lifetime).
+        s.buffs.push(Buff::ClickFrenzy {
+            ticks_remaining: TICK_HZ * 13,
+            initial_ticks: TICK_HZ * 13,
+            mult: 777.0,
+        });
+        // Simulate human click cadence: one click every 5 ticks (4Hz)
+        // for the buff's lifetime. That's the fastest human-sustainable
+        // tap rate.
+        let mut clicks = 0;
+        for _ in 0..(TICK_HZ * 13) {
+            // Sample every fifth tick.
+            if clicks * 5 < s.total_play_ticks as u32 + 5 {
+                s.click((20, 10), biscuit);
+                clicks += 1;
+            }
+            s.tick();
+        }
+        assert!(
+            s.cuques < 2_000.0,
+            "early-game Frenzy must not blow past ~1k cuques; got {}",
+            s.cuques
+        );
+        // Sanity: the buff did boost something (more than zero clicks
+        // worth of base power = 1).
+        assert!(
+            s.cuques > clicks as f64,
+            "Frenzy should still meaningfully boost clicks; got {} from {} clicks",
+            s.cuques,
+            clicks
+        );
+    }
+
+    #[test]
+    fn frenzy_click_yield_scales_with_fps_late_game() {
+        // Late-game contract: at high FPS, each Frenzy click is worth
+        // roughly `fps * FRENZY_FPS_SECONDS_PER_CLICK` (5s of FPS per
+        // click). Set up a state where fps() returns ~1000 by giving
+        // many fingerers, then assert the per-click yield is the
+        // scaled term, not the flat floor.
+        let mut s = GameState::default();
+        // Buy enough mid-tier fingerers to push fps into the thousands.
+        // Whole Hand (idx 1) = 1.0 fps each; 2000 of them = 2000 fps.
+        // (This skips visibility/cost gating since we mutate the count
+        // map directly.)
+        s.fingerers_state
+            .insert("whole_hand".into(), fs_with_count(2000));
+        let fps = s.fps();
+        assert!(
+            fps > 100.0,
+            "test setup expected fps>100, got {fps} — adjust the count if fingerer base changed"
+        );
+        // Activate Frenzy and click once.
+        s.buffs.push(Buff::ClickFrenzy {
+            ticks_remaining: TICK_HZ * 13,
+            initial_ticks: TICK_HZ * 13,
+            mult: 777.0,
+        });
+        let cuques_before = s.cuques;
+        let biscuit = r(0, 0, 40, 20);
+        s.click((20, 10), biscuit);
+        let yield_per_click = s.cuques - cuques_before;
+        // Should be roughly fps * 5.0 + base click_power (no upgrades = 1).
+        let expected = fps * FRENZY_FPS_SECONDS_PER_CLICK + 1.0;
+        // Floor of FRENZY_FLAT_PER_CLICK doesn't kick in here because
+        // fps * 5 > 10.
+        assert!(
+            (yield_per_click - expected).abs() < expected * 0.01,
+            "expected ~{expected}/click at fps={fps}, got {yield_per_click}"
+        );
+    }
+
+    #[test]
+    fn no_frenzy_means_no_bonus() {
+        // Negative test: without a Frenzy buff active, click_power is
+        // just the base × upgrades — no FPS-scaled bonus added.
+        let s = GameState::default();
+        // No upgrades, no Frenzy.
+        assert_eq!(s.click_power(), 1.0);
     }
 
     #[test]

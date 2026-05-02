@@ -29,8 +29,12 @@ pub enum PowerupKind {
     /// Instant flat reward: `max(10, fps * 60s)` cuques. No buff, no
     /// duration. Frequent, small.
     Lucky,
-    /// 13-second `ClickFrenzy` buff: manual clicks produce x777 cuques.
-    /// Less common, disruptive while it lasts.
+    /// 13-second `ClickFrenzy` buff: each manual click during the buff
+    /// adds an FPS-scaled bonus on top of normal click power. Less
+    /// common, disruptive while it lasts; the FPS scaling means a
+    /// late-game Frenzy is much more rewarding than an early-game one
+    /// (and the early-game version stays bounded against the cost
+    /// ladder).
     Frenzy,
     /// 60-second per-fingerer modifier on a random *owned* fingerer:
     /// that fingerer's passive FPS is multiplied x7. Implemented as a
@@ -73,7 +77,7 @@ impl PowerupKind {
     pub fn mean_cooldown_ticks(self) -> u32 {
         match self {
             Self::Lucky => 60 * TICK_HZ,      // ~60s avg — frequent, small
-            Self::Frenzy => 120 * TICK_HZ,    // ~120s avg — disruptive x777
+            Self::Frenzy => 120 * TICK_HZ,    // ~120s avg — fps-scaled click bonus
             Self::Buff => 120 * TICK_HZ,      // ~120s avg — x7 fingerer mult
             Self::GreenCoin => 240 * TICK_HZ, // ~240s avg — rarest, permanent +10%
         }
