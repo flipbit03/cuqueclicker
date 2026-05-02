@@ -348,10 +348,10 @@ pub struct GameState {
     #[serde(skip)]
     pub upgrade_unlock_flash: Vec<u32>,
     /// Brief gold shimmer on a fingerer row when a Green Coin catch
-    /// targeted it. Closes the visual loop with the floating "+10%
-    /// <fingerer>" particle and the green-tinted title-border pulse —
-    /// the gold here matches the catch particle, so the player can see
-    /// at a glance which row in the sidebar just took the boost.
+    /// targeted it. Closes the visual loop with the floating
+    /// `+10% {fingerer}` particle and the green-tinted title-border
+    /// pulse — the gold here matches the catch particle, so the player
+    /// can see at a glance which row in the sidebar just took the boost.
     #[serde(skip)]
     pub fingerer_green_coin_flash: Vec<u32>,
     /// Previous-tick affordability per row, used to detect the
@@ -412,7 +412,7 @@ pub const PURCHASE_FLASH_TICKS: u32 = 20; // 1s at 20Hz
 pub const GREEN_COIN_FLASH_TICKS: u32 = 50; // 2.5s at 20Hz
 /// Per-row gold shimmer on the targeted fingerer's sidebar row when a
 /// Green Coin catch lands on it. ~2 seconds — long enough for the eye
-/// to track from the floating "+10% <fingerer>" particle over to the
+/// to track from the floating `+10% {fingerer}` particle over to the
 /// row, short enough that it doesn't outlive the catch event.
 pub const GREEN_COIN_ROW_FLASH_TICKS: u32 = TICK_HZ * 2; // 2.0s at 20Hz
 
