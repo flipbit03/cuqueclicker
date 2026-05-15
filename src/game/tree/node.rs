@@ -161,16 +161,6 @@ pub fn node_at(x: i32, y: i32) -> Option<NodeSpec> {
     if !has_pop_neighbor {
         return None;
     }
-    // Suppress lots whose anchor chain doesn't reach origin. The chain
-    // is strictly-smaller-manhattan by construction (Pass 1/2 only), so
-    // it must terminate at origin or at a lot whose anchor returns
-    // `None` — in the latter case the whole component is an island and
-    // none of its lots are reachable from origin via the tree. Without
-    // this check the player would see 2-3 node clusters surrounded by
-    // gaps with no way to navigate to them.
-    if !anchor_chain_reaches_origin(TreeCoord::new(x, y)) {
-        return None;
-    }
 
     let mut rng = SplitMix64::from_coords(TREE_SEED, x, y, SALT_NODE);
 
@@ -494,30 +484,6 @@ pub fn is_king_neighbor(a: TreeCoord, b: TreeCoord) -> bool {
 ///      manhattan). Belt-and-suspenders; almost never triggers.
 ///
 /// Returns `None` for origin (no parent) and for unpopulated lots.
-/// Walks the anchor chain from `lot` toward origin. Returns true iff
-/// the chain terminates at `TreeCoord::ORIGIN`. The chain is strictly
-/// manhattan-decreasing by construction (Pass 1 / Pass 2 of
-/// `anchor_of`), so it can't loop and terminates in at most
-/// `manhattan(lot)` hops.
-fn anchor_chain_reaches_origin(lot: TreeCoord) -> bool {
-    let mut cur = lot;
-    // Manhattan distance is the maximum chain length (strict decrease
-    // per hop), plus one slack hop for the final origin step.
-    let max_steps = (lot.x.unsigned_abs() as usize)
-        .saturating_add(lot.y.unsigned_abs() as usize)
-        .saturating_add(2);
-    for _ in 0..max_steps {
-        if cur == TreeCoord::ORIGIN {
-            return true;
-        }
-        match anchor_of(cur) {
-            Some(parent) => cur = parent,
-            None => return false,
-        }
-    }
-    false
-}
-
 pub fn anchor_of(lot: TreeCoord) -> Option<TreeCoord> {
     if lot == TreeCoord::ORIGIN {
         return None;
@@ -557,12 +523,12 @@ pub fn anchor_of(lot: TreeCoord) -> Option<TreeCoord> {
             return Some(*n);
         }
     }
-    // No "any populated neighbor" fallback. Allowing a non-strict-smaller
-    // pick made the anchor chain non-monotonic, which let pairs of
-    // isolated populated lots reference each other as their anchors —
-    // a 2-cycle that never reached origin. Returning `None` here makes
-    // such lots un-anchored, and `node_at` suppresses them so the player
-    // never sees an unreachable island.
+    // Pass 3: any populated neighbor. Last resort.
+    for n in &candidates {
+        if passes_gap_roll(n.x, n.y) {
+            return Some(*n);
+        }
+    }
     None
 }
 
@@ -614,10 +580,10 @@ pub fn edge_exists(a: TreeCoord, b: TreeCoord) -> bool {
         (b, a)
     };
     if diagonal {
+        // Both L-bend corner lots occupied → suppress to avoid visually
+        // crossing an unrelated box.
         let mid_h = TreeCoord::new(hi.x, lo.y);
         let mid_v = TreeCoord::new(lo.x, hi.y);
-        // Visual-crossing suppression: both L-bend corner lots occupied
-        // → the diagonal line would slice across an unrelated box.
         if node_at(mid_h.x, mid_h.y).is_some() && node_at(mid_v.x, mid_v.y).is_some() {
             return false;
         }
@@ -644,37 +610,7 @@ pub fn edge_exists(a: TreeCoord, b: TreeCoord) -> bool {
         lo.y.wrapping_add(hi.y.wrapping_mul(6151)),
         SALT_EDGE,
     );
-    if !rng.bool_with_prob(p) {
-        return false;
-    }
-    // Anchor-redundancy suppression: if a 2-hop ANCHOR path through a
-    // common king-neighbor already connects A and B, the direct edge
-    // is just closing a triangle on top of the spine. Suppress so the
-    // tree reads as branches, not triangles.
-    //
-    // Anchor edges are permanent (the `anchor_of()` early-return above
-    // guarantees this), so a 2-hop made entirely of anchor edges is
-    // itself permanent — collapsing the third edge can't disconnect A
-    // from B. Using the anchor-only criterion also dodges the failure
-    // mode where all three sides of an all-procgen triangle would
-    // suppress each other if we did a recursive `edge_exists` check.
-    let is_anchor_edge =
-        |x: TreeCoord, y: TreeCoord| -> bool { anchor_of(x) == Some(y) || anchor_of(y) == Some(x) };
-    for c in neighbors_of(a) {
-        if c == b || c == a {
-            continue;
-        }
-        if !is_king_neighbor(c, b) {
-            continue;
-        }
-        if node_at(c.x, c.y).is_none() {
-            continue;
-        }
-        if is_anchor_edge(a, c) && is_anchor_edge(c, b) {
-            return false;
-        }
-    }
-    true
+    rng.bool_with_prob(p)
 }
 
 /// For a diagonal edge between `a` and `b`, return the "L-bend corner
@@ -997,83 +933,6 @@ mod tests {
                         assert!(
                             n.primitives.iter().any(|p| !p.is_bane()),
                             "keystone at ({x},{y}) has no boon primitive"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn every_node_has_anchor_chain_to_origin() {
-        // Walk a sizable region. Every `node_at(x, y).is_some()` MUST
-        // have an anchor chain that terminates at origin. The chain
-        // can't loop (strictly-smaller manhattan), and a node with no
-        // chain is an island — `node_at` should already be suppressing
-        // those.
-        for x in -30..=30 {
-            for y in -30..=30 {
-                if node_at(x, y).is_none() {
-                    continue;
-                }
-                let lot = TreeCoord::new(x, y);
-                if lot == TreeCoord::ORIGIN {
-                    continue;
-                }
-                assert!(
-                    anchor_chain_reaches_origin(lot),
-                    "node at {:?} has anchor chain that doesn't reach origin",
-                    lot
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn non_anchor_edges_dont_close_anchor_triangles() {
-        // Walk every king-pair in a sizable region. For each non-anchor
-        // edge that exists, prove no common king-neighbor has anchor
-        // edges to both endpoints — i.e. the edge isn't closing a
-        // triangle on top of the spine.
-        for x in -30..=30 {
-            for y in -30..=30 {
-                let a = TreeCoord::new(x, y);
-                for &(dx, dy) in &[
-                    (1, 0),
-                    (-1, 0),
-                    (0, 1),
-                    (0, -1),
-                    (1, 1),
-                    (1, -1),
-                    (-1, 1),
-                    (-1, -1),
-                ] {
-                    let b = TreeCoord::new(x + dx, y + dy);
-                    if (a.x, a.y) > (b.x, b.y) {
-                        continue;
-                    }
-                    if !edge_exists(a, b) {
-                        continue;
-                    }
-                    // Anchor edges get a pass — they're load-bearing for
-                    // connectivity and the suppression rule explicitly
-                    // preserves them.
-                    if anchor_of(a) == Some(b) || anchor_of(b) == Some(a) {
-                        continue;
-                    }
-                    for c in neighbors_of(a) {
-                        if c == a || c == b || !is_king_neighbor(c, b) {
-                            continue;
-                        }
-                        if node_at(c.x, c.y).is_none() {
-                            continue;
-                        }
-                        let ac_anchor = anchor_of(a) == Some(c) || anchor_of(c) == Some(a);
-                        let cb_anchor = anchor_of(c) == Some(b) || anchor_of(b) == Some(c);
-                        assert!(
-                            !(ac_anchor && cb_anchor),
-                            "non-anchor edge {a:?} <-> {b:?} closes an anchor \
-                             triangle through {c:?}"
                         );
                     }
                 }
