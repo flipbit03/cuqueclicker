@@ -644,17 +644,31 @@ pub fn neighbors_with_nodes(c: TreeCoord) -> Vec<TreeCoord> {
         .collect()
 }
 
-/// Cells along the rendered edge from A's box-center to B's box-center,
-/// in A→B order. Returns an empty Vec if either endpoint has no node.
+/// Cells along the rendered edge between two nodes, in canonical
+/// lo→hi lot order (lex on `(x, y)`). Returns an empty Vec if either
+/// endpoint has no node.
 ///
-/// The case-split mirrors `ui::tree::draw_edge` so the path used by the
-/// edge-unlock animation matches the cells the renderer actually paints:
+/// Canonical direction is load-bearing: `bresenham_path(A, B)` and
+/// `bresenham_path(B, A)` produce DIFFERENT cell sequences for the same
+/// endpoints, so we sort the inputs here. Pre-buy and post-buy
+/// rendering, plus the unlock-anim's completion check, all call this
+/// function with the same pair of lots — without canonicalization the
+/// wave would energize a different staircase shape from the grey base
+/// line, and you'd see the path geometry flip the moment the wave
+/// started.
+///
+/// The case-split mirrors `ui::tree::draw_edge`:
 ///   - boxes vertically aligned within ±2 columns → straight vertical run
 ///     at the midpoint x.
 ///   - boxes horizontally aligned within ±2 rows → straight horizontal
 ///     run at the midpoint y.
 ///   - otherwise → Bresenham staircase between the two centers.
 pub fn edge_path_cells(a: TreeCoord, b: TreeCoord) -> Vec<(i32, i32)> {
+    let (a, b) = if (a.x, a.y) <= (b.x, b.y) {
+        (a, b)
+    } else {
+        (b, a)
+    };
     let Some(an) = node_at(a.x, a.y) else {
         return Vec::new();
     };
@@ -695,6 +709,50 @@ pub fn edge_path_cells(a: TreeCoord, b: TreeCoord) -> Vec<(i32, i32)> {
         return path;
     }
     bresenham_path(acx, acy, bcx, bcy)
+}
+
+/// Count cells at the START of `path` whose canvas-grid coords lie
+/// inside the rect `(box_x, box_y, box_w, box_h)`. Used by the edge
+/// renderer + the unlock-anim's completion check to skip the "inside
+/// the source box" prefix when seeding the wavefront. Iteration stops
+/// at the first cell that's outside the rect — interior gaps don't
+/// inflate the count.
+pub fn count_leading_in_rect(
+    path: &[(i32, i32)],
+    box_x: i32,
+    box_y: i32,
+    box_w: u16,
+    box_h: u16,
+) -> usize {
+    let mut count = 0;
+    for &(cx, cy) in path {
+        if cx >= box_x && cx < box_x + box_w as i32 && cy >= box_y && cy < box_y + box_h as i32 {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// Mirror of `count_leading_in_rect` but counting from the END of
+/// the path inward.
+pub fn count_trailing_in_rect(
+    path: &[(i32, i32)],
+    box_x: i32,
+    box_y: i32,
+    box_w: u16,
+    box_h: u16,
+) -> usize {
+    let mut count = 0;
+    for &(cx, cy) in path.iter().rev() {
+        if cx >= box_x && cx < box_x + box_w as i32 && cy >= box_y && cy < box_y + box_h as i32 {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
 }
 
 /// Bresenham-style staircase between (ax, ay) and (bx, by) in

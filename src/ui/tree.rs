@@ -939,24 +939,57 @@ fn draw_edge(
         dim_style
     };
 
-    // When there's an active anim on this edge, walk the path in the
-    // anim's direction (from anim.from outward). That way the anim's
-    // leading_inside / trailing_inside (which were computed against
-    // `edge_path_cells(from, to)` at push time) match the cell order
-    // the renderer iterates here, and dist_from_head simplifies to
-    // `head - i` without a per-cell from-vs-to branch.
+    // `edge_path_cells` is canonical (lo→hi lot order), so the path
+    // shape is the same regardless of which is `a` vs `b` here. That
+    // guarantees the wave overlays the same staircase the grey base
+    // line was drawn on — without canonicalization the wave could
+    // bend along a Bresenham mirror image of the resting line.
     let anim = state
         .tree_edge_anims
         .iter()
         .find(|an| (an.from == a.lot && an.to == b.lot) || (an.from == b.lot && an.to == a.lot));
-    let path = if let Some(an) = anim {
-        node::edge_path_cells(an.from, an.to)
-    } else {
-        node::edge_path_cells(a.lot, b.lot)
-    };
+    let path = node::edge_path_cells(a.lot, b.lot);
     if path.is_empty() {
         return;
     }
+    // Wave anchor: which end of the canonical path is the anim's source
+    // (anim.from). `canonical_lo` is the lot at path[0].
+    let canonical_lo = if (a.lot.x, a.lot.y) <= (b.lot.x, b.lot.y) {
+        a.lot
+    } else {
+        b.lot
+    };
+    let wave_at_start = anim.map(|an| an.from == canonical_lo).unwrap_or(true);
+    // Source-side leading_inside (cells inside the source box at the
+    // wave's start end of the canonical path). Seeds the head past the
+    // in-box prefix so the visible wave starts at the FIRST visible
+    // cell on tick 0 — regardless of how much of the path lives inside
+    // the source's bounding rect.
+    let source_node: &VisibleNode = if let Some(an) = anim {
+        if an.from == a.lot { a } else { b }
+    } else {
+        a
+    };
+    let leading_inside = if wave_at_start {
+        node::count_leading_in_rect(
+            &path,
+            source_node.spec_box_x,
+            source_node.spec_box_y,
+            source_node.box_w,
+            source_node.box_h,
+        )
+    } else {
+        node::count_trailing_in_rect(
+            &path,
+            source_node.spec_box_x,
+            source_node.spec_box_y,
+            source_node.box_w,
+            source_node.box_h,
+        )
+    };
+    let head_path_index = anim
+        .map(|an| (leading_inside + an.visible_advance()).min(path.len().saturating_sub(1)))
+        .unwrap_or(0);
 
     // Same opacity rule as before: regular boxes are opaque across their
     // whole bounding rect, the anchor is only opaque on actually-painted
@@ -974,13 +1007,15 @@ fn draw_edge(
         // Animation styling. `dist_from_head` counts how many cells we
         // are behind the wavefront in the anim's direction-of-travel:
         // 0 is the head cell, 1+ is the trailing tail, negative means
-        // we're ahead of the wavefront (still draw the base line so the
-        // wave reads as "running over" an existing dim wire instead of
-        // clearing-then-painting). Path is in anim direction (from →
-        // to), so head walks from index 0 outward.
-        let dist_from_head: i32 = if let Some(an) = anim {
-            let head = an.head_cell_index().min(path_len.saturating_sub(1));
-            (head as i32) - (i as i32)
+        // we're ahead of the wavefront. The path is canonical (lo→hi);
+        // the wave runs from path[0] outward when the anim's source is
+        // at canonical_lo, otherwise from path[end] inward.
+        let dist_from_head: i32 = if anim.is_some() {
+            if wave_at_start {
+                (head_path_index as i32) - (i as i32)
+            } else {
+                (head_path_index as i32) - ((path_len - 1 - i) as i32)
+            }
         } else {
             0
         };
