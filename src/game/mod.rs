@@ -3,4 +3,4 @@ pub mod fingerer;
 pub mod modifier;
 pub mod powerup;
 pub mod state;
-pub mod upgrade;
+pub mod tree;

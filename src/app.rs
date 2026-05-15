@@ -38,7 +38,7 @@ use crate::game::fingerer;
 use crate::game::fingerer::FINGERERS;
 use crate::game::powerup::{self, Powerup, PowerupKind};
 use crate::game::state::{GameState, TICK_HZ};
-use crate::game::upgrade::UPGRADES;
+use crate::game::tree::coord::TreeCoord;
 use crate::input::{
     self, InputContext, InputEvent, KeyCode as InKeyCode, Modifiers, MouseButton as InMouseButton,
     UiState, WheelDelta,
@@ -147,13 +147,22 @@ impl App {
 
             let current = snapshot.load_full();
             terminal.draw(|f| {
-                layout = ui::draw(f, &current, ui.mode, ui.zoom_idx, debug, ui.last_mouse_pos);
+                layout = ui::draw(
+                    f,
+                    &current,
+                    ui.mode,
+                    ui.zoom_idx,
+                    debug,
+                    ui.last_mouse_pos,
+                    &mut ui.tree_render,
+                );
             })?;
 
             // Hand fresh geometry to the sim. Ordering is preserved by mpsc,
             // so the sim always uses the most recently drawn layout.
             let _ = action_tx.send(Action::UpdateGeometry {
                 biscuit: layout.biscuit_rect,
+                powerups_paused: ui.mode == Mode::Tree,
             });
 
             if event::poll(Duration::from_millis(INPUT_POLL_MS))? {
@@ -334,14 +343,39 @@ fn demo_driver_tick(
         }
     }
 
-    // Every ~8s, buy the cheapest available upgrade.
+    // Every ~8s, try to buy a reachable affordable tree node. Walk the
+    // king-neighbor ring around every owned lot and pick the cheapest
+    // hit; gives the demo a steady visible tree-spread without needing
+    // to plan a route.
     if t.is_multiple_of(160) {
-        let available = crate::game::upgrade::available_ids(state);
-        if let Some(&u_idx) = available
-            .iter()
-            .min_by(|&&a, &&b| UPGRADES[a].cost.partial_cmp(&UPGRADES[b].cost).unwrap())
-        {
-            state.buy_upgrade(u_idx);
+        let mut best: Option<(TreeCoord, f64)> = None;
+        for &owned in &state.tree.bought {
+            for n in crate::game::tree::node::neighbors_of(owned) {
+                if state.tree.bought.contains(&n) {
+                    continue;
+                }
+                if !crate::game::tree::node::edge_exists(owned, n) {
+                    continue;
+                }
+                if let Some(spec) = crate::game::tree::node::node_at(n.x, n.y)
+                    && state.affordable_cuques() >= spec.cost
+                {
+                    let cost = spec.cost;
+                    if best.map(|(_, c)| cost < c).unwrap_or(true) {
+                        best = Some((n, cost));
+                    }
+                }
+            }
+        }
+        // First buy: origin (no neighbors to walk).
+        if state.tree.bought.is_empty() {
+            if let Some(spec) = crate::game::tree::node::node_at(0, 0)
+                && state.affordable_cuques() >= spec.cost
+            {
+                state.buy_tree_node(TreeCoord::ORIGIN);
+            }
+        } else if let Some((lot, _)) = best {
+            state.buy_tree_node(lot);
         }
     }
 
@@ -352,7 +386,7 @@ fn demo_driver_tick(
     } else if phase == 140 {
         Some(Mode::Achievements)
     } else if phase == 180 {
-        Some(Mode::Upgrades)
+        Some(Mode::Tree)
     } else if phase == 220 {
         Some(Mode::Game)
     } else {
@@ -395,6 +429,11 @@ fn translate_key_code(code: CtKeyCode) -> Option<InKeyCode> {
         CtKeyCode::Char(c) => Some(InKeyCode::Char(c)),
         CtKeyCode::Esc => Some(InKeyCode::Esc),
         CtKeyCode::F(n) => Some(InKeyCode::F(n)),
+        CtKeyCode::Up => Some(InKeyCode::Up),
+        CtKeyCode::Down => Some(InKeyCode::Down),
+        CtKeyCode::Left => Some(InKeyCode::Left),
+        CtKeyCode::Right => Some(InKeyCode::Right),
+        CtKeyCode::Enter => Some(InKeyCode::Enter),
         _ => None,
     }
 }
@@ -427,6 +466,11 @@ fn translate_mouse(m: CtMouseEvent) -> Option<InputEvent> {
             row: m.row,
             button: translate_mouse_button(button)?,
             mods,
+        }),
+        MouseEventKind::Up(button) => Some(InputEvent::MouseUp {
+            col: m.column,
+            row: m.row,
+            button: translate_mouse_button(button)?,
         }),
         MouseEventKind::ScrollUp => Some(InputEvent::Wheel {
             col: m.column,
@@ -493,11 +537,27 @@ pub fn build_demo_state() -> GameState {
             s.fingerers_state.entry(f.id.to_string()).or_default().count = count;
         }
     }
-    // Take the first 10 upgrades from the catalog (deterministic regardless
-    // of how UPGRADES is reordered) — gives a spread of click + per-tier
-    // multipliers so the sidebar shows (xN) on several tiers.
-    for u in UPGRADES.iter().take(10) {
-        s.upgrades_earned.insert(u.id.to_string());
+    // Seed a small starter cluster of tree nodes around the origin so the
+    // demo HUD has the same "look how stacked I am" vibe the old upgrade
+    // grant gave. We do this through the live state's buy path (which
+    // folds the aggregate) but bypass the cost gate by zero-ing the cost
+    // — demo build_state is rich-by-construction, not by progression.
+    for lot in [
+        TreeCoord::ORIGIN,
+        TreeCoord::new(1, 0),
+        TreeCoord::new(0, 1),
+        TreeCoord::new(-1, 0),
+        TreeCoord::new(0, -1),
+        TreeCoord::new(1, 1),
+        TreeCoord::new(-1, -1),
+    ] {
+        if let Some(spec) = crate::game::tree::node::node_at(lot.x, lot.y) {
+            // Connectivity guard relaxed for demo seeding — we want a
+            // tight cluster regardless of edge rolls. Manually add to
+            // `bought` + fold the aggregate.
+            s.tree.bought.insert(lot);
+            s.tree_aggregate.fold_in_node(&spec);
+        }
     }
     // First 6 achievements for visual variety in that panel.
     for a in ACHIEVEMENTS.iter().take(6) {

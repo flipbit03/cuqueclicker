@@ -271,10 +271,13 @@ pub fn run() -> Result<(), JsValue> {
             web.ui.zoom_idx,
             debug,
             web.ui.last_mouse_pos,
+            &mut web.ui.tree_render,
         );
         // Hand the latest biscuit rect to the sim so goldens and auto-
-        // particles spawn inside the current layout.
+        // particles spawn inside the current layout. Powerup engine pauses
+        // while a full-screen modal (tree) is open.
         geom.biscuit = web.layout.biscuit_rect;
+        geom.powerups_paused = web.ui.mode == crate::ui::Mode::Tree;
 
         // Re-derive the cell pitch from canvas size vs grid cells.
         //
@@ -353,6 +356,11 @@ fn translate_key(k: RzKeyEvent) -> Option<InputEvent> {
         RzKeyCode::Char(c) => KeyCode::Char(c),
         RzKeyCode::Esc => KeyCode::Esc,
         RzKeyCode::F(n) => KeyCode::F(n),
+        RzKeyCode::Up => KeyCode::Up,
+        RzKeyCode::Down => KeyCode::Down,
+        RzKeyCode::Left => KeyCode::Left,
+        RzKeyCode::Right => KeyCode::Right,
+        RzKeyCode::Enter => KeyCode::Enter,
         _ => return None,
     };
     Some(InputEvent::KeyPress {
@@ -393,6 +401,14 @@ fn translate_mouse(m: RzMouseEvent, web: &WebUi) -> Vec<InputEvent> {
                 button,
                 mods,
             }]
+        }
+        RzMouseEventKind::Released => {
+            let button = match m.button {
+                RzMouseButton::Left => MouseButton::Left,
+                RzMouseButton::Right => MouseButton::Right,
+                _ => return Vec::new(),
+            };
+            vec![InputEvent::MouseUp { col, row, button }]
         }
         RzMouseEventKind::Moved => vec![InputEvent::MouseMoved { col, row }],
         _ => Vec::new(),

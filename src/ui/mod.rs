@@ -8,7 +8,7 @@ pub mod prestige;
 pub mod sidebar;
 pub mod stats;
 pub mod toast;
-pub mod upgrades;
+pub mod tree;
 
 use ratatui::{prelude::*, widgets::*};
 
@@ -21,7 +21,7 @@ use crate::i18n::t;
 // binaries. A 0.0.0 build advertises itself as "(dev)" in the HUD.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn hud_title() -> String {
+pub(crate) fn hud_title() -> String {
     if VERSION == "0.0.0" {
         // Dev builds include the git branch (or short SHA on detached HEAD)
         // so two instances built from different branches can be told apart
@@ -40,8 +40,22 @@ pub enum Mode {
     Game,
     Stats,
     Achievements,
-    Upgrades,
+    /// The infinite procedural upgrade tree — full-screen modal. Game ticks
+    /// keep running underneath; powerup spawns pause.
+    Tree,
     Prestige,
+}
+
+/// Which action a clickable button in the tree-modal info pane fires.
+/// `Buy` / `Refund` both target the cursor's lot; the renderer publishes
+/// at most one of these per frame (whichever the focused node currently
+/// supports). Left-click on the rect emits the corresponding sim
+/// action, giving touch / left-click-only players parity with the
+/// right-click-on-node gesture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TreeButtonAction {
+    Buy,
+    Refund,
 }
 
 /// Click target for a help-bar hint or for the prestige-reset confirm
@@ -88,12 +102,16 @@ pub struct DrawOutput {
     /// vast empty space around a small biscuit at low zoom), and only the
     /// right-hand sidebar opts out of zoom.
     pub play_area: Rect,
-    /// `(upgrade_idx, screen_row_rect)` pairs for the Upgrades panel —
-    /// populated only when the active mode renders that panel; empty
-    /// otherwise. The click router hit-tests these for `BuyUpgrade`.
-    /// First element of each tuple is also the digit-shortcut target,
-    /// kept aligned with `visible_upgrades`.
-    pub upgrade_rows: Vec<(usize, Rect)>,
+    /// Per-tree-node clickable rects when the Tree mode is active. Each
+    /// entry maps a node's lot coord to its on-screen box. The input
+    /// router walks these to translate mouse coords into `Action::TreeBuy`
+    /// / `Action::TreeFocus`. Empty when not in Tree mode.
+    pub tree_node_rects: Vec<(crate::game::tree::coord::TreeCoord, Rect)>,
+    /// Left-click target for the buy/refund text in the tree-modal info
+    /// pane. `Some` only when the focused node is currently actionable
+    /// (buyable + affordable, or owned + refundable). Lets touch /
+    /// left-only players trigger the action without right-clicking.
+    pub tree_action_button: Option<(TreeButtonAction, Rect)>,
     /// `(fingerer_idx, screen_row_rect)` for the Game-mode sidebar.
     pub fingerer_rows: Vec<(usize, Rect)>,
     /// (action, rect) for every clickable help-bar hint at the bottom of
@@ -156,6 +174,7 @@ pub fn draw(
     zoom_idx: usize,
     debug: bool,
     mouse_pos: Option<(u16, u16)>,
+    tree_render: &mut crate::input::TreeRenderState,
 ) -> DrawOutput {
     let lang = t();
     let area = frame.area();
@@ -165,7 +184,7 @@ pub fn draw(
         Mode::Game => lang.help_game,
         Mode::Stats => lang.help_stats,
         Mode::Achievements => lang.help_ach,
-        Mode::Upgrades => lang.help_upgrades,
+        Mode::Tree => lang.help_tree,
         Mode::Prestige => lang.help_prestige,
     };
     let help_height = wrapped_height(help_text, cols[0].width).max(1);
@@ -299,13 +318,19 @@ pub fn draw(
     hands::draw(frame, left[1], biscuit_rect, biscuit_focal, state);
     effects::draw_particles(frame, biscuit_rect, &state.particles);
     effects::draw_misclicks(frame, &state.misclick_particles);
-    draw_zoom_indicator(
-        frame,
-        left[1],
-        biscuit::level_label(zoom_idx).unwrap_or("100%"),
-    );
+    if mode != Mode::Tree {
+        draw_zoom_indicator(
+            frame,
+            left[1],
+            biscuit::level_label(zoom_idx).unwrap_or("100%"),
+        );
+    }
 
-    if debug {
+    // Skip debug pane and biscuit-zoom indicator in tree mode — the modal
+    // covers them but the zoom label specifically renders at the very
+    // bottom row of `left[1]` and pokes through. The biscuit underneath
+    // also has no business affecting render once we're in tree mode.
+    if debug && mode != Mode::Tree {
         debug_pane::draw(frame, left[1]);
     }
     // Render every on-screen powerup; collect (spawn_id, rect) pairs so
@@ -331,14 +356,22 @@ pub fn draw(
     // mouse-first player can drive the game without ever touching a key.
     let help_hits = draw_help(frame, left[2], help_text, mode, mouse_pos);
 
-    let mut upgrade_rows: Vec<(usize, Rect)> = Vec::new();
+    let mut tree_node_rects: Vec<(crate::game::tree::coord::TreeCoord, Rect)> = Vec::new();
+    let mut tree_action_button: Option<(TreeButtonAction, Rect)> = None;
     let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
     let mut prestige_reset_rect = Rect::default();
     match mode {
         Mode::Game => fingerer_rows = sidebar::draw(frame, cols[1], state, mouse_pos),
         Mode::Stats => stats::draw(frame, cols[1], state),
         Mode::Achievements => achievements::draw(frame, cols[1], state),
-        Mode::Upgrades => upgrade_rows = upgrades::draw(frame, cols[1], state, mouse_pos),
+        Mode::Tree => {
+            // Full-screen modal — the tree renderer takes the WHOLE frame
+            // area, not just the sidebar column, so the player gets the
+            // full canvas to pan around.
+            let out = tree::draw(frame, area, state, mouse_pos, tree_render);
+            tree_node_rects = out.node_rects;
+            tree_action_button = out.action_button;
+        }
         Mode::Prestige => prestige_reset_rect = prestige::draw(frame, cols[1], state, mouse_pos),
     }
 
@@ -347,7 +380,8 @@ pub fn draw(
         biscuit_focal,
         powerup_rects,
         play_area: left[1],
-        upgrade_rows,
+        tree_node_rects,
+        tree_action_button,
         fingerer_rows,
         help_hits,
         prestige_reset_rect,
@@ -481,7 +515,7 @@ fn map_help_token(token: &str, mode: Mode) -> Option<HelpAction> {
     }
     // Single-letter mode openers, only meaningful from Game.
     match (mode, key) {
-        (Mode::Game, "u") | (Mode::Game, "U") => Some(HelpAction::OpenMode(Mode::Upgrades)),
+        (Mode::Game, "t") | (Mode::Game, "T") => Some(HelpAction::OpenMode(Mode::Tree)),
         (Mode::Game, "p") | (Mode::Game, "P") => Some(HelpAction::OpenMode(Mode::Prestige)),
         (Mode::Game, "s") | (Mode::Game, "S") => Some(HelpAction::OpenMode(Mode::Stats)),
         (Mode::Game, "a") | (Mode::Game, "A") => Some(HelpAction::OpenMode(Mode::Achievements)),

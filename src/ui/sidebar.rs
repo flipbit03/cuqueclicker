@@ -77,7 +77,12 @@ pub fn draw(
             Span::raw(format!("    {}: {}  ", lang.owned, owned)),
             Span::styled(format!("{} {}", lang.cost, format::big(cost)), cost_style),
         ]));
-        let mult = state.fingerer_mult(i);
+        // Per-fingerer mul factor from the tree (folds in any
+        // `AllFingerers` contributions). The badge mirrors what the FPS
+        // formula will fold in, so the player sees the same multiplier
+        // here that drives their income.
+        let tree_contrib = state.tree_aggregate.effective_for_fingerer(i);
+        let mult = tree_contrib.mul_factor;
         let effective = k.fps_per_unit * mult;
         let mult_tag = if mult > 1.0001 {
             format!(" (x{:.1})", mult)

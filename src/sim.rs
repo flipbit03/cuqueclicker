@@ -21,6 +21,7 @@ use ratatui::layout::Rect;
 
 use crate::game::powerup::{self, Powerup, PowerupKind};
 use crate::game::state::{GameState, TICK_DT};
+use crate::game::tree::coord::TreeCoord;
 
 /// Buy quantity for a fingerer purchase action. Modifier-key meaning is
 /// translated to this in the input router; sim only consumes the resolved
@@ -52,14 +53,33 @@ pub enum Action {
         idx: usize,
         qty: BuyQty,
     },
-    BuyUpgrade(usize),
+    /// Buy the tree node at the given lot. No-op if the lot doesn't have a
+    /// node, is already owned, isn't reachable, or the player can't afford it.
+    TreeBuy(TreeCoord),
+    /// Refund the tree node at the given lot. No-op if not owned, would
+    /// orphan another owned node, or the node doesn't exist.
+    TreeRefund(TreeCoord),
+    /// Move the tree cursor to `lot` (no purchase). Persists into
+    /// `state.tree.cursor` so reopening the modal lands here.
+    TreeFocus(TreeCoord),
+    /// Save the current cursor position into bookmark slot `slot` (0..9
+    /// corresponding to digit keys 1..9, 0). Out-of-range slots are
+    /// ignored.
+    TreeBookmarkSet {
+        slot: usize,
+        lot: TreeCoord,
+    },
     PrestigeReset,
     /// Latest render-computed biscuit geometry, so the sim can place
     /// powerups and auto-particles inside the current layout. Powerup
     /// rects live on the input/render side (only the click handler reads
-    /// them).
+    /// them). `powerups_paused` is set while a full-screen modal (the
+    /// upgrade tree) is open — auto-FPS keeps accruing but the powerup
+    /// engine freezes (no new spawns, existing on-screen powerups stop
+    /// counting down their lifetime).
     UpdateGeometry {
         biscuit: Rect,
+        powerups_paused: bool,
     },
     /// Dev-only cheats (F-keys). Gated at the input router by `debug`;
     /// the sim trusts whatever arrives.
@@ -82,6 +102,10 @@ pub enum Action {
 #[derive(Clone, Copy, Default)]
 pub struct SimGeometry {
     pub biscuit: Rect,
+    /// True while a full-screen modal (the upgrade tree) is open. Pauses
+    /// the powerup spawn / tick engine; the rest of the tick keeps
+    /// running so auto-FPS continues to accrue underneath.
+    pub powerups_paused: bool,
 }
 
 /// Apply one [`Action`] to the canonical [`GameState`]. Pure data: no I/O,
@@ -125,14 +149,31 @@ pub fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometr
                 state.buy_max(idx);
             }
         },
-        Action::BuyUpgrade(idx) => {
-            state.buy_upgrade(idx);
+        Action::TreeBuy(lot) => {
+            state.buy_tree_node(lot);
+        }
+        Action::TreeRefund(lot) => {
+            let _ = state.refund_tree_node(lot);
+        }
+        Action::TreeFocus(lot) => {
+            state.tree.cursor = lot;
+        }
+        Action::TreeBookmarkSet { slot, lot } => {
+            if let Some(b) = state.tree.bookmarks.get_mut(slot) {
+                *b = lot;
+            }
         }
         Action::PrestigeReset => {
             state.prestige_reset();
         }
-        Action::UpdateGeometry { biscuit } => {
-            *geom = SimGeometry { biscuit };
+        Action::UpdateGeometry {
+            biscuit,
+            powerups_paused,
+        } => {
+            *geom = SimGeometry {
+                biscuit,
+                powerups_paused,
+            };
         }
         Action::DevAddCuques(n) => {
             state.dev_add_cuques(n);
@@ -149,10 +190,17 @@ pub fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometr
 /// Run the platform-agnostic body of one sim tick: state updates + ambient
 /// spawn helpers. Save scheduling and demo-driver autopilot are the
 /// **caller's** concern (they live in `app.rs::sim_loop` on native).
+///
+/// When `geom.powerups_paused` is set (a full-screen modal is open), the
+/// powerup engine is skipped entirely — no spawns, no lifetime ticks, no
+/// cooldown advancement. The base tick still runs so auto-FPS, modifiers,
+/// achievements, and HUD count-ups keep flowing.
 pub fn sim_tick(state: &mut GameState, geom: &SimGeometry) {
     state.tick();
-    state.tick_powerups();
-    maybe_spawn_powerups(state, geom);
+    if !geom.powerups_paused {
+        state.tick_powerups();
+        maybe_spawn_powerups(state, geom);
+    }
     maybe_spawn_auto_particle(state, geom);
     maybe_idle_clench(state);
 }
@@ -264,7 +312,16 @@ fn maybe_spawn_powerups(state: &mut GameState, geom: &SimGeometry) {
             continue;
         }
         spawn_powerup(state, kind, cells);
-        state.powerup_cooldowns[i] = powerup::next_cooldown(kind);
+        // Tree contribution: SpawnRateMul scales the cooldown
+        // multiplicatively. <1.0 = more frequent spawns; >1.0 = rarer.
+        let mul = state
+            .tree_aggregate
+            .powerup_spawn_mul
+            .get(i)
+            .copied()
+            .unwrap_or(1.0);
+        let base = powerup::next_cooldown(kind) as f64;
+        state.powerup_cooldowns[i] = (base * mul).max(1.0) as u32;
     }
 }
 
@@ -316,6 +373,7 @@ mod tests {
     fn geom_with_biscuit() -> SimGeometry {
         SimGeometry {
             biscuit: Rect::new(0, 0, 40, 20),
+            powerups_paused: false,
         }
     }
 
@@ -388,6 +446,7 @@ mod tests {
         let trials = 1000;
         let geom = SimGeometry {
             biscuit: Rect::new(0, 0, 60, 30),
+            powerups_paused: false,
         };
         for _ in 0..trials {
             let mut state = GameState::default();
@@ -419,6 +478,7 @@ mod tests {
         // Just above the size guard so force_spawn_powerup goes through.
         let geom = SimGeometry {
             biscuit: Rect::new(0, 0, 16, 8),
+            powerups_paused: false,
         };
         force_spawn_powerup(&mut state, &geom, PowerupKind::Lucky);
         force_spawn_powerup(&mut state, &geom, PowerupKind::Frenzy);

@@ -111,7 +111,11 @@ mod tests {
         assert_eq!(s.fingerer_count("index_finger"), 9);
         assert_eq!(s.fingerer_count("latex_glove"), 4);
         assert!(s.has_achievement("first_finger"));
-        assert!(s.has_upgrade("click_mult_1"));
+        // V3→V4 (the 1.0.0 breaking change) silently drops the old
+        // hardcoded upgrades. A V1 save's `upgrades_earned` field is
+        // accepted by the V1 deserializer but the chain ends with an
+        // empty tree.
+        assert!(s.tree.bought.is_empty());
         assert_eq!(s.prestige, 7);
         assert_eq!(s.total_play_ticks, 1000);
         assert_eq!(s.buffs.len(), 1);

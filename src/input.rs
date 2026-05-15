@@ -20,8 +20,9 @@
 use ratatui::layout::Rect;
 
 use crate::game::state::GameState;
+use crate::game::tree::coord::TreeCoord;
 use crate::sim::{Action, BuyQty};
-use crate::ui::{HelpAction, Mode};
+use crate::ui::{HelpAction, Mode, TreeButtonAction};
 
 /// Platform-neutral input vocabulary. Crossterm's `Event::{Key,Mouse,Resize,…}`
 /// and ratzilla's `KeyEvent`/`MouseEvent`/`WheelEvent` both narrow into this
@@ -37,6 +38,13 @@ pub enum InputEvent {
         row: u16,
         button: MouseButton,
         mods: Modifiers,
+    },
+    /// A mouse button was released. Used to end drag tracking in the tree
+    /// modal; click effects fire on `MouseDown`, not on `MouseUp`.
+    MouseUp {
+        col: u16,
+        row: u16,
+        button: MouseButton,
     },
     /// The mouse moved over `(col, row)` — used for hover highlighting.
     /// Drag events normalize to this too; the router doesn't care which.
@@ -57,6 +65,13 @@ pub enum KeyCode {
     Char(char),
     Esc,
     F(u8),
+    /// Cursor / pan navigation. Mapped from crossterm `Up/Down/Left/Right`.
+    Up,
+    Down,
+    Left,
+    Right,
+    /// Confirm — used by the tree modal to buy the focused node.
+    Enter,
 }
 
 /// Subset of mouse buttons the game cares about. Middle-click is dropped
@@ -89,6 +104,12 @@ pub struct UiState {
     pub zoom_idx: usize,
     pub running: bool,
     pub last_mouse_pos: Option<(u16, u16)>,
+    pub tree_render: TreeRenderState,
+    /// True after pressing `b` in the tree modal — the next digit press
+    /// saves the current cursor as that bookmark slot instead of jumping
+    /// to it. Cleared by the digit press, by Esc, by mode change, or by
+    /// any non-digit key in tree mode (so the prefix doesn't get stuck).
+    pub tree_bookmark_pending: bool,
 }
 
 impl UiState {
@@ -98,6 +119,8 @@ impl UiState {
             zoom_idx: 0,
             running: true,
             last_mouse_pos: None,
+            tree_render: TreeRenderState::default(),
+            tree_bookmark_pending: false,
         }
     }
 }
@@ -108,12 +131,62 @@ impl Default for UiState {
     }
 }
 
+/// Render-side state for the upgrade tree modal. Holds the smoothed camera
+/// pan (so panning eases instead of snapping), the active drag tracker,
+/// and a snapshot of the last-seen cursor for cursor-change detection.
+///
+/// All `f32` because the tween needs sub-cell precision — the final
+/// `pan_x` / `pan_y` are rounded back to integer cells in the renderer.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeRenderState {
+    /// Current rendered pan (canvas-cell coords). Eased toward `target_*`
+    /// each frame; pan reads use `.round() as i32`.
+    pub pan_x: f32,
+    pub pan_y: f32,
+    /// Where the camera is heading. Set to the cursor's centered position
+    /// whenever the cursor changes; modified directly by drag.
+    pub target_pan_x: f32,
+    pub target_pan_y: f32,
+    /// Previously-rendered cursor — drives cursor-change detection
+    /// (cursor change resets `target_pan_*` to its centered position).
+    pub prev_cursor: TreeCoord,
+    /// `false` before the first frame in the current modal session; the
+    /// renderer snaps `pan_*` to `target_*` on that frame instead of
+    /// tweening. Reset to `false` on every modal close so the camera
+    /// doesn't tween from a stale position on reopen.
+    pub initialized: bool,
+    /// Last mouse cell observed while the left button was held. While
+    /// `Some`, MouseMoved events apply the (cell-delta) directly to
+    /// `pan_*` AND `target_pan_*` so the dragged position sticks after
+    /// release (the tween doesn't pull back to cursor).
+    pub drag_last: Option<(u16, u16)>,
+}
+
+impl Default for TreeRenderState {
+    fn default() -> Self {
+        Self {
+            pan_x: 0.0,
+            pan_y: 0.0,
+            target_pan_x: 0.0,
+            target_pan_y: 0.0,
+            prev_cursor: TreeCoord::ORIGIN,
+            initialized: false,
+            drag_last: None,
+        }
+    }
+}
+
 /// Per-frame geometry the click router hit-tests against. All `Rect`s come
 /// from the latest `ui::draw` output; `current` is the latest published
 /// snapshot. Borrowed for the duration of one event dispatch.
 pub struct InputContext<'a> {
     pub fingerer_rows: &'a [(usize, Rect)],
-    pub upgrade_rows: &'a [(usize, Rect)],
+    pub tree_node_rects: &'a [(crate::game::tree::coord::TreeCoord, Rect)],
+    /// Optional left-clickable action button in the tree-modal info pane.
+    /// `Some` when the focused node is currently actionable (buyable +
+    /// affordable, or owned + refundable). Lets a touch / single-button
+    /// player trigger buy/refund without needing right-click.
+    pub tree_action_button: Option<(TreeButtonAction, Rect)>,
     pub help_hits: &'a [(HelpAction, Rect)],
     pub biscuit_rect: Rect,
     /// Screen position of the biscuit's focal cell. See
@@ -149,7 +222,8 @@ impl<'a> InputContext<'a> {
     ) -> Self {
         InputContext {
             fingerer_rows: &layout.fingerer_rows,
-            upgrade_rows: &layout.upgrade_rows,
+            tree_node_rects: &layout.tree_node_rects,
+            tree_action_button: layout.tree_action_button,
             help_hits: &layout.help_hits,
             biscuit_rect: layout.biscuit_rect,
             biscuit_focal: layout.biscuit_focal,
@@ -174,7 +248,15 @@ pub fn process_input_event(
     out: &mut Vec<Action>,
 ) {
     match ev {
-        InputEvent::KeyPress { code, mods } => handle_key(code, mods, ui, ctx, out),
+        InputEvent::KeyPress { code, mods } => {
+            // Keyboard nav inside the tree modal cancels any in-progress
+            // drag so a stray-held button doesn't keep panning after the
+            // player switches to keyboard.
+            if ui.mode == Mode::Tree {
+                ui.tree_render.drag_last = None;
+            }
+            handle_key(code, mods, ui, ctx, out);
+        }
         InputEvent::MouseDown {
             col,
             row,
@@ -182,6 +264,13 @@ pub fn process_input_event(
             mods,
         } => {
             ui.last_mouse_pos = Some((col, row));
+            // In tree mode, left-mouse-down starts a potential drag — the
+            // drag actually begins on the next MouseMoved event with the
+            // anchor still held. Click effects (focus, buy) still fire
+            // immediately below.
+            if ui.mode == Mode::Tree && button == MouseButton::Left {
+                ui.tree_render.drag_last = Some((col, row));
+            }
             // M1+M2: try help-bar / prestige-reset hits first. These give
             // the mouse-only player parity with `[u]/[p]/[s]/[a]/[g]/[q]/[r]`
             // shortcuts. Consumed hits short-circuit the rest of the click
@@ -191,12 +280,45 @@ pub fn process_input_event(
             }
             handle_click(col, row, button, mods, ui, ctx, out);
         }
+        InputEvent::MouseUp { col, row, button } => {
+            ui.last_mouse_pos = Some((col, row));
+            // Left release ends an in-progress tree drag. Other buttons
+            // are not used for drag.
+            if button == MouseButton::Left {
+                ui.tree_render.drag_last = None;
+            }
+        }
         InputEvent::MouseMoved { col, row } => {
             // K5: hover highlighting; renderer reads `last_mouse_pos`.
             // Drag events from the underlying terminal collapse to this.
+            // While the tree modal is open with a held-left, apply the
+            // cell delta to the pan target so the camera follows the
+            // mouse instantly (no tween — that would fight the drag).
+            if ui.mode == Mode::Tree
+                && let Some((lc, lr)) = ui.tree_render.drag_last
+            {
+                let dx = col as i32 - lc as i32;
+                let dy = row as i32 - lr as i32;
+                if dx != 0 || dy != 0 {
+                    let r = &mut ui.tree_render;
+                    r.pan_x -= dx as f32;
+                    r.pan_y -= dy as f32;
+                    r.target_pan_x -= dx as f32;
+                    r.target_pan_y -= dy as f32;
+                    r.drag_last = Some((col, row));
+                }
+            }
             ui.last_mouse_pos = Some((col, row));
         }
         InputEvent::Wheel { col, row, delta } => {
+            // Biscuit zoom is meaningless in tree mode — the biscuit isn't
+            // visible, and accidentally zooming-out behind the modal then
+            // closing it is a confusing UX trap. Drop wheel events entirely
+            // while the tree is open. (A future feature could repurpose
+            // wheel for tree-canvas zoom; for now plain drop.)
+            if ui.mode == Mode::Tree {
+                return;
+            }
             // Scroll only zooms inside the play area (the whole left column
             // where the biscuit lives, including the void around a small
             // biscuit at low zoom). Cold frames (no rect yet) conservatively
@@ -318,6 +440,54 @@ fn handle_click(
     ctx: &InputContext,
     out: &mut Vec<Action>,
 ) {
+    // Tree mode is a FULL-SCREEN modal that paints over the biscuit /
+    // sidebar / HUD. The rects from those layers are still live in
+    // `InputContext` (the renderer drew them before the tree overpainted),
+    // and falling through to the normal click pipeline would let those
+    // ghost rects swallow tree clicks. Concretely: the cuque-anchor
+    // renders at screen-center, which is also where `biscuit_rect` sits,
+    // so clicking the anchor used to fire `Action::Click` (a biscuit
+    // finger) instead of `Action::TreeFocus`. Isolate tree-mode clicks
+    // so only `tree_node_rects` apply.
+    if ui.mode == Mode::Tree {
+        // Left-click on the info-pane action button = buy or refund
+        // the focused lot. Lets touch / single-button players trigger
+        // the action without a right-click. Right-click here also
+        // fires the action — same intent either way.
+        if let Some((action, r)) = ctx.tree_action_button
+            && rect_contains(r, col, row)
+        {
+            let cursor = ctx.current.tree.cursor;
+            match action {
+                TreeButtonAction::Buy => out.push(Action::TreeBuy(cursor)),
+                TreeButtonAction::Refund => out.push(Action::TreeRefund(cursor)),
+            }
+            return;
+        }
+        for &(lot, r) in ctx.tree_node_rects {
+            if rect_contains(r, col, row) {
+                out.push(Action::TreeFocus(lot));
+                if button == MouseButton::Right {
+                    let owned = ctx.current.tree.bought.contains(&lot);
+                    if owned {
+                        // Try refund — silently rejected by the sim if
+                        // it would orphan another owned node, so safe
+                        // to emit unconditionally.
+                        out.push(Action::TreeRefund(lot));
+                    } else if ctx.current.can_buy_tree_node(lot) {
+                        out.push(Action::TreeBuy(lot));
+                    }
+                }
+                return;
+            }
+        }
+        // Click on empty tree canvas: no-op. The MouseDown handler
+        // above already started drag tracking, so a hold + move from
+        // here will pan; a release without motion does nothing visible.
+        let _ = mods;
+        return;
+    }
+
     // Powerups are catchable from ANY panel — match the keyboard 'g'
     // behavior, which has no mode guard. The marker still renders on the
     // biscuit while a non-Game panel is open. Right-click on a powerup
@@ -358,16 +528,7 @@ fn handle_click(
             }
         }
     }
-    // Mouse-buy upgrades from the Upgrades panel. Modifiers ignored — each
-    // upgrade is a one-shot purchase. Right-click also buys.
-    if ui.mode == Mode::Upgrades {
-        for &(idx, r) in ctx.upgrade_rows {
-            if rect_contains(r, col, row) {
-                out.push(Action::BuyUpgrade(idx));
-                return;
-            }
-        }
-    }
+    let _ = mods;
     // J10: nothing actionable under the click. Acknowledge it visually with
     // a brief "·" so the dead-zone (e.g. the air around a 25%-zoom biscuit)
     // doesn't feel inert. Skip when:
@@ -426,11 +587,11 @@ fn handle_key(
                 Mode::Achievements
             };
         }
-        KeyCode::Char('u') | KeyCode::Char('U') => {
-            ui.mode = if matches!(ui.mode, Mode::Upgrades) {
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            ui.mode = if matches!(ui.mode, Mode::Tree) {
                 Mode::Game
             } else {
-                Mode::Upgrades
+                Mode::Tree
             };
         }
         // [g] catches the most-urgent powerup (lowest remaining life
@@ -486,6 +647,43 @@ fn handle_key(
             out.push(Action::PrestigeReset);
             ui.mode = Mode::Game;
         }
+        // Tree-mode controls. Pan via hjkl or arrow keys; Enter buys the
+        // focused node; R refunds the focused node; `b` then digit saves
+        // a bookmark; plain digit jumps to a bookmark (handled below in
+        // the digit_slot block).
+        KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Left if ui.mode == Mode::Tree => {
+            ui.tree_bookmark_pending = false;
+            let c = ctx.current.tree.cursor;
+            out.push(Action::TreeFocus(TreeCoord::new(c.x - 1, c.y)));
+        }
+        KeyCode::Char('l') | KeyCode::Char('L') | KeyCode::Right if ui.mode == Mode::Tree => {
+            ui.tree_bookmark_pending = false;
+            let c = ctx.current.tree.cursor;
+            out.push(Action::TreeFocus(TreeCoord::new(c.x + 1, c.y)));
+        }
+        KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Up if ui.mode == Mode::Tree => {
+            ui.tree_bookmark_pending = false;
+            let c = ctx.current.tree.cursor;
+            out.push(Action::TreeFocus(TreeCoord::new(c.x, c.y - 1)));
+        }
+        KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Down if ui.mode == Mode::Tree => {
+            ui.tree_bookmark_pending = false;
+            let c = ctx.current.tree.cursor;
+            out.push(Action::TreeFocus(TreeCoord::new(c.x, c.y + 1)));
+        }
+        KeyCode::Enter if ui.mode == Mode::Tree => {
+            ui.tree_bookmark_pending = false;
+            out.push(Action::TreeBuy(ctx.current.tree.cursor));
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') if ui.mode == Mode::Tree => {
+            ui.tree_bookmark_pending = false;
+            out.push(Action::TreeRefund(ctx.current.tree.cursor));
+        }
+        KeyCode::Char('b') | KeyCode::Char('B') if ui.mode == Mode::Tree => {
+            // Toggle so a second press cancels the pending state without
+            // having to press an unrelated key.
+            ui.tree_bookmark_pending = !ui.tree_bookmark_pending;
+        }
         KeyCode::Char('+') | KeyCode::Char('=') => {
             ui.zoom_idx = ui.zoom_idx.saturating_sub(1);
         }
@@ -514,10 +712,21 @@ fn handle_key(
                             out.push(Action::BuyFingerer { idx: fid, qty });
                         }
                     }
-                    Mode::Upgrades => {
-                        if let Some(&(u_idx, _)) = ctx.upgrade_rows.get(slot) {
-                            out.push(Action::BuyUpgrade(u_idx));
+                    Mode::Tree => {
+                        if ui.tree_bookmark_pending || buy_10 {
+                            // Either we're inside a pending `b`-prefix or
+                            // the player pressed Shift+digit — both save
+                            // the current cursor as that bookmark slot.
+                            out.push(Action::TreeBookmarkSet {
+                                slot,
+                                lot: ctx.current.tree.cursor,
+                            });
+                            ui.tree_bookmark_pending = false;
+                        } else {
+                            let target = ctx.current.tree.bookmarks[slot];
+                            out.push(Action::TreeFocus(target));
                         }
+                        let _ = buy_max;
                     }
                     _ => {}
                 }
@@ -584,14 +793,15 @@ mod tests {
         play_area: Rect,
         prestige_reset_rect: Rect,
         fingerer_rows: &'a [(usize, Rect)],
-        upgrade_rows: &'a [(usize, Rect)],
+        tree_node_rects: &'a [(crate::game::tree::coord::TreeCoord, Rect)],
         help_hits: &'a [(HelpAction, Rect)],
         debug: bool,
         current: &'a GameState,
     ) -> InputContext<'a> {
         InputContext {
             fingerer_rows,
-            upgrade_rows,
+            tree_node_rects,
+            tree_action_button: None,
             help_hits,
             biscuit_rect: biscuit,
             biscuit_focal: (0, 0),
