@@ -40,6 +40,28 @@ pub const ACHIEVEMENT_FLASH_TICKS: u32 = TICK_HZ * 2;
 /// short enough that it's clearly an "announcement," not the longer
 /// purchase flash that fires on actual buy.
 pub const UNLOCK_FLASH_TICKS: u32 = TICK_HZ / 2; // 0.5s
+/// Ticks per cell the edge-unlock wavefront advances. At `TICK_HZ = 20`
+/// a value of 1 = 50 ms / cell = 20 cells / sec, so a typical 8-cell
+/// straight edge fully energizes in ~0.4 s and a longer diagonal in
+/// ~0.7-1.0 s. Lower values speed the animation up; values >1 slow it.
+pub const EDGE_UNLOCK_TICKS_PER_CELL: u32 = 2;
+
+/// In-flight "path lights up" animation when a buy unlocks a neighbor.
+/// Lives only at runtime — `#[serde(skip)]`-projected fields don't ever
+/// reach disk. `ticks` advances one per `tick()`; the renderer derives
+/// the wavefront cell index as `ticks / EDGE_UNLOCK_TICKS_PER_CELL`.
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeUnlockAnim {
+    pub from: TreeCoord,
+    pub to: TreeCoord,
+    pub ticks: u32,
+}
+
+impl EdgeUnlockAnim {
+    pub fn head_cell_index(&self) -> usize {
+        (self.ticks / EDGE_UNLOCK_TICKS_PER_CELL) as usize
+    }
+}
 /// Per-tick upward drift for a particle, expressed as a fraction of the
 /// biscuit's height. Calibrated to match the original feel before the
 /// switch to fractional anchors: the old code rose 0.18 cells/tick on
@@ -283,6 +305,13 @@ pub struct GameState {
     /// unowned so the flash decays on the visible-but-unowned box.
     #[serde(skip)]
     pub tree_refund_flash: HashMap<TreeCoord, u32>,
+    /// In-flight "wire energizing" animations from a just-bought node to
+    /// each neighbor that flipped reachable on the buy. The destination
+    /// box stays gated as not-yet-reachable for the duration of its
+    /// incoming anim; when the wavefront reaches the box, the anim is
+    /// removed and `tree_unlock_flash` fires for that lot.
+    #[serde(skip)]
+    pub tree_edge_anims: Vec<EdgeUnlockAnim>,
 
     #[serde(skip)]
     pub clench_ticks: u32,
@@ -493,6 +522,7 @@ impl Default for GameState {
             tree_buy_flash: HashMap::new(),
             tree_unlock_flash: HashMap::new(),
             tree_refund_flash: HashMap::new(),
+            tree_edge_anims: Vec::new(),
             clench_ticks: 0,
             particles: Vec::new(),
             misclick_particles: Vec::new(),
@@ -1076,6 +1106,7 @@ impl GameState {
         self.tree_buy_flash.clear();
         self.tree_unlock_flash.clear();
         self.tree_refund_flash.clear();
+        self.tree_edge_anims.clear();
         self.buffs.clear();
         self.visual_debt = 0.0;
         self.particles.clear();
@@ -1152,6 +1183,29 @@ impl GameState {
             *t = t.saturating_sub(1);
             *t > 0
         });
+        // Edge-unlock anims: tick each one's wavefront forward. When the
+        // head reaches the path length, the anim is done — drop it and
+        // fire the destination box's unlock_flash so the player gets the
+        // familiar gold pulse to punctuate arrival.
+        let mut just_unlocked: Vec<TreeCoord> = Vec::new();
+        for anim in &mut self.tree_edge_anims {
+            anim.ticks = anim.ticks.saturating_add(1);
+        }
+        self.tree_edge_anims.retain(|a| {
+            let len = node::edge_path_cells(a.from, a.to).len();
+            if len == 0 {
+                return false;
+            }
+            if a.head_cell_index() >= len {
+                just_unlocked.push(a.to);
+                false
+            } else {
+                true
+            }
+        });
+        for to in just_unlocked {
+            self.tree_unlock_flash.insert(to, UNLOCK_FLASH_TICKS);
+        }
         // Held-spacebar streak with a small grace window. Real key-repeat
         // is bursty (~30Hz nominal but with OS-level jitter), so a strict
         // "every tick must see a press" test breaks on a single missed
@@ -1488,6 +1542,15 @@ impl GameState {
         false
     }
 
+    /// True while `lot` has at least one in-flight edge-unlock animation
+    /// converging on it — i.e. a wavefront is still walking the connecting
+    /// path. The render and buy paths gate "is this lot reachable yet?"
+    /// through this so the player can't click through a node before its
+    /// path finishes lighting up.
+    pub fn tree_unlock_pending(&self, lot: TreeCoord) -> bool {
+        self.tree_edge_anims.iter().any(|a| a.to == lot)
+    }
+
     /// True iff the player can buy the node at `lot` right now: it exists,
     /// isn't already owned, is reachable, and they can afford it.
     pub fn can_buy_tree_node(&self, lot: TreeCoord) -> bool {
@@ -1498,6 +1561,9 @@ impl GameState {
             return false;
         };
         if !self.tree_reachable(lot) {
+            return false;
+        }
+        if self.tree_unlock_pending(lot) {
             return false;
         }
         self.affordable_cuques() >= node.cost
@@ -1513,6 +1579,12 @@ impl GameState {
             return None;
         }
         if !self.tree_reachable(lot) {
+            return None;
+        }
+        // Reject while the lot still has an in-flight wavefront — the
+        // player must wait for the path to finish energizing before they
+        // can buy the destination.
+        if self.tree_unlock_pending(lot) {
             return None;
         }
         if self.affordable_cuques() < node.cost {
@@ -1544,7 +1616,15 @@ impl GameState {
             if node::node_at(n.x, n.y).is_none() {
                 continue;
             }
-            self.tree_unlock_flash.insert(n, UNLOCK_FLASH_TICKS);
+            // Defer the gold unlock_flash pulse until the wavefront
+            // actually reaches the neighbor — for now, push an anim so the
+            // edge from this lot to the neighbor lights up over the next
+            // few ticks.
+            self.tree_edge_anims.push(EdgeUnlockAnim {
+                from: lot,
+                to: n,
+                ticks: 0,
+            });
         }
         Some(node)
     }

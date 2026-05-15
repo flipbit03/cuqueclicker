@@ -309,7 +309,10 @@ fn draw_canvas(
                 continue;
             };
             let owned = state.tree.bought.contains(&lot);
-            let reachable = !owned && state.tree_reachable(lot);
+            // While a wavefront is still walking toward this lot, hold it
+            // in its "unreachable" look — the box only flips reachable
+            // once the path finishes energizing.
+            let reachable = !owned && state.tree_reachable(lot) && !state.tree_unlock_pending(lot);
             let affordable = state.affordable_cuques() >= spec.cost;
             let title_short = truncate(&spec.title, (spec.box_w as usize).saturating_sub(2));
             let buy_flash = state
@@ -918,7 +921,7 @@ fn draw_edge(
 ) {
     let a_owned = state.tree.bought.contains(&a.lot);
     let b_owned = state.tree.bought.contains(&b.lot);
-    let style = if a_owned && b_owned {
+    let base_style = if a_owned && b_owned {
         Style::default()
             .fg(Color::Rgb(255, 220, 120))
             .add_modifier(StyleMod::BOLD)
@@ -928,65 +931,57 @@ fn draw_edge(
         Style::default().fg(Color::Rgb(80, 80, 100))
     };
 
-    // Centers of each box (canvas-grid coords).
-    let acx = a.spec_box_x + (a.box_w as i32) / 2;
-    let acy = a.spec_box_y + (a.box_h as i32) / 2;
-    let bcx = b.spec_box_x + (b.box_w as i32) / 2;
-    let bcy = b.spec_box_y + (b.box_h as i32) / 2;
+    // Path goes from A's center to B's center, in that order. Animation
+    // wavefronts are anchored to one of the two endpoints — if there's
+    // an active anim with `from == a.lot` the lit subrange is path[0..=head];
+    // if `from == b.lot` the lit subrange is path[len-1-head..]. No-anim
+    // edges paint the full path.
+    let path = node::edge_path_cells(a.lot, b.lot);
+    if path.is_empty() {
+        return;
+    }
+    let anim = state
+        .tree_edge_anims
+        .iter()
+        .find(|an| (an.from == a.lot && an.to == b.lot) || (an.from == b.lot && an.to == a.lot));
 
-    // Per-endpoint opacity check. Regular boxes paint every cell in
-    // their bounding rect (border + interior content), so the line
-    // should stop at the bounding rect — anything that intrudes gets
-    // overpainted and looks wrong. The anchor (cuque) paints only its
-    // NON-SPACE sprite cells (BISCUIT_TINY has wide blank gutters
-    // around its rounded outline), so an edge that stops at the
-    // bounding rect leaves a visible gap between the line and the
-    // sprite border. For anchors we only consider the actually-painted
-    // sprite cells opaque, letting the line cross the hollow gutter
-    // and meet the visible outline — the cuque draws on top after, so
-    // outline cells are never visibly trampled.
+    // Same opacity rule as before: regular boxes are opaque across their
+    // whole bounding rect, the anchor is only opaque on actually-painted
+    // sprite cells (so edges can meet its rounded outline).
     let in_a = |x: i32, y: i32| opaque_for(a, x, y);
     let in_b = |x: i32, y: i32| opaque_for(b, x, y);
 
-    // Strictly aligned (same row or same column) → single straight
-    // segment. Reads as a clean orthogonal connection.
-    if (acx - bcx).abs() <= 2 {
-        let mid_x = (acx + bcx) / 2;
-        let (y0, y1) = if acy < bcy { (acy, bcy) } else { (bcy, acy) };
-        paint_v_segment(
-            frame, area, pan_x, pan_y, mid_x, y0, y1, style, &in_a, &in_b,
-        );
-        return;
-    }
-    if (acy - bcy).abs() <= 2 {
-        let mid_y = (acy + bcy) / 2;
-        let (x0, x1) = if acx < bcx { (acx, bcx) } else { (bcx, acx) };
-        paint_h_segment(
-            frame, area, pan_x, pan_y, mid_y, x0, x1, style, &in_a, &in_b,
-        );
-        return;
-    }
-
-    // Diagonal king-edge → Bresenham staircase from A's center to B's
-    // center, alternating horizontal and vertical hops in proportion to
-    // the dx/dy ratio. Each cell along the path gets a glyph chosen from
-    // its prev/next directions: straight runs use `─`/`│`, turns use a
-    // rounded corner `╭ ╮ ╰ ╯`. The net visual is a "soft diagonal" that
-    // descends in small steps instead of the previous one-big-L jolt.
-    let path = bresenham_path(acx, acy, bcx, bcy);
     let buf = frame.buffer_mut();
-    for i in 0..path.len() {
+    let path_len = path.len();
+    for i in 0..path_len {
         let (cx, cy) = path[i];
         if in_a(cx, cy) || in_b(cx, cy) {
             continue;
         }
+        // Animation styling. `dist_from_head` counts how many cells we
+        // are behind the wavefront in the anim's direction-of-travel:
+        // 0 is the head cell, 1+ is the trailing tail, negative means
+        // we're ahead of the wavefront (still draw the base line so the
+        // wave reads as "running over" an existing dim wire instead of
+        // clearing-then-painting).
+        let dist_from_head: i32 = if let Some(an) = anim {
+            let head = an.head_cell_index().min(path_len.saturating_sub(1));
+            if an.from == a.lot {
+                (head as i32) - (i as i32)
+            } else {
+                // Wave runs B → A: cell i is at offset (path_len-1-i)
+                // from B's side.
+                let offset_from_b = (path_len - 1 - i) as i32;
+                (head as i32) - offset_from_b
+            }
+        } else {
+            0
+        };
+
         let prev_raw = if i > 0 { Some(path[i - 1]) } else { None };
         let next_raw = path.get(i + 1).copied();
         let prev_in_box = prev_raw.is_some_and(|(px, py)| in_a(px, py) || in_b(px, py));
         let next_in_box = next_raw.is_some_and(|(nx, ny)| in_a(nx, ny) || in_b(nx, ny));
-        // If the neighbor on either side is inside a box, treat that
-        // direction as "terminus" (None) so the glyph picker draws a
-        // half-stub instead of a turn into-nothing.
         let prev = prev_raw.filter(|_| !prev_in_box);
         let next = next_raw.filter(|_| !next_in_box);
         // dir_to_box: direction FROM this cell TOWARD the in-box
@@ -1006,6 +1001,26 @@ fn draw_edge(
             next.map(|n| dir_between((cx, cy), n)),
             dir_to_box,
         );
+
+        // Wave styling: head cell is pure white, trail decays through
+        // bright cyan into the resting base style. Cells AHEAD of the
+        // wavefront (dist < 0) and well-behind the trail keep their
+        // base style so the wire is always drawn — the wave is a
+        // bright overpaint on top of the dim base line, not a reveal.
+        let style = match dist_from_head {
+            0 if anim.is_some() => Style::default()
+                .fg(Color::Rgb(255, 255, 255))
+                .add_modifier(StyleMod::BOLD),
+            1 if anim.is_some() => Style::default()
+                .fg(Color::Rgb(120, 220, 255))
+                .add_modifier(StyleMod::BOLD),
+            2 if anim.is_some() => Style::default()
+                .fg(Color::Rgb(80, 170, 230))
+                .add_modifier(StyleMod::BOLD),
+            3 if anim.is_some() => Style::default().fg(Color::Rgb(70, 130, 190)),
+            _ => base_style,
+        };
+
         if let Some((sx, sy)) = canvas_to_screen(area, pan_x, pan_y, cx, cy)
             && let Some(cell) = buf.cell_mut((sx, sy))
         {
@@ -1178,163 +1193,6 @@ fn opposite(d: Dir) -> Dir {
         Dir::Left => Dir::Right,
         Dir::Right => Dir::Left,
     }
-}
-
-/// Manhattan-Bresenham path from `(ax, ay)` to `(bx, by)` — cardinal
-/// moves only, interleaved in proportion to the dx/dy ratio so a
-/// 36-wide × 10-tall lot pair (the typical diagonal king-edge) produces
-/// a path of ~3-4 horizontal hops between each vertical hop. The
-/// resulting staircase reads as a soft diagonal rather than one big L.
-fn bresenham_path(ax: i32, ay: i32, bx: i32, by: i32) -> Vec<(i32, i32)> {
-    let mut path = Vec::with_capacity(((bx - ax).abs() + (by - ay).abs() + 1) as usize);
-    let mut x = ax;
-    let mut y = ay;
-    let dx = (bx - ax).abs();
-    let dy = (by - ay).abs();
-    let sx: i32 = (bx - ax).signum();
-    let sy: i32 = (by - ay).signum();
-    path.push((x, y));
-    let mut xs: i64 = 0; // x-steps taken
-    let mut ys: i64 = 0; // y-steps taken
-    while x != bx || y != by {
-        // Step the axis whose normalized progress is currently the
-        // smallest: `(steps+1)/total_for_that_axis`. Cross-multiplying
-        // avoids float math while keeping interleaving exact.
-        let step_x_now = if x == bx {
-            false
-        } else if y == by {
-            true
-        } else {
-            (xs + 1) * (dy as i64) <= (ys + 1) * (dx as i64)
-        };
-        if step_x_now {
-            x += sx;
-            xs += 1;
-        } else {
-            y += sy;
-            ys += 1;
-        }
-        path.push((x, y));
-    }
-    path
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_h_run(
-    frame: &mut Frame,
-    area: Rect,
-    pan_x: i32,
-    pan_y: i32,
-    y: i32,
-    x0: i32,
-    x1: i32,
-    style: Style,
-    in_a: &impl Fn(i32, i32) -> bool,
-    in_b: &impl Fn(i32, i32) -> bool,
-    skip_corner: &impl Fn(i32, i32) -> bool,
-) {
-    if x1 < x0 {
-        return;
-    }
-    let buf = frame.buffer_mut();
-    for x in x0..=x1 {
-        if in_a(x, y) || in_b(x, y) || skip_corner(x, y) {
-            continue;
-        }
-        if let Some((sx, sy)) = canvas_to_screen(area, pan_x, pan_y, x, y)
-            && let Some(cell) = buf.cell_mut((sx, sy))
-        {
-            cell.set_char('─');
-            cell.set_style(style);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_v_run(
-    frame: &mut Frame,
-    area: Rect,
-    pan_x: i32,
-    pan_y: i32,
-    x: i32,
-    y0: i32,
-    y1: i32,
-    style: Style,
-    in_a: &impl Fn(i32, i32) -> bool,
-    in_b: &impl Fn(i32, i32) -> bool,
-    skip_corner: &impl Fn(i32, i32) -> bool,
-) {
-    if y1 < y0 {
-        return;
-    }
-    let buf = frame.buffer_mut();
-    for y in y0..=y1 {
-        if in_a(x, y) || in_b(x, y) || skip_corner(x, y) {
-            continue;
-        }
-        if let Some((sx, sy)) = canvas_to_screen(area, pan_x, pan_y, x, y)
-            && let Some(cell) = buf.cell_mut((sx, sy))
-        {
-            cell.set_char('│');
-            cell.set_style(style);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_h_segment(
-    frame: &mut Frame,
-    area: Rect,
-    pan_x: i32,
-    pan_y: i32,
-    y: i32,
-    x0: i32,
-    x1: i32,
-    style: Style,
-    in_a: &impl Fn(i32, i32) -> bool,
-    in_b: &impl Fn(i32, i32) -> bool,
-) {
-    paint_h_run(
-        frame,
-        area,
-        pan_x,
-        pan_y,
-        y,
-        x0 + 1,
-        x1 - 1,
-        style,
-        in_a,
-        in_b,
-        &|_, _| false,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn paint_v_segment(
-    frame: &mut Frame,
-    area: Rect,
-    pan_x: i32,
-    pan_y: i32,
-    x: i32,
-    y0: i32,
-    y1: i32,
-    style: Style,
-    in_a: &impl Fn(i32, i32) -> bool,
-    in_b: &impl Fn(i32, i32) -> bool,
-) {
-    paint_v_run(
-        frame,
-        area,
-        pan_x,
-        pan_y,
-        x,
-        y0 + 1,
-        y1 - 1,
-        style,
-        in_a,
-        in_b,
-        &|_, _| false,
-    );
 }
 
 fn hover_lift(frame: &mut Frame, r: Rect) {

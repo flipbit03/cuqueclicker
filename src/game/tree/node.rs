@@ -644,6 +644,94 @@ pub fn neighbors_with_nodes(c: TreeCoord) -> Vec<TreeCoord> {
         .collect()
 }
 
+/// Cells along the rendered edge from A's box-center to B's box-center,
+/// in A→B order. Returns an empty Vec if either endpoint has no node.
+///
+/// The case-split mirrors `ui::tree::draw_edge` so the path used by the
+/// edge-unlock animation matches the cells the renderer actually paints:
+///   - boxes vertically aligned within ±2 columns → straight vertical run
+///     at the midpoint x.
+///   - boxes horizontally aligned within ±2 rows → straight horizontal
+///     run at the midpoint y.
+///   - otherwise → Bresenham staircase between the two centers.
+pub fn edge_path_cells(a: TreeCoord, b: TreeCoord) -> Vec<(i32, i32)> {
+    let Some(an) = node_at(a.x, a.y) else {
+        return Vec::new();
+    };
+    let Some(bn) = node_at(b.x, b.y) else {
+        return Vec::new();
+    };
+    let acx = an.box_x + (an.box_w as i32) / 2;
+    let acy = an.box_y + (an.box_h as i32) / 2;
+    let bcx = bn.box_x + (bn.box_w as i32) / 2;
+    let bcy = bn.box_y + (bn.box_h as i32) / 2;
+
+    if (acx - bcx).abs() <= 2 {
+        let mid_x = (acx + bcx) / 2;
+        let step: i32 = if acy <= bcy { 1 } else { -1 };
+        let mut path = Vec::new();
+        let mut y = acy;
+        loop {
+            path.push((mid_x, y));
+            if y == bcy {
+                break;
+            }
+            y += step;
+        }
+        return path;
+    }
+    if (acy - bcy).abs() <= 2 {
+        let mid_y = (acy + bcy) / 2;
+        let step: i32 = if acx <= bcx { 1 } else { -1 };
+        let mut path = Vec::new();
+        let mut x = acx;
+        loop {
+            path.push((x, mid_y));
+            if x == bcx {
+                break;
+            }
+            x += step;
+        }
+        return path;
+    }
+    bresenham_path(acx, acy, bcx, bcy)
+}
+
+/// Bresenham-style staircase between (ax, ay) and (bx, by) in
+/// canvas-grid coords. Single-axis steps only, interleaved by
+/// cross-multiplied normalized progress so the staircase doesn't
+/// degenerate into a one-big-L jolt. Returns cells in start→end order.
+pub fn bresenham_path(ax: i32, ay: i32, bx: i32, by: i32) -> Vec<(i32, i32)> {
+    let mut path = Vec::with_capacity(((bx - ax).abs() + (by - ay).abs() + 1) as usize);
+    let mut x = ax;
+    let mut y = ay;
+    let dx = (bx - ax).abs();
+    let dy = (by - ay).abs();
+    let sx: i32 = (bx - ax).signum();
+    let sy: i32 = (by - ay).signum();
+    path.push((x, y));
+    let mut xs: i64 = 0;
+    let mut ys: i64 = 0;
+    while x != bx || y != by {
+        let step_x_now = if x == bx {
+            false
+        } else if y == by {
+            true
+        } else {
+            (xs + 1) * (dy as i64) <= (ys + 1) * (dx as i64)
+        };
+        if step_x_now {
+            x += sx;
+            xs += 1;
+        } else {
+            y += sy;
+            ys += 1;
+        }
+        path.push((x, y));
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
