@@ -415,6 +415,13 @@ fn roll_magnitude(
 }
 
 /// Cost scales with Manhattan distance from origin: deeper = pricier.
+/// Global node-cost multiplier — the single tuning knob for "are upgrades
+/// too cheap / too expensive?". Multiplies every node's rolled cost
+/// uniformly across rarities and depth, so the relative pricing curve
+/// stays intact. Bump it to make the tree feel more grindy, lower it
+/// for a faster ramp.
+pub const NODE_COST_MULT: f64 = 5.0;
+
 /// 1.45^d gives a comfortable mid-game ramp; rarity adds a multiplier on
 /// top so keystones in the same neighborhood cost more than their small
 /// neighbors.
@@ -431,7 +438,7 @@ pub fn roll_cost(x: i32, y: i32, rarity: Rarity) -> f64 {
     // exactly the same.
     let mut rng = SplitMix64::from_coords(TREE_SEED, x, y, 0xC0);
     let jitter = rng.range_f64(0.85, 1.25);
-    (base * depth_factor * rarity_factor * jitter)
+    (NODE_COST_MULT * base * depth_factor * rarity_factor * jitter)
         .floor()
         .max(10.0)
 }
