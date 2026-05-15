@@ -161,6 +161,16 @@ pub fn node_at(x: i32, y: i32) -> Option<NodeSpec> {
     if !has_pop_neighbor {
         return None;
     }
+    // Suppress lots whose anchor chain doesn't reach origin. The chain
+    // is strictly-smaller-manhattan by construction (Pass 1/2 only), so
+    // it must terminate at origin or at a lot whose anchor returns
+    // `None` — in the latter case the whole component is an island and
+    // none of its lots are reachable from origin via the tree. Without
+    // this check the player would see 2-3 node clusters surrounded by
+    // gaps with no way to navigate to them.
+    if !anchor_chain_reaches_origin(TreeCoord::new(x, y)) {
+        return None;
+    }
 
     let mut rng = SplitMix64::from_coords(TREE_SEED, x, y, SALT_NODE);
 
@@ -484,6 +494,30 @@ pub fn is_king_neighbor(a: TreeCoord, b: TreeCoord) -> bool {
 ///      manhattan). Belt-and-suspenders; almost never triggers.
 ///
 /// Returns `None` for origin (no parent) and for unpopulated lots.
+/// Walks the anchor chain from `lot` toward origin. Returns true iff
+/// the chain terminates at `TreeCoord::ORIGIN`. The chain is strictly
+/// manhattan-decreasing by construction (Pass 1 / Pass 2 of
+/// `anchor_of`), so it can't loop and terminates in at most
+/// `manhattan(lot)` hops.
+fn anchor_chain_reaches_origin(lot: TreeCoord) -> bool {
+    let mut cur = lot;
+    // Manhattan distance is the maximum chain length (strict decrease
+    // per hop), plus one slack hop for the final origin step.
+    let max_steps = (lot.x.unsigned_abs() as usize)
+        .saturating_add(lot.y.unsigned_abs() as usize)
+        .saturating_add(2);
+    for _ in 0..max_steps {
+        if cur == TreeCoord::ORIGIN {
+            return true;
+        }
+        match anchor_of(cur) {
+            Some(parent) => cur = parent,
+            None => return false,
+        }
+    }
+    false
+}
+
 pub fn anchor_of(lot: TreeCoord) -> Option<TreeCoord> {
     if lot == TreeCoord::ORIGIN {
         return None;
@@ -523,12 +557,12 @@ pub fn anchor_of(lot: TreeCoord) -> Option<TreeCoord> {
             return Some(*n);
         }
     }
-    // Pass 3: any populated neighbor. Last resort.
-    for n in &candidates {
-        if passes_gap_roll(n.x, n.y) {
-            return Some(*n);
-        }
-    }
+    // No "any populated neighbor" fallback. Allowing a non-strict-smaller
+    // pick made the anchor chain non-monotonic, which let pairs of
+    // isolated populated lots reference each other as their anchors —
+    // a 2-cycle that never reached origin. Returning `None` here makes
+    // such lots un-anchored, and `node_at` suppresses them so the player
+    // never sees an unreachable island.
     None
 }
 
@@ -966,6 +1000,31 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn every_node_has_anchor_chain_to_origin() {
+        // Walk a sizable region. Every `node_at(x, y).is_some()` MUST
+        // have an anchor chain that terminates at origin. The chain
+        // can't loop (strictly-smaller manhattan), and a node with no
+        // chain is an island — `node_at` should already be suppressing
+        // those.
+        for x in -30..=30 {
+            for y in -30..=30 {
+                if node_at(x, y).is_none() {
+                    continue;
+                }
+                let lot = TreeCoord::new(x, y);
+                if lot == TreeCoord::ORIGIN {
+                    continue;
+                }
+                assert!(
+                    anchor_chain_reaches_origin(lot),
+                    "node at {:?} has anchor chain that doesn't reach origin",
+                    lot
+                );
             }
         }
     }
