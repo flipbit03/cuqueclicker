@@ -102,6 +102,29 @@ pub fn draw(
     draw_header(frame, header_area, state);
     let node_rects = draw_canvas(frame, canvas_area, state, mouse_pos, tree_render);
     let action_button = draw_info_pane(frame, info_area, state);
+    // Hover-fill the info-pane action button (buy / refund) so the player
+    // reads it as a clickable target. Matches the help-bar token hover:
+    // white fg + dark bg tint + bold.
+    if let (Some((_, r)), Some((mx, my))) = (action_button, mouse_pos)
+        && mx >= r.x
+        && mx < r.x + r.width
+        && my >= r.y
+        && my < r.y + r.height
+    {
+        let buf = frame.buffer_mut();
+        for y in r.y..r.y + r.height {
+            for x in r.x..r.x + r.width {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_style(
+                        cell.style()
+                            .fg(Color::Rgb(255, 255, 255))
+                            .bg(Color::Rgb(40, 40, 50))
+                            .add_modifier(StyleMod::BOLD),
+                    );
+                }
+            }
+        }
+    }
     TreeDrawOutput {
         node_rects,
         action_button,
