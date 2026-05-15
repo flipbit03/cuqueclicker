@@ -580,11 +580,29 @@ pub fn edge_exists(a: TreeCoord, b: TreeCoord) -> bool {
         (b, a)
     };
     if diagonal {
-        // Both L-bend corner lots occupied → suppress to avoid visually
-        // crossing an unrelated box.
         let mid_h = TreeCoord::new(hi.x, lo.y);
         let mid_v = TreeCoord::new(lo.x, hi.y);
-        if node_at(mid_h.x, mid_h.y).is_some() && node_at(mid_v.x, mid_v.y).is_some() {
+        let mid_h_exists = node_at(mid_h.x, mid_h.y).is_some();
+        let mid_v_exists = node_at(mid_v.x, mid_v.y).is_some();
+        // Visual-crossing suppression: both L-bend corner lots occupied
+        // → the diagonal line would slice across an unrelated box.
+        if mid_h_exists && mid_v_exists {
+            return false;
+        }
+        // Redundant-diagonal suppression: if a 2-hop orthogonal path
+        // through the (single) occupied L-bend corner already connects
+        // A and B, the diagonal is just a shortcut closing a triangle —
+        // both lots are already reachable from each other via the
+        // corner, and the player gets no new connectivity from the
+        // diagonal. Suppress it so the tree reads as branches instead
+        // of triangles. Anchor diagonals dodge this (the anchor_of()
+        // check above already short-circuits with `return true`).
+        //
+        // `edge_exists` recurses into ORTHOGONAL queries here, which
+        // skip the diagonal branch entirely — no infinite recursion.
+        let path_via_mid_h = mid_h_exists && edge_exists(lo, mid_h) && edge_exists(mid_h, hi);
+        let path_via_mid_v = mid_v_exists && edge_exists(lo, mid_v) && edge_exists(mid_v, hi);
+        if path_via_mid_h || path_via_mid_v {
             return false;
         }
     }
@@ -935,6 +953,50 @@ mod tests {
                             "keystone at ({x},{y}) has no boon primitive"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diagonal_edges_dont_close_triangles_with_existing_orthogonal_path() {
+        // Walk every diagonal king-pair in a sizable region. For each one
+        // that `edge_exists` returns true on, prove the diagonal isn't
+        // closing a triangle — at least one of the two L-bend corner
+        // lots must NOT have both orthogonal hops in place.
+        for x in -30..=30 {
+            for y in -30..=30 {
+                let a = TreeCoord::new(x, y);
+                let diag_offsets = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
+                for (dx, dy) in diag_offsets {
+                    let b = TreeCoord::new(x + dx, y + dy);
+                    // Canonicalize to avoid double-counting.
+                    if (a.x, a.y) > (b.x, b.y) {
+                        continue;
+                    }
+                    if !edge_exists(a, b) {
+                        continue;
+                    }
+                    // Anchor diagonals get a pass — the anchor-edge rule
+                    // overrides redundancy suppression because removing
+                    // them would orphan the destination from origin.
+                    if anchor_of(a) == Some(b) || anchor_of(b) == Some(a) {
+                        continue;
+                    }
+                    let mid_h = TreeCoord::new(b.x, a.y);
+                    let mid_v = TreeCoord::new(a.x, b.y);
+                    let path_via_h = node_at(mid_h.x, mid_h.y).is_some()
+                        && edge_exists(a, mid_h)
+                        && edge_exists(mid_h, b);
+                    let path_via_v = node_at(mid_v.x, mid_v.y).is_some()
+                        && edge_exists(a, mid_v)
+                        && edge_exists(mid_v, b);
+                    assert!(
+                        !path_via_h && !path_via_v,
+                        "diagonal edge {a:?} <-> {b:?} closes a triangle via \
+                         mid_h={mid_h:?} (path={path_via_h}) or mid_v={mid_v:?} \
+                         (path={path_via_v})"
+                    );
                 }
             }
         }
