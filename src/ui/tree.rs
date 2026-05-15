@@ -921,14 +921,22 @@ fn draw_edge(
 ) {
     let a_owned = state.tree.bought.contains(&a.lot);
     let b_owned = state.tree.bought.contains(&b.lot);
-    let base_style = if a_owned && b_owned {
+    // Pre-energize dim style — what the line looked like when neither
+    // endpoint was owned. While the wave is in flight, cells AHEAD of
+    // the wavefront keep this dim grey so the snake's head reads as
+    // physically painting the line from grey to lit.
+    let dim_style = Style::default().fg(Color::Rgb(80, 80, 100));
+    // Lit / resting style — what the line settles into once the wave
+    // has passed (and what cells behind the wave hold). Matches the
+    // one-owned and both-owned resting palettes.
+    let lit_style = if a_owned && b_owned {
         Style::default()
             .fg(Color::Rgb(255, 220, 120))
             .add_modifier(StyleMod::BOLD)
     } else if a_owned || b_owned {
         Style::default().fg(Color::Rgb(180, 180, 200))
     } else {
-        Style::default().fg(Color::Rgb(80, 80, 100))
+        dim_style
     };
 
     // Path goes from A's center to B's center, in that order. Animation
@@ -1002,23 +1010,31 @@ fn draw_edge(
             dir_to_box,
         );
 
-        // Wave styling: head cell is pure white, trail decays through
-        // bright cyan into the resting base style. Cells AHEAD of the
-        // wavefront (dist < 0) and well-behind the trail keep their
-        // base style so the wire is always drawn — the wave is a
-        // bright overpaint on top of the dim base line, not a reveal.
-        let style = match dist_from_head {
-            0 if anim.is_some() => Style::default()
-                .fg(Color::Rgb(255, 255, 255))
-                .add_modifier(StyleMod::BOLD),
-            1 if anim.is_some() => Style::default()
-                .fg(Color::Rgb(120, 220, 255))
-                .add_modifier(StyleMod::BOLD),
-            2 if anim.is_some() => Style::default()
-                .fg(Color::Rgb(80, 170, 230))
-                .add_modifier(StyleMod::BOLD),
-            3 if anim.is_some() => Style::default().fg(Color::Rgb(70, 130, 190)),
-            _ => base_style,
+        // Snake-game styling. The head cell is pure white; the few
+        // cells just behind it pulse through cyan; further-behind
+        // cells settle into the lit resting style (so the trail
+        // STAYS lit — the snake grows). Cells AHEAD of the head are
+        // still grey (pre-energize), so the wave reads as the snake
+        // eating its way along the wire.
+        let style = if anim.is_some() {
+            if dist_from_head < 0 {
+                dim_style
+            } else {
+                match dist_from_head {
+                    0 => Style::default()
+                        .fg(Color::Rgb(255, 255, 255))
+                        .add_modifier(StyleMod::BOLD),
+                    1 => Style::default()
+                        .fg(Color::Rgb(120, 220, 255))
+                        .add_modifier(StyleMod::BOLD),
+                    2 => Style::default()
+                        .fg(Color::Rgb(80, 170, 230))
+                        .add_modifier(StyleMod::BOLD),
+                    _ => lit_style,
+                }
+            }
+        } else {
+            lit_style
         };
 
         if let Some((sx, sy)) = canvas_to_screen(area, pan_x, pan_y, cx, cy)
