@@ -40,11 +40,13 @@ pub const ACHIEVEMENT_FLASH_TICKS: u32 = TICK_HZ * 2;
 /// short enough that it's clearly an "announcement," not the longer
 /// purchase flash that fires on actual buy.
 pub const UNLOCK_FLASH_TICKS: u32 = TICK_HZ / 2; // 0.5s
-/// Ticks per cell the edge-unlock wavefront advances. At `TICK_HZ = 20`
-/// a value of 1 = 50 ms / cell = 20 cells / sec, so a typical 8-cell
-/// straight edge fully energizes in ~0.4 s and a longer diagonal in
-/// ~0.7-1.0 s. Lower values speed the animation up; values >1 slow it.
-pub const EDGE_UNLOCK_TICKS_PER_CELL: u32 = 1;
+/// Cells the edge-unlock wavefront advances per tick. At `TICK_HZ = 20`
+/// a value of 2 = 40 cells / sec — a typical 8-cell straight edge fully
+/// energizes in ~0.2 s, a longer diagonal in ~0.4 s. Bumping this is
+/// the right knob when the user says "make it faster"; going below 1
+/// (e.g. tick / 2 cells/tick = slower) needs a different mechanism
+/// since we sample integer cells per tick.
+pub const EDGE_UNLOCK_CELLS_PER_TICK: u32 = 2;
 
 /// In-flight "path lights up" animation when a buy unlocks a neighbor.
 /// Lives only at runtime — `#[serde(skip)]`-projected fields don't ever
@@ -59,7 +61,7 @@ pub struct EdgeUnlockAnim {
 
 impl EdgeUnlockAnim {
     pub fn head_cell_index(&self) -> usize {
-        (self.ticks / EDGE_UNLOCK_TICKS_PER_CELL) as usize
+        (self.ticks * EDGE_UNLOCK_CELLS_PER_TICK) as usize
     }
 }
 /// Per-tick upward drift for a particle, expressed as a fraction of the
