@@ -428,7 +428,7 @@ pub const NODE_COST_MULT: f64 = 5.0;
 /// Reference: fingerers grow at 1.15^count (classic Cookie Clicker
 /// 15%-per-buy). The tree grows much steeper because each "lot step"
 /// gives only ONE upgrade, vs many buys per fingerer.
-pub const NODE_COST_GROWTH: f64 = 1.65;
+pub const NODE_COST_GROWTH: f64 = 1.75;
 
 /// Base cost at distance 0 (before rarity and jitter). The origin lot
 /// is auto-owned so this never quotes a real purchase, but it anchors
