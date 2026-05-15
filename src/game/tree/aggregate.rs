@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use crate::game::fingerer::FINGERERS;
-use crate::game::powerup::{N_KINDS, PowerupKind};
+use crate::game::powerup::N_KINDS;
 use crate::game::tree::coord::TreeCoord;
 use crate::game::tree::node::{NodeSpec, node_at};
 use crate::game::tree::primitive::{Op, Primitive, Target};
@@ -251,12 +251,20 @@ fn fold_primitive(agg: &mut TreeAggregate, p: Primitive, add: bool) {
                 agg.green_coin_strength_mul /= p.magnitude;
             }
         }
-        // Op/Target combinations the procgen never produces — silently
-        // ignore. Belt-and-suspenders: any future generation bug just
-        // means the primitive has no effect, not a panic.
-        _ => {}
+        // Op/Target combinations the procgen never produces — fail loud
+        // in dev so a future generation bug or new enum variant can't
+        // silently charge the player cuques for an effect that doesn't
+        // fold into the aggregate. Release builds still no-op (the
+        // primitive has no effect) instead of panicking the run.
+        (op, target) => {
+            debug_assert!(
+                false,
+                "unhandled tree primitive: op={op:?} target={target:?} — \
+                 add a fold arm in aggregate.rs::fold_primitive or remove \
+                 this (op, target) pairing from procgen pick_op"
+            );
+        }
     }
-    let _ = (PowerupKind::ALL,);
 }
 
 #[cfg(test)]

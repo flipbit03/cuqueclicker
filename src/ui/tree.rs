@@ -23,10 +23,9 @@ use crate::game::powerup::PowerupKind;
 use crate::game::state::{
     GameState, PURCHASE_FLASH_TICKS, TREE_REFUND_FRACTION, UNLOCK_FLASH_TICKS,
 };
-use crate::game::tree::aggregate::TreeAggregate;
 use crate::game::tree::coord::TreeCoord;
 use crate::game::tree::naming::primitive_blurb;
-use crate::game::tree::node::{self, LOT_H, LOT_W, NodeSpec, Rarity};
+use crate::game::tree::node::{self, LOT_H, LOT_W, Rarity};
 use crate::game::tree::primitive::{Op, Primitive, Target};
 use crate::i18n::t;
 use crate::input::TreeRenderState;
@@ -385,16 +384,7 @@ fn draw_canvas(
 
     let mut click_rects: Vec<(TreeCoord, Rect)> = Vec::new();
     for v in &visible {
-        if let Some(r) = draw_box(
-            frame,
-            area,
-            pan_x,
-            pan_y,
-            v,
-            cursor,
-            &state.tree_aggregate,
-            state,
-        ) {
+        if let Some(r) = draw_box(frame, area, pan_x, pan_y, v, cursor, state) {
             click_rects.push((v.lot, r));
         }
     }
@@ -435,7 +425,6 @@ fn draw_box(
     pan_y: i32,
     v: &VisibleNode,
     cursor: TreeCoord,
-    tree_agg: &TreeAggregate,
     state: &GameState,
 ) -> Option<Rect> {
     // Anchor (the cuque-sprite at origin) renders as a small ass instead
@@ -532,8 +521,6 @@ fn draw_box(
             max_sy = max_sy.max(sy);
         }
     }
-
-    let _ = tree_agg;
 
     if !painted_any {
         return None;
@@ -1258,17 +1245,17 @@ fn hover_lift(frame: &mut Frame, r: Rect) {
 
 // ---------- Info pane ------------------------------------------------------
 
-/// Button-label strings. Kept as constants so the click-rect math (which
-/// has to know exactly how many characters wide the label is) stays in
-/// sync with the rendered text. Touching one site touches both.
-const BUY_BUTTON_LABEL: &str = "[Click/Enter] to buy";
-const REFUND_BUTTON_LABEL: &str = "[Click/R] refund";
-
 fn draw_info_pane(
     frame: &mut Frame,
     area: Rect,
     state: &GameState,
 ) -> Option<(TreeButtonAction, Rect)> {
+    let lang = t();
+    // Localized button-label strings. Computed once per draw so the
+    // click-rect math (which needs the rendered width) stays in lockstep
+    // with the rendered text under either locale.
+    let buy_button_label = lang.tree_buy_button;
+    let refund_button_label = lang.tree_refund_button;
     let cursor = state.tree.cursor;
     let mut lines: Vec<Line> = Vec::new();
     // The rect of the currently-rendered action button (if any). We
@@ -1283,12 +1270,14 @@ fn draw_info_pane(
     match node::node_at(cursor.x, cursor.y) {
         None => {
             lines.push(Line::styled(
-                format!("(empty lot at {:+}, {:+})", cursor.x, cursor.y),
+                lang.tree_empty_lot_fmt
+                    .replacen("{:+}", &format!("{:+}", cursor.x), 1)
+                    .replacen("{:+}", &format!("{:+}", cursor.y), 1),
                 Style::default().fg(Color::Rgb(120, 120, 130)),
             ));
             lines.push(Line::raw(""));
             lines.push(Line::styled(
-                "Pan with arrows / hjkl to find populated lots.",
+                lang.tree_empty_lot_hint,
                 Style::default().fg(Color::Rgb(160, 160, 170)),
             ));
         }
@@ -1333,9 +1322,9 @@ fn draw_info_pane(
             let reachable = state.tree_reachable(cursor);
             let affordable = state.affordable_cuques() >= spec.cost;
             let rarity_label = match spec.rarity {
-                Rarity::Small => "Small",
-                Rarity::Notable => "Notable",
-                Rarity::Keystone => "KEYSTONE",
+                Rarity::Small => lang.tree_rarity_small,
+                Rarity::Notable => lang.tree_rarity_notable,
+                Rarity::Keystone => lang.tree_rarity_keystone,
             };
             let rarity_color = match spec.rarity {
                 Rarity::Small => Color::Rgb(200, 200, 220),
@@ -1368,6 +1357,8 @@ fn draw_info_pane(
             // before* we push it. Capture that now and use it below
             // when computing the button rect.
             let action_row = inner_y + lines.len() as u16;
+            let owned_tag_padded = format!("  {}  ", lang.tree_owned_tag);
+            let cost_label_padded = format!("  {}", lang.tree_cost_label);
             let action_hint = if owned {
                 let can_refund = state.can_refund_tree_node(cursor);
                 if !can_refund {
@@ -1378,7 +1369,7 @@ fn draw_info_pane(
                     };
                     Line::from(vec![
                         Span::styled(
-                            "  [owned]  ",
+                            owned_tag_padded.clone(),
                             Style::default().fg(Color::Rgb(180, 220, 180)),
                         ),
                         Span::styled(
@@ -1389,21 +1380,23 @@ fn draw_info_pane(
                 } else {
                     let refund = (spec.cost * TREE_REFUND_FRACTION).floor();
                     let loss = spec.cost - refund;
-                    let prefix = "  [owned]  "; // 11 cols
-                    let label_len = REFUND_BUTTON_LABEL.chars().count() as u16;
+                    let label_len = refund_button_label.chars().count() as u16;
                     action_button = Some((
                         TreeButtonAction::Refund,
                         Rect {
-                            x: inner_x + prefix.chars().count() as u16,
+                            x: inner_x + owned_tag_padded.chars().count() as u16,
                             y: action_row,
                             width: label_len,
                             height: 1,
                         },
                     ));
                     Line::from(vec![
-                        Span::styled(prefix, Style::default().fg(Color::Rgb(180, 220, 180))),
                         Span::styled(
-                            REFUND_BUTTON_LABEL,
+                            owned_tag_padded.clone(),
+                            Style::default().fg(Color::Rgb(180, 220, 180)),
+                        ),
+                        Span::styled(
+                            refund_button_label,
                             Style::default()
                                 .fg(Color::Rgb(220, 220, 120))
                                 .add_modifier(StyleMod::BOLD)
@@ -1411,9 +1404,10 @@ fn draw_info_pane(
                         ),
                         Span::styled(
                             format!(
-                                "  (returns {}, loses {})",
-                                format::big(refund),
-                                format::big(loss)
+                                "  {}",
+                                lang.tree_refund_returns_fmt
+                                    .replacen("{}", &format::big(refund), 1)
+                                    .replacen("{}", &format::big(loss), 1)
                             ),
                             Style::default().fg(Color::Rgb(180, 150, 150)),
                         ),
@@ -1421,24 +1415,31 @@ fn draw_info_pane(
                 }
             } else if !reachable {
                 Line::styled(
-                    "  unreachable — buy a connected neighbor first",
+                    format!("  {}", lang.tree_unreachable_hint),
                     Style::default().fg(Color::Rgb(180, 100, 100)),
                 )
             } else if !affordable {
+                let need_more = lang.tree_cost_need_more_fmt.replacen(
+                    "{}",
+                    &format::big(spec.cost - state.affordable_cuques()),
+                    1,
+                );
                 Line::styled(
                     format!(
-                        "  Cost: {}  (need {} more)",
+                        "{}{}  {}",
+                        cost_label_padded,
                         format::big(spec.cost),
-                        format::big(spec.cost - state.affordable_cuques())
+                        need_more
                     ),
                     Style::default().fg(Color::Rgb(220, 100, 100)),
                 )
             } else {
                 let cost_text = format::big(spec.cost);
-                // Line layout: "  Cost: {cost}   {BUY_LABEL}"
-                let prefix_cols =
-                    "  Cost: ".chars().count() + cost_text.chars().count() + "   ".chars().count();
-                let label_len = BUY_BUTTON_LABEL.chars().count() as u16;
+                // Line layout: "{cost_label_padded}{cost}   {buy_button}"
+                let prefix_cols = cost_label_padded.chars().count()
+                    + cost_text.chars().count()
+                    + "   ".chars().count();
+                let label_len = buy_button_label.chars().count() as u16;
                 action_button = Some((
                     TreeButtonAction::Buy,
                     Rect {
@@ -1449,7 +1450,7 @@ fn draw_info_pane(
                     },
                 ));
                 Line::from(vec![
-                    Span::raw("  Cost: "),
+                    Span::raw(cost_label_padded.clone()),
                     Span::styled(
                         cost_text,
                         Style::default()
@@ -1458,7 +1459,7 @@ fn draw_info_pane(
                     ),
                     Span::raw("   "),
                     Span::styled(
-                        BUY_BUTTON_LABEL,
+                        buy_button_label,
                         Style::default()
                             .fg(Color::Rgb(220, 220, 120))
                             .add_modifier(StyleMod::BOLD)
@@ -1505,9 +1506,4 @@ fn truncate(s: &str, max: usize) -> String {
     let mut out: String = s.chars().take(take).collect();
     out.push('…');
     out
-}
-
-#[allow(dead_code)]
-fn _used(spec: &NodeSpec) {
-    let _ = spec.box_x;
 }

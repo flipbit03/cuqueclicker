@@ -77,7 +77,7 @@ impl EdgeUnlockAnim {
     /// Visible-cell offset of the wavefront — how many cells past the
     /// source-side leading-inside region the head has advanced.
     pub fn visible_advance(&self) -> usize {
-        (self.ticks * EDGE_UNLOCK_CELLS_PER_TICK) as usize
+        self.ticks.saturating_mul(EDGE_UNLOCK_CELLS_PER_TICK) as usize
     }
 }
 
@@ -922,7 +922,13 @@ impl GameState {
             PowerupKind::Lucky => {
                 self.lucky_caught += 1;
                 let fps = self.fps();
-                let r = (fps * GOLDEN_REWARD_SECONDS).max(GOLDEN_REWARD_FLAT);
+                let reward_mul = self
+                    .tree_aggregate
+                    .powerup_reward_mul
+                    .get(PowerupKind::Lucky as usize)
+                    .copied()
+                    .unwrap_or(1.0);
+                let r = ((fps * GOLDEN_REWARD_SECONDS).max(GOLDEN_REWARD_FLAT)) * reward_mul;
                 self.add_cuques(r);
                 self.lucky_flash_ticks = LUCKY_FLASH_TICKS;
                 self.cuques_flash_ticks = HUD_FLASH_TICKS;
@@ -930,7 +936,13 @@ impl GameState {
             }
             PowerupKind::Frenzy => {
                 self.frenzy_caught += 1;
-                let dur = TICK_HZ * 13;
+                let duration_mul = self
+                    .tree_aggregate
+                    .powerup_duration_mul
+                    .get(PowerupKind::Frenzy as usize)
+                    .copied()
+                    .unwrap_or(1.0);
+                let dur = ((TICK_HZ * 13) as f64 * duration_mul).round() as u32;
                 // `mult: 777.0` is a legacy field — `click_power()` no
                 // longer reads it. The per-click Frenzy bonus is FPS-
                 // scaled via `FRENZY_FPS_SECONDS_PER_CLICK` /
@@ -945,10 +957,22 @@ impl GameState {
             }
             PowerupKind::Buff => {
                 self.buff_caught += 1;
-                let dur = TICK_HZ * 60;
+                let duration_mul = self
+                    .tree_aggregate
+                    .powerup_duration_mul
+                    .get(PowerupKind::Buff as usize)
+                    .copied()
+                    .unwrap_or(1.0);
+                let reward_mul = self
+                    .tree_aggregate
+                    .powerup_reward_mul
+                    .get(PowerupKind::Buff as usize)
+                    .copied()
+                    .unwrap_or(1.0);
+                let dur = ((TICK_HZ * 60) as f64 * duration_mul).round() as u32;
                 let m = Modifier {
                     source: ModifierSource::PurpleCoin,
-                    effects: vec![ModifierEffect::MulFactor(7.0)],
+                    effects: vec![ModifierEffect::MulFactor(7.0 * reward_mul)],
                     duration: ModifierDuration::Ticks(dur),
                     created_at_tick: self.total_play_ticks,
                 };
@@ -965,9 +989,10 @@ impl GameState {
             PowerupKind::GreenCoin => {
                 self.green_coin_caught += 1;
                 self.green_coin_flash_ticks = GREEN_COIN_FLASH_TICKS;
+                let strength = GREEN_COIN_ADD_PERCENT * self.tree_aggregate.green_coin_strength_mul;
                 let m = Modifier {
                     source: ModifierSource::GreenCoin,
-                    effects: vec![ModifierEffect::AddPercent(GREEN_COIN_ADD_PERCENT)],
+                    effects: vec![ModifierEffect::AddPercent(strength)],
                     duration: ModifierDuration::Permanent,
                     created_at_tick: self.total_play_ticks,
                 };

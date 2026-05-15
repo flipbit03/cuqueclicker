@@ -913,29 +913,53 @@ fn fingerer_noun_pool(idx: usize) -> &'static [&'static str] {
 }
 
 /// Render a short human-readable description of a single primitive. Used by
-/// the info pane to show what a node does in plain English.
+/// the info pane to show what a node does. Math symbols + magnitude
+/// numbers are locale-neutral; only the connector ("to", "cost on", …)
+/// and the target label flip per locale.
 pub fn primitive_blurb(p: Primitive) -> String {
+    let lang = crate::i18n::t();
     let target = target_label(p.target);
     match p.op {
-        Op::AddPercent => format!("{:+.1}% to {}", p.magnitude * 100.0, target),
-        Op::MulFactor => format!("×{:.2} to {}", p.magnitude, target),
-        Op::FlatAdd => format!("{:+.1} flat to {}", p.magnitude, target),
-        Op::CostMul => format!("×{:.2} cost on {}", p.magnitude, target),
-        Op::SpawnRateMul => format!("×{:.2} spawn rate for {}", p.magnitude, target),
-        Op::EffectMul => format!("×{:.2} effect on {}", p.magnitude, target),
+        Op::AddPercent => format!(
+            "{:+.1}% {} {}",
+            p.magnitude * 100.0,
+            lang.tree_blurb_to,
+            target
+        ),
+        Op::MulFactor => format!("×{:.2} {} {}", p.magnitude, lang.tree_blurb_to, target),
+        Op::FlatAdd => format!("{:+.1} {} {}", p.magnitude, lang.tree_blurb_flat_to, target),
+        Op::CostMul => format!("×{:.2} {} {}", p.magnitude, lang.tree_blurb_cost_on, target),
+        Op::SpawnRateMul => format!(
+            "×{:.2} {} {}",
+            p.magnitude, lang.tree_blurb_spawn_rate_for, target
+        ),
+        Op::EffectMul => format!(
+            "×{:.2} {} {}",
+            p.magnitude, lang.tree_blurb_effect_on, target
+        ),
     }
 }
 
 fn target_label(t: Target) -> String {
+    let lang = crate::i18n::t();
     match t {
         Target::Fingerer(idx) => fingerer_label(idx as usize),
-        Target::AllFingerers => "all fingerers".to_string(),
-        Target::Click => "click power".to_string(),
-        Target::PowerupSpawn(k) => format!("{} spawn", powerup_label(k)),
-        Target::PowerupReward(k) => format!("{} reward", powerup_label(k)),
-        Target::PowerupDuration(k) => format!("{} duration", powerup_label(k)),
-        Target::Prestige => "prestige multiplier".to_string(),
-        Target::GreenCoinStrength => "Green Coin strength".to_string(),
+        Target::AllFingerers => lang.tree_target_all_fingerers.to_string(),
+        Target::Click => lang.tree_target_click.to_string(),
+        Target::PowerupSpawn(k) => {
+            lang.tree_target_powerup_spawn_fmt
+                .replacen("{}", powerup_label(k), 1)
+        }
+        Target::PowerupReward(k) => {
+            lang.tree_target_powerup_reward_fmt
+                .replacen("{}", powerup_label(k), 1)
+        }
+        Target::PowerupDuration(k) => {
+            lang.tree_target_powerup_duration_fmt
+                .replacen("{}", powerup_label(k), 1)
+        }
+        Target::Prestige => lang.tree_target_prestige.to_string(),
+        Target::GreenCoinStrength => lang.tree_target_green_coin_strength.to_string(),
     }
 }
 

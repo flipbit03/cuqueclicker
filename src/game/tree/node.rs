@@ -448,9 +448,14 @@ pub fn roll_cost(x: i32, y: i32, rarity: Rarity) -> f64 {
     // exactly the same.
     let mut rng = SplitMix64::from_coords(TREE_SEED, x, y, 0xC0);
     let jitter = rng.range_f64(0.85, 1.25);
-    (NODE_COST_MULT * NODE_BASE_COST * depth_factor * rarity_factor * jitter)
-        .floor()
-        .max(10.0)
+    // `NODE_COST_GROWTH.powf(dist)` overflows to `f64::INFINITY` around
+    // dist ≈ 1232 (at growth=1.75). Clamp to a safe ceiling so the
+    // info-pane "Cost: ?" path is replaced by a real finite quote — the
+    // player won't ever afford it anyway, but the rendering and the
+    // `affordable_cuques() >= cost` check both behave better with a
+    // concrete number.
+    let raw = NODE_COST_MULT * NODE_BASE_COST * depth_factor * rarity_factor * jitter;
+    raw.min(1e300).floor().max(10.0)
 }
 
 /// True when the lots at `a` and `b` are 8-king neighbors (chebyshev
@@ -942,10 +947,14 @@ mod tests {
         assert!(far > near * 100.0, "far ({far}) should be >> near ({near})");
     }
 
-    /// Diagnostic table — not a real assertion, just `cargo test -- --nocapture
-    /// dump_cost_table` to print the live ramp at the current
-    /// NODE_COST_MULT / NODE_COST_GROWTH values. Always passes.
+    /// Diagnostic table — not a real assertion, prints the live ramp at
+    /// the current `NODE_COST_MULT` / `NODE_COST_GROWTH` values. Gated
+    /// behind `#[ignore]` so it doesn't run in normal CI; invoke
+    /// explicitly when tuning balance:
+    ///
+    ///   `cargo test --release dump_cost_table -- --ignored --nocapture`
     #[test]
+    #[ignore]
     fn dump_cost_table() {
         eprintln!(
             "NODE_COST_MULT={NODE_COST_MULT}  NODE_COST_GROWTH={NODE_COST_GROWTH}  base={NODE_BASE_COST}"
