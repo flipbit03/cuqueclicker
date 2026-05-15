@@ -267,15 +267,21 @@ fn draw_canvas(
     let pan_x = tree_render.pan_x.round() as i32;
     let pan_y = tree_render.pan_y.round() as i32;
 
-    // Visibility radius is in lot-space around the cursor (which is what
-    // determines the meaningful frontier). With smooth panning the
-    // viewport's center can briefly be far from the cursor lot, so widen
-    // the harvest a touch to keep the dragged-into region populated.
+    // Harvest is centered on the lot currently under the VIEWPORT center,
+    // not the cursor lot. Drag-panning moves the camera without moving the
+    // cursor; anchoring the harvest to the cursor would leave the
+    // dragged-into edge unpopulated until the player clicked something to
+    // re-focus. With viewport-anchored harvest the tree grows naturally
+    // ahead of the camera, matching the "infinite" expectation.
+    let view_center_canvas_x = pan_x + canvas_center_x;
+    let view_center_canvas_y = pan_y + canvas_center_y;
+    let view_lot_x = view_center_canvas_x.div_euclid(LOT_W);
+    let view_lot_y = view_center_canvas_y.div_euclid(LOT_H);
     let visible_radius = VISIBLE_RADIUS_LOTS + 2;
     let mut visible: Vec<VisibleNode> = Vec::new();
     for dy in -visible_radius..=visible_radius {
         for dx in -visible_radius..=visible_radius {
-            let lot = TreeCoord::new(cursor.x + dx, cursor.y + dy);
+            let lot = TreeCoord::new(view_lot_x + dx, view_lot_y + dy);
             let Some(spec) = node::node_at(lot.x, lot.y) else {
                 continue;
             };
