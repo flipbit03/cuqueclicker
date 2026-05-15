@@ -312,8 +312,9 @@ fn maybe_spawn_powerups(state: &mut GameState, geom: &SimGeometry) {
             continue;
         }
         spawn_powerup(state, kind, cells);
-        // Tree contribution: SpawnRateMul scales the cooldown
-        // multiplicatively. <1.0 = more frequent spawns; >1.0 = rarer.
+        // Tree contribution: SpawnRateMul is a true spawn-rate
+        // multiplier — >1.0 means more frequent spawns, so the
+        // cooldown scales by its inverse.
         let mul = state
             .tree_aggregate
             .powerup_spawn_mul
@@ -321,7 +322,8 @@ fn maybe_spawn_powerups(state: &mut GameState, geom: &SimGeometry) {
             .copied()
             .unwrap_or(1.0);
         let base = powerup::next_cooldown(kind) as f64;
-        state.powerup_cooldowns[i] = (base * mul).max(1.0) as u32;
+        let cooldown = if mul > 0.0 { base / mul } else { base };
+        state.powerup_cooldowns[i] = cooldown.max(1.0) as u32;
     }
 }
 

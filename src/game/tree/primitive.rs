@@ -132,10 +132,9 @@ impl Primitive {
         match self.op {
             Op::AddPercent | Op::FlatAdd => self.magnitude < 0.0,
             // For multiplicative ops a magnitude < 1.0 is a nerf (incl 0).
-            Op::MulFactor | Op::EffectMul => self.magnitude < 1.0,
-            // CostMul / SpawnRateMul: < 1.0 is a *boon* (cheaper / more
-            // frequent); > 1.0 is a bane.
-            Op::CostMul | Op::SpawnRateMul => self.magnitude > 1.0,
+            Op::MulFactor | Op::EffectMul | Op::SpawnRateMul => self.magnitude < 1.0,
+            // CostMul: < 1.0 is a *boon* (cheaper); > 1.0 is a bane.
+            Op::CostMul => self.magnitude > 1.0,
         }
     }
 }
@@ -218,6 +217,24 @@ mod tests {
                 op: Op::CostMul,
                 target: Target::Fingerer(0),
                 magnitude: 1.5
+            }
+            .is_bane()
+        );
+
+        // SpawnRateMul: <1 is bane (slower spawns); >1 is boon (faster).
+        assert!(
+            !Primitive {
+                op: Op::SpawnRateMul,
+                target: Target::PowerupSpawn(PowerupKind::Lucky),
+                magnitude: 1.10
+            }
+            .is_bane()
+        );
+        assert!(
+            Primitive {
+                op: Op::SpawnRateMul,
+                target: Target::PowerupSpawn(PowerupKind::Lucky),
+                magnitude: 0.91
             }
             .is_bane()
         );

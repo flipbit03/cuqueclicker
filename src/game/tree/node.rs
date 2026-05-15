@@ -394,12 +394,12 @@ fn roll_magnitude(
             }
         }
         Op::SpawnRateMul => {
-            // < 1 is boon (more frequent), > 1 is bane (rarer).
+            // > 1 is boon (more frequent), < 1 is bane (rarer).
             let scale = rng.range_f64(0.02, 0.12) * (1.0 + (dist / 30.0));
             if bane {
-                (1.0 + scale).min(3.0)
-            } else {
                 (1.0 - scale).max(0.30)
+            } else {
+                (1.0 + scale).min(3.0)
             }
         }
         Op::EffectMul => {
