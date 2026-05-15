@@ -37,7 +37,7 @@ use crate::ui::{TreeButtonAction, border, hud_title};
 /// for touch / single-button players.
 pub struct TreeDrawOutput {
     pub node_rects: Vec<(TreeCoord, Rect)>,
-    pub action_button: Option<(TreeButtonAction, Rect)>,
+    pub action_button: Option<(TreeButtonAction, Rect, TreeCoord)>,
 }
 
 /// Per-frame ease factor. The displayed pan moves `PAN_TWEEN_FACTOR` of the
@@ -104,7 +104,7 @@ pub fn draw(
     // Hover-fill the info-pane action button (buy / refund) so the player
     // reads it as a clickable target. Matches the help-bar token hover:
     // white fg + dark bg tint + bold.
-    if let (Some((_, r)), Some((mx, my))) = (action_button, mouse_pos)
+    if let (Some((_, r, _)), Some((mx, my))) = (action_button, mouse_pos)
         && mx >= r.x
         && mx < r.x + r.width
         && my >= r.y
@@ -1249,7 +1249,7 @@ fn draw_info_pane(
     frame: &mut Frame,
     area: Rect,
     state: &GameState,
-) -> Option<(TreeButtonAction, Rect)> {
+) -> Option<(TreeButtonAction, Rect, TreeCoord)> {
     let lang = t();
     // Localized button-label strings. Computed once per draw so the
     // click-rect math (which needs the rendered width) stays in lockstep
@@ -1261,7 +1261,7 @@ fn draw_info_pane(
     // The rect of the currently-rendered action button (if any). We
     // compute it from string-prefix lengths during the line build and
     // return it for the input router to hit-test.
-    let mut action_button: Option<(TreeButtonAction, Rect)> = None;
+    let mut action_button: Option<(TreeButtonAction, Rect, TreeCoord)> = None;
     // Inner content lives one row below the top border that the
     // surrounding Block draws.
     let inner_y = area.y + 1;
@@ -1294,19 +1294,19 @@ fn draw_info_pane(
                             .add_modifier(StyleMod::BOLD),
                     ),
                     Span::styled(
-                        "[Root Node]",
+                        lang.tree_anchor_tag,
                         Style::default()
                             .fg(Color::Rgb(255, 200, 100))
                             .add_modifier(StyleMod::BOLD),
                     ),
                 ]));
                 lines.push(Line::styled(
-                    "  - the twitching ass itself",
+                    lang.tree_anchor_blurb,
                     Style::default().fg(Color::Rgb(200, 200, 210)),
                 ));
                 lines.push(Line::raw(""));
                 lines.push(Line::styled(
-                    "  every path of the tree branches outward from here.",
+                    lang.tree_anchor_footer,
                     Style::default().fg(Color::Rgb(160, 160, 170)),
                 ));
                 let p = Paragraph::new(lines).block(
@@ -1363,9 +1363,9 @@ fn draw_info_pane(
                 let can_refund = state.can_refund_tree_node(cursor);
                 if !can_refund {
                     let reason = if cursor == TreeCoord::ORIGIN {
-                        "anchor — origin cannot be refunded"
+                        lang.tree_refund_reason_origin
                     } else {
-                        "would orphan another owned node — refund a leaf first"
+                        lang.tree_refund_reason_orphan
                     };
                     Line::from(vec![
                         Span::styled(
@@ -1373,7 +1373,7 @@ fn draw_info_pane(
                             Style::default().fg(Color::Rgb(180, 220, 180)),
                         ),
                         Span::styled(
-                            format!("(no refund: {reason})"),
+                            lang.tree_no_refund_fmt.replacen("{}", reason, 1),
                             Style::default().fg(Color::Rgb(170, 130, 130)),
                         ),
                     ])
@@ -1389,6 +1389,7 @@ fn draw_info_pane(
                             width: label_len,
                             height: 1,
                         },
+                        cursor,
                     ));
                     Line::from(vec![
                         Span::styled(
@@ -1448,6 +1449,7 @@ fn draw_info_pane(
                         width: label_len,
                         height: 1,
                     },
+                    cursor,
                 ));
                 Line::from(vec![
                     Span::raw(cost_label_padded.clone()),

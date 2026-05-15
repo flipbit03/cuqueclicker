@@ -64,10 +64,6 @@ pub enum Target {
     GreenCoinStrength,
 }
 
-/// Number of categorical targets the procgen can roll from (fingerers + globals).
-/// FINGERERS.len() varies via the catalog; this is just a generation hint.
-pub const N_PRIMITIVE_TARGETS: usize = 24;
-
 impl Target {
     /// Stable index used by the procgen to pick a target uniformly from the
     /// available axes. Distinct values are returned for distinct targets.

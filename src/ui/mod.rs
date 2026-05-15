@@ -116,7 +116,7 @@ pub struct DrawOutput {
     /// pane. `Some` only when the focused node is currently actionable
     /// (buyable + affordable, or owned + refundable). Lets touch /
     /// left-only players trigger the action without right-clicking.
-    pub tree_action_button: Option<(TreeButtonAction, Rect)>,
+    pub tree_action_button: Option<(TreeButtonAction, Rect, crate::game::tree::coord::TreeCoord)>,
     /// `(fingerer_idx, screen_row_rect)` for the Game-mode sidebar.
     pub fingerer_rows: Vec<(usize, Rect)>,
     /// (action, rect) for every clickable help-bar hint at the bottom of
@@ -362,7 +362,11 @@ pub fn draw(
     let help_hits = draw_help(frame, left[2], help_text, mode, mouse_pos);
 
     let mut tree_node_rects: Vec<(crate::game::tree::coord::TreeCoord, Rect)> = Vec::new();
-    let mut tree_action_button: Option<(TreeButtonAction, Rect)> = None;
+    let mut tree_action_button: Option<(
+        TreeButtonAction,
+        Rect,
+        crate::game::tree::coord::TreeCoord,
+    )> = None;
     let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
     let mut prestige_reset_rect = Rect::default();
     match mode {

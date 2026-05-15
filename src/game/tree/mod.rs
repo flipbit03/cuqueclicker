@@ -25,6 +25,6 @@ pub use node::{
     LOT_H, LOT_W, NodeSpec, Rarity, anchor_of, diagonal_route_via, edge_exists, neighbors_of,
     node_at,
 };
-pub use primitive::{N_PRIMITIVE_TARGETS, Op, Primitive, Target};
+pub use primitive::{Op, Primitive, Target};
 pub use seed::{TREE_SEED, TREE_SEED_LITERAL};
 pub use state::UpgradeTreeState;

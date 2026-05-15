@@ -177,8 +177,12 @@ pub fn node_at(x: i32, y: i32) -> Option<NodeSpec> {
     let off_x = rng.range_usize(max_off_x as usize) as i32 + 1;
     let off_y = rng.range_usize(max_off_y as usize) as i32 + 1;
 
-    let box_x = x * LOT_W + off_x;
-    let box_y = y * LOT_H + off_y;
+    // saturating_mul guards against overflow at extreme lots (|x|
+    // larger than `i32::MAX / LOT_W`, ~6e7). Out-of-range box coords
+    // get clamped to i32 edges — the renderer's canvas_to_screen
+    // bounds-checks them off-screen, so nothing visible breaks.
+    let box_x = x.saturating_mul(LOT_W).saturating_add(off_x);
+    let box_y = y.saturating_mul(LOT_H).saturating_add(off_y);
 
     // Primitive count: small=1, notable=2-3, keystone=2-4. Keystones MUST
     // have at least one bane (the procgen biases sign accordingly).
@@ -294,7 +298,11 @@ fn pick_target_biased(x: i32, y: i32, rng: &mut SplitMix64) -> Target {
     let center = (bias * n_targets as f64) as usize % n_targets;
     // Radius of bias: tighter when in the origin neighborhood (player
     // starts focused on Index Finger), wider elsewhere.
-    let radius = if x.abs() + y.abs() < 4 { 1.5 } else { 4.0 };
+    let radius = if x.unsigned_abs().saturating_add(y.unsigned_abs()) < 4 {
+        1.5
+    } else {
+        4.0
+    };
 
     // 60% of the time pick from a Gaussian-ish window around `center`; 40%
     // of the time pick uniformly to keep regions from being monolithic.
@@ -342,7 +350,7 @@ fn roll_magnitude(
 ) -> f64 {
     // Base "strength multiplier" scales with rarity AND with manhattan
     // distance from origin: deeper lots roll harder magnitudes.
-    let dist = (x.abs() + y.abs()) as f64;
+    let dist = x.unsigned_abs().saturating_add(y.unsigned_abs()) as f64;
     let depth_scale = 1.0 + (dist / 12.0).min(20.0); // capped so keystones don't run away
     let rarity_scale = match rarity {
         Rarity::Small => 1.0,
@@ -437,7 +445,7 @@ pub const NODE_COST_GROWTH: f64 = 1.75;
 pub const NODE_BASE_COST: f64 = 50.0;
 
 pub fn roll_cost(x: i32, y: i32, rarity: Rarity) -> f64 {
-    let dist = (x.abs() + y.abs()) as f64;
+    let dist = x.unsigned_abs().saturating_add(y.unsigned_abs()) as f64;
     let depth_factor = NODE_COST_GROWTH.powf(dist);
     let rarity_factor = match rarity {
         Rarity::Small => 1.0,
@@ -491,18 +499,20 @@ pub fn anchor_of(lot: TreeCoord) -> Option<TreeCoord> {
     if !passes_gap_roll(lot.x, lot.y) {
         return None;
     }
-    let dist = lot.x.abs() + lot.y.abs();
+    let dist = lot.manhattan();
     let mut candidates: Vec<TreeCoord> = neighbors_of(lot).to_vec();
-    // Sort by (manhattan, x, y) for stable tie-breaking.
-    candidates.sort_by_key(|n| (n.x.abs() + n.y.abs(), n.x, n.y));
+    // Sort by (manhattan, x, y) for stable tie-breaking. Uses the
+    // saturating manhattan helper so extreme coords (near i32::MIN /
+    // i32::MAX) don't overflow the abs sum.
+    candidates.sort_by_key(|n| (n.manhattan(), n.x, n.y));
     let is_orthogonal = |n: &TreeCoord| {
-        let dx = (n.x - lot.x).abs();
-        let dy = (n.y - lot.y).abs();
+        let dx = n.x.wrapping_sub(lot.x).unsigned_abs();
+        let dy = n.y.wrapping_sub(lot.y).unsigned_abs();
         (dx == 0 || dy == 0) && (dx + dy == 1)
     };
     // Pass 1: orthogonal + strictly-smaller-manhattan + populated.
     for n in &candidates {
-        if (n.x.abs() + n.y.abs()) >= dist {
+        if n.manhattan() >= dist {
             continue;
         }
         if !is_orthogonal(n) {
@@ -516,7 +526,7 @@ pub fn anchor_of(lot: TreeCoord) -> Option<TreeCoord> {
     // a lot whose 4 orthogonal neighbors are all gaps still find a
     // parent toward origin.
     for n in &candidates {
-        if (n.x.abs() + n.y.abs()) >= dist {
+        if n.manhattan() >= dist {
             continue;
         }
         if passes_gap_roll(n.x, n.y) {

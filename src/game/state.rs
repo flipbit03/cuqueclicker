@@ -1117,7 +1117,17 @@ impl GameState {
     }
 
     pub fn prestige_earned_total(&self) -> u64 {
-        (self.lifetime_cuques / 1_000_000.0).sqrt().floor() as u64
+        // Clamp to a sane ceiling so a corrupted / cheat-inflated
+        // `lifetime_cuques` (e.g. f64 near INFINITY) can't saturate to
+        // u64::MAX and blow `prestige_mult` to 1.8e17. 1_000_000 papers
+        // is a 1e16-cuques lifetime — far past anything reachable in
+        // legitimate play.
+        let raw = (self.lifetime_cuques / 1_000_000.0).sqrt().floor();
+        if !raw.is_finite() || raw < 0.0 {
+            0
+        } else {
+            (raw as u64).min(1_000_000)
+        }
     }
 
     pub fn prestige_available(&self) -> u64 {
@@ -1233,6 +1243,11 @@ impl GameState {
         // fire the destination box's unlock_flash so the player gets the
         // familiar gold pulse to punctuate arrival.
         let mut just_unlocked: Vec<TreeCoord> = Vec::new();
+        // Prune anims whose path geometry went stale BEFORE bumping ticks,
+        // so a now-invalid anim doesn't linger one extra tick gating the
+        // destination as `tree_unlock_pending`.
+        self.tree_edge_anims
+            .retain(|a| !node::edge_path_cells(a.from, a.to).is_empty());
         for anim in &mut self.tree_edge_anims {
             anim.ticks = anim.ticks.saturating_add(1);
         }
@@ -1789,6 +1804,14 @@ impl GameState {
             return 0.0;
         }
         let Some(node) = node::node_at(lot.x, lot.y) else {
+            // Ghost lot in `bought` (e.g. survived a procgen change that
+            // moved its spec to `None`). Clean it out of the set so the
+            // user doesn't end up with stuck phantom-owned entries, and
+            // pay no cuques back since we can't compute the refund.
+            self.tree.bought.remove(&lot);
+            if self.tree.last_bought == Some(lot) {
+                self.tree.last_bought = None;
+            }
             return 0.0;
         };
         self.tree.bought.remove(&lot);

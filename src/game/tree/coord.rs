@@ -20,7 +20,11 @@ impl TreeCoord {
         Self { x, y }
     }
 
+    /// Manhattan distance from origin, saturating so `(i32::MIN, i32::MIN)`
+    /// returns `u32::MAX` instead of overflowing the sum (each
+    /// `unsigned_abs` is up to `2^31`; the plain sum overflows at
+    /// `i32::MIN + i32::MIN`, panicking in debug builds).
     pub fn manhattan(self) -> u32 {
-        self.x.unsigned_abs() + self.y.unsigned_abs()
+        self.x.unsigned_abs().saturating_add(self.y.unsigned_abs())
     }
 }

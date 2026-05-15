@@ -180,7 +180,7 @@ pub struct InputContext<'a> {
     /// `Some` when the focused node is currently actionable (buyable +
     /// affordable, or owned + refundable). Lets a touch / single-button
     /// player trigger buy/refund without needing right-click.
-    pub tree_action_button: Option<(TreeButtonAction, Rect)>,
+    pub tree_action_button: Option<(TreeButtonAction, Rect, TreeCoord)>,
     pub help_hits: &'a [(HelpAction, Rect)],
     pub biscuit_rect: Rect,
     /// Screen position of the biscuit's focal cell. See
@@ -455,13 +455,16 @@ fn handle_click(
         // the focused lot. Lets touch / single-button players trigger
         // the action without a right-click. Right-click here also
         // fires the action — same intent either way.
-        if let Some((action, r)) = ctx.tree_action_button
+        if let Some((action, r, captured_cursor)) = ctx.tree_action_button
             && rect_contains(r, col, row)
         {
-            let cursor = ctx.current.tree.cursor;
+            // Use the cursor coord captured at RENDER time (alongside the
+            // rect), not `ctx.current.tree.cursor` — between draw and click
+            // a keyboard nav can shift the cursor by one lot, and we want
+            // the click to act on the lot the user actually clicked at.
             match action {
-                TreeButtonAction::Buy => out.push(Action::TreeBuy(cursor)),
-                TreeButtonAction::Refund => out.push(Action::TreeRefund(cursor)),
+                TreeButtonAction::Buy => out.push(Action::TreeBuy(captured_cursor)),
+                TreeButtonAction::Refund => out.push(Action::TreeRefund(captured_cursor)),
             }
             return;
         }
