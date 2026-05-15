@@ -942,6 +942,50 @@ mod tests {
         assert!(far > near * 100.0, "far ({far}) should be >> near ({near})");
     }
 
+    /// Diagnostic table — not a real assertion, just `cargo test -- --nocapture
+    /// dump_cost_table` to print the live ramp at the current
+    /// NODE_COST_MULT / NODE_COST_GROWTH values. Always passes.
+    #[test]
+    fn dump_cost_table() {
+        eprintln!(
+            "NODE_COST_MULT={NODE_COST_MULT}  NODE_COST_GROWTH={NODE_COST_GROWTH}  base={NODE_BASE_COST}"
+        );
+        eprintln!(
+            "{:>4}  {:>14}  {:>14}  {:>14}",
+            "dist", "Small", "Notable", "Keystone"
+        );
+        for &d in &[1, 2, 3, 5, 7, 10, 12, 15, 18, 20, 25, 30, 35, 40, 50i32] {
+            // Use (d, 0) so manhattan == d. Average over a small sample to
+            // smooth out jitter, since jitter is seeded from (x, y).
+            let small = roll_cost(d, 0, Rarity::Small);
+            let notable = roll_cost(d, 0, Rarity::Notable);
+            let keystone = roll_cost(d, 0, Rarity::Keystone);
+            eprintln!(
+                "{:>4}  {:>14}  {:>14}  {:>14}",
+                d,
+                format_cost(small),
+                format_cost(notable),
+                format_cost(keystone)
+            );
+        }
+    }
+
+    fn format_cost(c: f64) -> String {
+        if c >= 1e15 {
+            format!("{:.2} quad", c / 1e15)
+        } else if c >= 1e12 {
+            format!("{:.2} T", c / 1e12)
+        } else if c >= 1e9 {
+            format!("{:.2} B", c / 1e9)
+        } else if c >= 1e6 {
+            format!("{:.2} M", c / 1e6)
+        } else if c >= 1e3 {
+            format!("{:.2} k", c / 1e3)
+        } else {
+            format!("{c:.0}")
+        }
+    }
+
     #[test]
     fn box_dims_match_rarity() {
         assert_eq!(Rarity::Small.box_dims(), (14, 3));
