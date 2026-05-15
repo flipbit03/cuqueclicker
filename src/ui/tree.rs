@@ -1305,14 +1305,14 @@ fn draw_info_pane(
                             .add_modifier(StyleMod::BOLD),
                     ),
                     Span::styled(
-                        "[Anchor]",
+                        "[Root Node]",
                         Style::default()
                             .fg(Color::Rgb(255, 200, 100))
                             .add_modifier(StyleMod::BOLD),
                     ),
                 ]));
                 lines.push(Line::styled(
-                    "  the ass itself — always active, has no upgrades.",
+                    "  - the twitching ass itself",
                     Style::default().fg(Color::Rgb(200, 200, 210)),
                 ));
                 lines.push(Line::raw(""));
