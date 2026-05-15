@@ -71,6 +71,11 @@ pub enum HelpAction {
     PrestigeReset,
     /// Quit the program.
     Quit,
+    /// Tree modal: jump the cursor to the origin (the cuque anchor).
+    TreeFocusOrigin,
+    /// Tree modal: jump the cursor to the last bought node, or to the
+    /// origin if the player hasn't bought anything yet this run.
+    TreeFocusLastBought,
 }
 
 /// Per-frame layout snapshot produced by [`draw`]. Single source of truth
@@ -521,6 +526,8 @@ fn map_help_token(token: &str, mode: Mode) -> Option<HelpAction> {
         (Mode::Game, "a") | (Mode::Game, "A") => Some(HelpAction::OpenMode(Mode::Achievements)),
         (Mode::Game, "g") | (Mode::Game, "G") => Some(HelpAction::GrabGolden),
         (Mode::Prestige, "r") | (Mode::Prestige, "R") => Some(HelpAction::PrestigeReset),
+        (Mode::Tree, "0") => Some(HelpAction::TreeFocusOrigin),
+        (Mode::Tree, "1") => Some(HelpAction::TreeFocusLastBought),
         _ => None,
     }
 }

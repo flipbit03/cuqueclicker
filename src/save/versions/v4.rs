@@ -180,9 +180,7 @@ mod tests {
         let v4: GameStateV4 = empty_v3().into();
         assert!(v4.tree.bought.is_empty());
         assert_eq!(v4.tree.cursor, TreeCoord::ORIGIN);
-        for bm in v4.tree.bookmarks {
-            assert_eq!(bm, TreeCoord::ORIGIN);
-        }
+        assert_eq!(v4.tree.last_bought, None);
     }
 
     #[test]

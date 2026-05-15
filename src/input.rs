@@ -105,11 +105,6 @@ pub struct UiState {
     pub running: bool,
     pub last_mouse_pos: Option<(u16, u16)>,
     pub tree_render: TreeRenderState,
-    /// True after pressing `b` in the tree modal — the next digit press
-    /// saves the current cursor as that bookmark slot instead of jumping
-    /// to it. Cleared by the digit press, by Esc, by mode change, or by
-    /// any non-digit key in tree mode (so the prefix doesn't get stuck).
-    pub tree_bookmark_pending: bool,
 }
 
 impl UiState {
@@ -120,7 +115,6 @@ impl UiState {
             running: true,
             last_mouse_pos: None,
             tree_render: TreeRenderState::default(),
-            tree_bookmark_pending: false,
         }
     }
 }
@@ -425,6 +419,13 @@ fn try_help_click(
             HelpAction::Quit => {
                 ui.running = false;
             }
+            HelpAction::TreeFocusOrigin => {
+                out.push(Action::TreeFocus(TreeCoord::ORIGIN));
+            }
+            HelpAction::TreeFocusLastBought => {
+                let target = ctx.current.tree.last_bought.unwrap_or(TreeCoord::ORIGIN);
+                out.push(Action::TreeFocus(target));
+            }
         }
         return true;
     }
@@ -648,41 +649,36 @@ fn handle_key(
             ui.mode = Mode::Game;
         }
         // Tree-mode controls. Pan via hjkl or arrow keys; Enter buys the
-        // focused node; R refunds the focused node; `b` then digit saves
-        // a bookmark; plain digit jumps to a bookmark (handled below in
-        // the digit_slot block).
+        // focused node; R refunds the focused node; `0` jumps to the
+        // root anchor, `1` jumps to the last bought node.
         KeyCode::Char('h') | KeyCode::Char('H') | KeyCode::Left if ui.mode == Mode::Tree => {
-            ui.tree_bookmark_pending = false;
             let c = ctx.current.tree.cursor;
             out.push(Action::TreeFocus(TreeCoord::new(c.x - 1, c.y)));
         }
         KeyCode::Char('l') | KeyCode::Char('L') | KeyCode::Right if ui.mode == Mode::Tree => {
-            ui.tree_bookmark_pending = false;
             let c = ctx.current.tree.cursor;
             out.push(Action::TreeFocus(TreeCoord::new(c.x + 1, c.y)));
         }
         KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Up if ui.mode == Mode::Tree => {
-            ui.tree_bookmark_pending = false;
             let c = ctx.current.tree.cursor;
             out.push(Action::TreeFocus(TreeCoord::new(c.x, c.y - 1)));
         }
         KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Down if ui.mode == Mode::Tree => {
-            ui.tree_bookmark_pending = false;
             let c = ctx.current.tree.cursor;
             out.push(Action::TreeFocus(TreeCoord::new(c.x, c.y + 1)));
         }
         KeyCode::Enter if ui.mode == Mode::Tree => {
-            ui.tree_bookmark_pending = false;
             out.push(Action::TreeBuy(ctx.current.tree.cursor));
         }
         KeyCode::Char('r') | KeyCode::Char('R') if ui.mode == Mode::Tree => {
-            ui.tree_bookmark_pending = false;
             out.push(Action::TreeRefund(ctx.current.tree.cursor));
         }
-        KeyCode::Char('b') | KeyCode::Char('B') if ui.mode == Mode::Tree => {
-            // Toggle so a second press cancels the pending state without
-            // having to press an unrelated key.
-            ui.tree_bookmark_pending = !ui.tree_bookmark_pending;
+        KeyCode::Char('0') if ui.mode == Mode::Tree => {
+            out.push(Action::TreeFocus(TreeCoord::ORIGIN));
+        }
+        KeyCode::Char('1') if ui.mode == Mode::Tree => {
+            let target = ctx.current.tree.last_bought.unwrap_or(TreeCoord::ORIGIN);
+            out.push(Action::TreeFocus(target));
         }
         KeyCode::Char('+') | KeyCode::Char('=') => {
             ui.zoom_idx = ui.zoom_idx.saturating_sub(1);
@@ -712,23 +708,11 @@ fn handle_key(
                             out.push(Action::BuyFingerer { idx: fid, qty });
                         }
                     }
-                    Mode::Tree => {
-                        if ui.tree_bookmark_pending || buy_10 {
-                            // Either we're inside a pending `b`-prefix or
-                            // the player pressed Shift+digit — both save
-                            // the current cursor as that bookmark slot.
-                            out.push(Action::TreeBookmarkSet {
-                                slot,
-                                lot: ctx.current.tree.cursor,
-                            });
-                            ui.tree_bookmark_pending = false;
-                        } else {
-                            let target = ctx.current.tree.bookmarks[slot];
-                            out.push(Action::TreeFocus(target));
-                        }
-                        let _ = buy_max;
+                    // Tree mode handles its own digits (`0` and `1`) above
+                    // — anything else is ignored.
+                    _ => {
+                        let _ = (slot, buy_10, buy_max);
                     }
-                    _ => {}
                 }
             }
         }

@@ -62,13 +62,6 @@ pub enum Action {
     /// Move the tree cursor to `lot` (no purchase). Persists into
     /// `state.tree.cursor` so reopening the modal lands here.
     TreeFocus(TreeCoord),
-    /// Save the current cursor position into bookmark slot `slot` (0..9
-    /// corresponding to digit keys 1..9, 0). Out-of-range slots are
-    /// ignored.
-    TreeBookmarkSet {
-        slot: usize,
-        lot: TreeCoord,
-    },
     PrestigeReset,
     /// Latest render-computed biscuit geometry, so the sim can place
     /// powerups and auto-particles inside the current layout. Powerup
@@ -157,11 +150,6 @@ pub fn apply_action(state: &mut GameState, action: Action, geom: &mut SimGeometr
         }
         Action::TreeFocus(lot) => {
             state.tree.cursor = lot;
-        }
-        Action::TreeBookmarkSet { slot, lot } => {
-            if let Some(b) = state.tree.bookmarks.get_mut(slot) {
-                *b = lot;
-            }
         }
         Action::PrestigeReset => {
             state.prestige_reset();

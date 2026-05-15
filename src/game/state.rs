@@ -1071,6 +1071,7 @@ impl GameState {
         // very next tick of the post-prestige run.
         self.tree.bought.insert(TreeCoord::ORIGIN);
         self.tree.cursor = TreeCoord::ORIGIN;
+        self.tree.last_bought = None;
         self.tree_aggregate.reset();
         self.tree_buy_flash.clear();
         self.tree_unlock_flash.clear();
@@ -1525,6 +1526,7 @@ impl GameState {
 
         self.cuques -= node.cost;
         self.tree.bought.insert(lot);
+        self.tree.last_bought = Some(lot);
         self.tree_aggregate.fold_in_node(&node);
         self.trigger_purchase_flash(1.5);
         self.cuques_spend_flash_ticks = HUD_FLASH_TICKS;
@@ -1609,6 +1611,9 @@ impl GameState {
             return 0.0;
         };
         self.tree.bought.remove(&lot);
+        if self.tree.last_bought == Some(lot) {
+            self.tree.last_bought = None;
+        }
         self.tree_aggregate.fold_out_node(&node);
         let refunded = (node.cost * TREE_REFUND_FRACTION).floor();
         self.cuques += refunded;
