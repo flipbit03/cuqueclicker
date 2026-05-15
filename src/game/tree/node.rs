@@ -415,20 +415,30 @@ fn roll_magnitude(
 }
 
 /// Cost scales with Manhattan distance from origin: deeper = pricier.
-/// Global node-cost multiplier — the single tuning knob for "are upgrades
-/// too cheap / too expensive?". Multiplies every node's rolled cost
-/// uniformly across rarities and depth, so the relative pricing curve
-/// stays intact. Bump it to make the tree feel more grindy, lower it
-/// for a faster ramp.
+/// Flat multiplier on every node's rolled cost — shifts the whole
+/// pricing curve up or down without bending it. Use this when "the
+/// tree feels too cheap" but the SHAPE of the ramp is correct.
 pub const NODE_COST_MULT: f64 = 5.0;
 
-/// 1.45^d gives a comfortable mid-game ramp; rarity adds a multiplier on
-/// top so keystones in the same neighborhood cost more than their small
-/// neighbors.
+/// Per-lot exponential growth rate. Each step further from the origin
+/// multiplies the node's cost by this factor (manhattan distance). The
+/// shape of the late-game wall lives here — bump it to make deep
+/// nodes balloon faster, lower it for a gentler ramp.
+///
+/// Reference: fingerers grow at 1.15^count (classic Cookie Clicker
+/// 15%-per-buy). The tree grows much steeper because each "lot step"
+/// gives only ONE upgrade, vs many buys per fingerer.
+pub const NODE_COST_GROWTH: f64 = 1.65;
+
+/// Base cost at distance 0 (before rarity and jitter). The origin lot
+/// is auto-owned so this never quotes a real purchase, but it anchors
+/// the ramp: cost(d) = NODE_COST_MULT * NODE_BASE_COST * NODE_COST_GROWTH^d
+///                    * rarity_factor * jitter.
+pub const NODE_BASE_COST: f64 = 50.0;
+
 pub fn roll_cost(x: i32, y: i32, rarity: Rarity) -> f64 {
     let dist = (x.abs() + y.abs()) as f64;
-    let base = 50.0;
-    let depth_factor = 1.45_f64.powf(dist);
+    let depth_factor = NODE_COST_GROWTH.powf(dist);
     let rarity_factor = match rarity {
         Rarity::Small => 1.0,
         Rarity::Notable => 5.0,
@@ -438,7 +448,7 @@ pub fn roll_cost(x: i32, y: i32, rarity: Rarity) -> f64 {
     // exactly the same.
     let mut rng = SplitMix64::from_coords(TREE_SEED, x, y, 0xC0);
     let jitter = rng.range_f64(0.85, 1.25);
-    (NODE_COST_MULT * base * depth_factor * rarity_factor * jitter)
+    (NODE_COST_MULT * NODE_BASE_COST * depth_factor * rarity_factor * jitter)
         .floor()
         .max(10.0)
 }
