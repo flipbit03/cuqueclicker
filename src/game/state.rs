@@ -44,7 +44,7 @@ pub const UNLOCK_FLASH_TICKS: u32 = TICK_HZ / 2; // 0.5s
 /// a value of 1 = 50 ms / cell = 20 cells / sec, so a typical 8-cell
 /// straight edge fully energizes in ~0.4 s and a longer diagonal in
 /// ~0.7-1.0 s. Lower values speed the animation up; values >1 slow it.
-pub const EDGE_UNLOCK_TICKS_PER_CELL: u32 = 2;
+pub const EDGE_UNLOCK_TICKS_PER_CELL: u32 = 1;
 
 /// In-flight "path lights up" animation when a buy unlocks a neighbor.
 /// Lives only at runtime — `#[serde(skip)]`-projected fields don't ever
