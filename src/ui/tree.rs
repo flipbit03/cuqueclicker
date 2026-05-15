@@ -939,19 +939,24 @@ fn draw_edge(
         dim_style
     };
 
-    // Path goes from A's center to B's center, in that order. Animation
-    // wavefronts are anchored to one of the two endpoints — if there's
-    // an active anim with `from == a.lot` the lit subrange is path[0..=head];
-    // if `from == b.lot` the lit subrange is path[len-1-head..]. No-anim
-    // edges paint the full path.
-    let path = node::edge_path_cells(a.lot, b.lot);
-    if path.is_empty() {
-        return;
-    }
+    // When there's an active anim on this edge, walk the path in the
+    // anim's direction (from anim.from outward). That way the anim's
+    // leading_inside / trailing_inside (which were computed against
+    // `edge_path_cells(from, to)` at push time) match the cell order
+    // the renderer iterates here, and dist_from_head simplifies to
+    // `head - i` without a per-cell from-vs-to branch.
     let anim = state
         .tree_edge_anims
         .iter()
         .find(|an| (an.from == a.lot && an.to == b.lot) || (an.from == b.lot && an.to == a.lot));
+    let path = if let Some(an) = anim {
+        node::edge_path_cells(an.from, an.to)
+    } else {
+        node::edge_path_cells(a.lot, b.lot)
+    };
+    if path.is_empty() {
+        return;
+    }
 
     // Same opacity rule as before: regular boxes are opaque across their
     // whole bounding rect, the anchor is only opaque on actually-painted
@@ -971,17 +976,11 @@ fn draw_edge(
         // 0 is the head cell, 1+ is the trailing tail, negative means
         // we're ahead of the wavefront (still draw the base line so the
         // wave reads as "running over" an existing dim wire instead of
-        // clearing-then-painting).
+        // clearing-then-painting). Path is in anim direction (from →
+        // to), so head walks from index 0 outward.
         let dist_from_head: i32 = if let Some(an) = anim {
             let head = an.head_cell_index().min(path_len.saturating_sub(1));
-            if an.from == a.lot {
-                (head as i32) - (i as i32)
-            } else {
-                // Wave runs B → A: cell i is at offset (path_len-1-i)
-                // from B's side.
-                let offset_from_b = (path_len - 1 - i) as i32;
-                (head as i32) - offset_from_b
-            }
+            (head as i32) - (i as i32)
         } else {
             0
         };

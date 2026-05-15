@@ -48,21 +48,78 @@ pub const UNLOCK_FLASH_TICKS: u32 = TICK_HZ / 2; // 0.5s
 /// since we sample integer cells per tick.
 pub const EDGE_UNLOCK_CELLS_PER_TICK: u32 = 2;
 
-/// In-flight "path lights up" animation when a buy unlocks a neighbor.
+/// In-flight "path lights up" animation when a buy lights an edge.
 /// Lives only at runtime — `#[serde(skip)]`-projected fields don't ever
-/// reach disk. `ticks` advances one per `tick()`; the renderer derives
-/// the wavefront cell index as `ticks / EDGE_UNLOCK_TICKS_PER_CELL`.
+/// reach disk.
+///
+/// `leading_inside` / `trailing_inside` capture how many cells of
+/// `edge_path_cells(from, to)` lie inside the FROM and TO boxes
+/// respectively; the renderer skips those cells, so seeding the head
+/// past `leading_inside` makes the wave's first visible cell line up
+/// with cell 0 of the rendered line on tick 0 — without this offset,
+/// diagonals (which spend ~7 cells inside a 14-wide source box) lag
+/// the verticals (which exit a 3-tall box in 1 cell) by a noticeable
+/// 100-300 ms.
+///
+/// `gates_destination` is true when the buy newly made the destination
+/// reachable — those destinations are held in "not yet reachable" UX
+/// until the wave arrives, and get the gold unlock_flash on completion.
+/// Edges to already-reachable neighbors animate decoratively (so every
+/// newly-lit edge gets the snake) but DON'T gate the destination, since
+/// the player was free to buy it before this animation started.
 #[derive(Clone, Copy, Debug)]
 pub struct EdgeUnlockAnim {
     pub from: TreeCoord,
     pub to: TreeCoord,
     pub ticks: u32,
+    pub gates_destination: bool,
+    pub leading_inside: u16,
+    pub trailing_inside: u16,
 }
 
 impl EdgeUnlockAnim {
     pub fn head_cell_index(&self) -> usize {
-        (self.ticks * EDGE_UNLOCK_CELLS_PER_TICK) as usize
+        (self.ticks * EDGE_UNLOCK_CELLS_PER_TICK) as usize + self.leading_inside as usize
     }
+}
+
+/// Count cells at the START of `path` that lie inside the bounding rect
+/// `(box_x, box_y, box_w, box_h)`. Used by the edge-unlock anim to skip
+/// the "inside the source box" prefix when seeding the wavefront.
+fn count_leading_in_rect(
+    path: &[(i32, i32)],
+    box_x: i32,
+    box_y: i32,
+    box_w: u16,
+    box_h: u16,
+) -> usize {
+    let mut count = 0;
+    for &(cx, cy) in path {
+        if cx >= box_x && cx < box_x + box_w as i32 && cy >= box_y && cy < box_y + box_h as i32 {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+fn count_trailing_in_rect(
+    path: &[(i32, i32)],
+    box_x: i32,
+    box_y: i32,
+    box_w: u16,
+    box_h: u16,
+) -> usize {
+    let mut count = 0;
+    for &(cx, cy) in path.iter().rev() {
+        if cx >= box_x && cx < box_x + box_w as i32 && cy >= box_y && cy < box_y + box_h as i32 {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
 }
 /// Per-tick upward drift for a particle, expressed as a fraction of the
 /// biscuit's height. Calibrated to match the original feel before the
@@ -1198,8 +1255,15 @@ impl GameState {
             if len == 0 {
                 return false;
             }
-            if a.head_cell_index() >= len {
-                just_unlocked.push(a.to);
+            // Anim completes when the head reaches the cells INSIDE the
+            // destination box — `trailing_inside` cells past the visible
+            // tail are filtered by the renderer anyway, so the wave's
+            // last visible cell is `len - trailing_inside - 1`.
+            let finish_idx = len.saturating_sub(a.trailing_inside as usize);
+            if a.head_cell_index() >= finish_idx {
+                if a.gates_destination {
+                    just_unlocked.push(a.to);
+                }
                 false
             } else {
                 true
@@ -1550,7 +1614,9 @@ impl GameState {
     /// through this so the player can't click through a node before its
     /// path finishes lighting up.
     pub fn tree_unlock_pending(&self, lot: TreeCoord) -> bool {
-        self.tree_edge_anims.iter().any(|a| a.to == lot)
+        self.tree_edge_anims
+            .iter()
+            .any(|a| a.to == lot && a.gates_destination)
     }
 
     /// True iff the player can buy the node at `lot` right now: it exists,
@@ -1606,26 +1672,46 @@ impl GameState {
         self.cuques_spend_flash_ticks = HUD_FLASH_TICKS;
         self.tree_buy_flash.insert(lot, PURCHASE_FLASH_TICKS);
 
-        // Unlock-flash any lot that flipped false→true on this buy AND
-        // actually has a node in the procgen.
+        // Animate the edge from this lot to EVERY procedural neighbor
+        // that isn't already owned — `gates_destination` distinguishes
+        // newly-reachable neighbors (which gate purchase + fire the
+        // gold unlock_flash on completion) from already-reachable ones
+        // (which just get the decorative wire-up animation).
+        let source_spec = node::node_at(lot.x, lot.y);
         for (i, n) in neighbors.into_iter().enumerate() {
-            if self.tree.bought.contains(&n) || was_reachable[i] {
+            if self.tree.bought.contains(&n) {
                 continue;
             }
-            if !self.tree_reachable(n) {
+            let Some(dest_spec) = node::node_at(n.x, n.y) else {
+                continue;
+            };
+            if !node::edge_exists(lot, n) {
                 continue;
             }
-            if node::node_at(n.x, n.y).is_none() {
+            let path = node::edge_path_cells(lot, n);
+            if path.is_empty() {
                 continue;
             }
-            // Defer the gold unlock_flash pulse until the wavefront
-            // actually reaches the neighbor — for now, push an anim so the
-            // edge from this lot to the neighbor lights up over the next
-            // few ticks.
+            let (leading, trailing) = match &source_spec {
+                Some(src) => (
+                    count_leading_in_rect(&path, src.box_x, src.box_y, src.box_w, src.box_h),
+                    count_trailing_in_rect(
+                        &path,
+                        dest_spec.box_x,
+                        dest_spec.box_y,
+                        dest_spec.box_w,
+                        dest_spec.box_h,
+                    ),
+                ),
+                None => (0, 0),
+            };
             self.tree_edge_anims.push(EdgeUnlockAnim {
                 from: lot,
                 to: n,
                 ticks: 0,
+                gates_destination: !was_reachable[i],
+                leading_inside: leading.min(u16::MAX as usize) as u16,
+                trailing_inside: trailing.min(u16::MAX as usize) as u16,
             });
         }
         Some(node)
