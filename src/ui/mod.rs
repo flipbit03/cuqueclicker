@@ -240,7 +240,7 @@ pub fn draw(
         .add_modifier(Modifier::BOLD);
     let mut hud_spans: Vec<Span> = vec![
         Span::raw(format!("{}: ", lang.hud_cuques)),
-        Span::styled(format::big(state.displayed_cuques), cuques_style),
+        Span::styled(format::big_mag(state.displayed_cuques), cuques_style),
         Span::raw(format!(
             "   {}: {}",
             lang.hud_fps,
@@ -300,7 +300,7 @@ pub fn draw(
                 _ => None,
             });
             let label = match mul {
-                Some(v) => format!("  [++ {} x{} {}s]", name, v as u64, secs),
+                Some(v) => format!("  [++ {} x{} {}s]", name, v.floor_u64(), secs),
                 None => format!("  [++ {} {}s]", name, secs),
             };
             let color = match m.source {

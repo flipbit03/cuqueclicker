@@ -917,25 +917,45 @@ fn fingerer_noun_pool(idx: usize) -> &'static [&'static str] {
 /// numbers are locale-neutral; only the connector ("to", "cost on", …)
 /// and the target label flip per locale.
 pub fn primitive_blurb(p: Primitive) -> String {
+    use crate::format::{flat_magnitude, mul_magnitude, percent_magnitude};
     let lang = crate::i18n::t();
     let target = target_label(p.target);
     match p.op {
         Op::AddPercent => format!(
-            "{:+.1}% {} {}",
-            p.magnitude * 100.0,
+            "{} {} {}",
+            percent_magnitude(p.magnitude),
             lang.tree_blurb_to,
             target
         ),
-        Op::MulFactor => format!("×{:.2} {} {}", p.magnitude, lang.tree_blurb_to, target),
-        Op::FlatAdd => format!("{:+.1} {} {}", p.magnitude, lang.tree_blurb_flat_to, target),
-        Op::CostMul => format!("×{:.2} {} {}", p.magnitude, lang.tree_blurb_cost_on, target),
+        Op::MulFactor => format!(
+            "{} {} {}",
+            mul_magnitude(p.magnitude),
+            lang.tree_blurb_to,
+            target
+        ),
+        Op::FlatAdd => format!(
+            "{} {} {}",
+            flat_magnitude(p.magnitude),
+            lang.tree_blurb_flat_to,
+            target
+        ),
+        Op::CostMul => format!(
+            "{} {} {}",
+            mul_magnitude(p.magnitude),
+            lang.tree_blurb_cost_on,
+            target
+        ),
         Op::SpawnRateMul => format!(
-            "×{:.2} {} {}",
-            p.magnitude, lang.tree_blurb_spawn_rate_for, target
+            "{} {} {}",
+            mul_magnitude(p.magnitude),
+            lang.tree_blurb_spawn_rate_for,
+            target
         ),
         Op::EffectMul => format!(
-            "×{:.2} {} {}",
-            p.magnitude, lang.tree_blurb_effect_on, target
+            "{} {} {}",
+            mul_magnitude(p.magnitude),
+            lang.tree_blurb_effect_on,
+            target
         ),
     }
 }

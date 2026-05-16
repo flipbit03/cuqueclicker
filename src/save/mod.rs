@@ -20,7 +20,7 @@ use crate::game::state::GameState;
 
 /// The version number every fresh save is written as. Bump in lockstep
 /// with adding a new `versions/vN.rs` and routing it in [`load_from_str`].
-pub const CURRENT_VERSION: u32 = 4;
+pub const CURRENT_VERSION: u32 = 5;
 
 /// Best-effort load from a JSON string. Falls back to a default state if
 /// the input is malformed at any layer of the chain. The result is always
@@ -31,29 +31,34 @@ pub const CURRENT_VERSION: u32 = 4;
 /// pessimistic on purpose (a future version is more likely to have new
 /// fields than the current code can interpret).
 pub fn load_from_str(json: &str) -> GameState {
+    use versions::{v1, v2, v3, v4, v5};
     match migrate::peek_version(json) {
-        1 => match serde_json::from_str::<versions::v1::GameStateV1>(json) {
-            Ok(v1) => versions::v4::GameStateV4::from(versions::v3::GameStateV3::from(
-                versions::v2::GameStateV2::from(v1),
-            ))
+        1 => match serde_json::from_str::<v1::GameStateV1>(json) {
+            Ok(v) => v5::GameStateV5::from(v4::GameStateV4::from(v3::GameStateV3::from(
+                v2::GameStateV2::from(v),
+            )))
             .into_current()
             .migrate_runtime(),
             Err(_) => GameState::default().migrate_runtime(),
         },
-        2 => match serde_json::from_str::<versions::v2::GameStateV2>(json) {
-            Ok(v2) => versions::v4::GameStateV4::from(versions::v3::GameStateV3::from(v2))
+        2 => match serde_json::from_str::<v2::GameStateV2>(json) {
+            Ok(v) => v5::GameStateV5::from(v4::GameStateV4::from(v3::GameStateV3::from(v)))
                 .into_current()
                 .migrate_runtime(),
             Err(_) => GameState::default().migrate_runtime(),
         },
-        3 => match serde_json::from_str::<versions::v3::GameStateV3>(json) {
-            Ok(v3) => versions::v4::GameStateV4::from(v3)
+        3 => match serde_json::from_str::<v3::GameStateV3>(json) {
+            Ok(v) => v5::GameStateV5::from(v4::GameStateV4::from(v))
                 .into_current()
                 .migrate_runtime(),
             Err(_) => GameState::default().migrate_runtime(),
         },
-        4 => match serde_json::from_str::<versions::v4::GameStateV4>(json) {
-            Ok(v4) => v4.into_current().migrate_runtime(),
+        4 => match serde_json::from_str::<v4::GameStateV4>(json) {
+            Ok(v) => v5::GameStateV5::from(v).into_current().migrate_runtime(),
+            Err(_) => GameState::default().migrate_runtime(),
+        },
+        5 => match serde_json::from_str::<v5::GameStateV5>(json) {
+            Ok(v) => v.into_current().migrate_runtime(),
             Err(_) => GameState::default().migrate_runtime(),
         },
         _ => GameState::default().migrate_runtime(),
@@ -73,15 +78,20 @@ pub fn load_from_str(json: &str) -> GameState {
 /// once can poison `cuques` / `lifetime_cuques` and we'd rather lose
 /// the corruption than lose subsequent saves.
 pub fn save_to_string(state: &GameState) -> serde_json::Result<String> {
+    // With Mag-typed counters, "non-finite" is no longer reachable —
+    // `Mag` stores log10 and saturates on impossible inputs. The clone+
+    // sanitize dance is preserved as belt-and-suspenders against any
+    // future buggy assignment that puts a NaN into the log10 field; if
+    // we ever see one, fall the affected counter back to zero.
     let mut sanitized = state.clone();
-    if !sanitized.cuques.is_finite() {
-        sanitized.cuques = 0.0;
+    if sanitized.cuques.log10.is_nan() {
+        sanitized.cuques = crate::bignum::Mag::ZERO;
     }
-    if !sanitized.lifetime_cuques.is_finite() {
-        sanitized.lifetime_cuques = 0.0;
+    if sanitized.lifetime_cuques.log10.is_nan() {
+        sanitized.lifetime_cuques = crate::bignum::Mag::ZERO;
     }
-    if !sanitized.best_fps.is_finite() {
-        sanitized.best_fps = 0.0;
+    if sanitized.best_fps.log10.is_nan() {
+        sanitized.best_fps = crate::bignum::Mag::ZERO;
     }
     serde_json::to_string_pretty(&sanitized)
 }
@@ -110,7 +120,7 @@ mod tests {
         }"#;
         let s = load_from_str(legacy);
         assert_eq!(s.version, CURRENT_VERSION);
-        assert_eq!(s.cuques, 1234.5);
+        assert_eq!(s.cuques, crate::bignum::Mag::from_f64(1234.5));
         assert_eq!(s.total_clicks, 99);
         assert_eq!(s.fingerer_count("index_finger"), 7);
         assert!(s.has_achievement("first_finger"));
@@ -128,21 +138,73 @@ mod tests {
     #[test]
     fn malformed_json_falls_back_to_default() {
         let s = load_from_str("{ not valid json");
-        assert_eq!(s.cuques, 0.0);
+        assert_eq!(s.cuques, crate::bignum::Mag::ZERO);
         assert_eq!(s.version, CURRENT_VERSION);
     }
 
     #[test]
     fn round_trip_through_save_to_string_preserves_state() {
         let original = GameState {
-            cuques: 4242.0,
+            cuques: crate::bignum::Mag::from_f64(4242.0),
             total_clicks: 17,
             ..GameState::default()
         };
         let json = save_to_string(&original).expect("serialize");
         let loaded = load_from_str(&json);
-        assert_eq!(loaded.cuques, 4242.0);
+        assert_eq!(loaded.cuques, crate::bignum::Mag::from_f64(4242.0));
         assert_eq!(loaded.total_clicks, 17);
         assert_eq!(loaded.version, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn round_trip_preserves_huge_mag_values_past_f64_range() {
+        // Regression for the V5-blocker: before the bump, `Mag` serialized
+        // as `{"log10": x}` once it cleared `f64`-finite range, but the
+        // V4 frozen schema's `cuques: f64` rejected the struct shape and
+        // `load_from_str` silently fell back to `default()` — wiping the
+        // entire save. With V5 declaring Mag-typed counters, the struct
+        // form is now part of the schema and the round-trip survives.
+        let original = GameState {
+            cuques: crate::bignum::Mag { log10: 600.0 },
+            lifetime_cuques: crate::bignum::Mag { log10: 1200.0 },
+            best_fps: crate::bignum::Mag { log10: 750.0 },
+            ..GameState::default()
+        };
+        let json = save_to_string(&original).expect("serialize");
+        let loaded = load_from_str(&json);
+        assert!((loaded.cuques.log10 - 600.0).abs() < 1e-9);
+        assert!((loaded.lifetime_cuques.log10 - 1200.0).abs() < 1e-9);
+        assert!((loaded.best_fps.log10 - 750.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn v4_json_with_plain_number_fields_still_loads_under_v5() {
+        // A V4-shaped save (`"cuques": 1234.5`) must still parse cleanly
+        // through the V5 reader. The `Mag` untagged-serde shim accepts
+        // bare JSON numbers exactly because of this requirement.
+        let v4_json = r#"{
+            "version": 4,
+            "cuques": 1234.5,
+            "total_clicks": 88,
+            "lifetime_cuques": 6789.0,
+            "best_fps": 12.0,
+            "golden_caught": 0,
+            "lucky_caught": 0,
+            "frenzy_caught": 0,
+            "buff_caught": 0,
+            "green_coin_caught": 0,
+            "fingerers_state": {},
+            "achievements_earned": [],
+            "prestige": 2,
+            "total_play_ticks": 4242,
+            "buffs": [],
+            "tree": { "bought": [], "cursor": {"x": 0, "y": 0}, "last_bought": null }
+        }"#;
+        let loaded = load_from_str(v4_json);
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert!((loaded.cuques.to_f64() - 1234.5).abs() < 1e-9);
+        assert!((loaded.lifetime_cuques.to_f64() - 6789.0).abs() < 1e-9);
+        assert_eq!(loaded.total_clicks, 88);
+        assert_eq!(loaded.prestige, 2);
     }
 }

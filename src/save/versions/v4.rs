@@ -20,7 +20,6 @@ use std::collections::{HashMap, HashSet};
 
 use super::v2::{BuffV2, FingererStateV2};
 use super::v3::GameStateV3;
-use crate::game::state::GameState;
 use crate::game::tree::UpgradeTreeState;
 
 fn default_v4_version() -> u32 {
@@ -65,38 +64,12 @@ pub struct GameStateV4 {
     pub tree: UpgradeTreeState,
 }
 
-impl GameStateV4 {
-    /// Convert a V4 snapshot into the live `GameState`. Persisted fields
-    /// copy verbatim; ephemeral state (`#[serde(skip)]` fields) stays at
-    /// `Default` and is seeded by `migrate_runtime`.
-    pub fn into_current(self) -> GameState {
-        let fingerers_state = self
-            .fingerers_state
-            .into_iter()
-            .map(|(id, st)| (id, st.into()))
-            .collect();
-        let buffs = self.buffs.into_iter().map(Into::into).collect();
-        GameState {
-            version: crate::save::CURRENT_VERSION,
-            cuques: self.cuques,
-            total_clicks: self.total_clicks,
-            lifetime_cuques: self.lifetime_cuques,
-            best_fps: self.best_fps,
-            golden_caught: self.golden_caught,
-            lucky_caught: self.lucky_caught,
-            frenzy_caught: self.frenzy_caught,
-            buff_caught: self.buff_caught,
-            green_coin_caught: self.green_coin_caught,
-            fingerers_state,
-            achievements_earned: self.achievements_earned,
-            prestige: self.prestige,
-            total_play_ticks: self.total_play_ticks,
-            buffs,
-            tree: self.tree,
-            ..GameState::default()
-        }
-    }
-}
+// V4's old `into_current` lived here when V4 was the current schema. The
+// V5 bump moved the live-state conversion to `v5::GameStateV5::into_current`
+// (the live `GameState` shape now requires `Mag` counters, which the V4
+// frozen schema doesn't carry). V4 saves on disk continue to load — the
+// chain now walks `v4 → v5 → GameState` — but the V4 module itself only
+// owns the persisted shape and the `From<GameStateV3>` step.
 
 /// V3 → V4 conversion. Drops `upgrades_earned` (old hardcoded UPGRADES
 /// catalog is retired); inits a fresh empty `UpgradeTreeState`. Every
@@ -242,11 +215,9 @@ mod tests {
     }
 
     #[test]
-    fn v4_into_current_rebuilds_tree_aggregate() {
-        // A V4 save with one bought node at origin should arrive in live
-        // state with the TreeAggregate already populated. The migrate_runtime
-        // step is what does this rebuild; here we just confirm the bought
-        // set survives the chain.
+    fn v4_through_v5_preserves_tree_state() {
+        // V4-on-disk → live state goes through V5 now. Round the V4
+        // fixture through the chain and confirm the bought set survives.
         let mut v4 = GameStateV4 {
             version: 4,
             cuques: 0.0,
@@ -267,7 +238,7 @@ mod tests {
         };
         v4.tree.bought.insert(TreeCoord::ORIGIN);
 
-        let live = v4.into_current();
+        let live = crate::save::versions::v5::GameStateV5::from(v4).into_current();
         assert!(live.tree.bought.contains(&TreeCoord::ORIGIN));
     }
 }

@@ -349,7 +349,7 @@ fn demo_driver_tick(
     // hit; gives the demo a steady visible tree-spread without needing
     // to plan a route.
     if t.is_multiple_of(160) {
-        let mut best: Option<(TreeCoord, f64)> = None;
+        let mut best: Option<(TreeCoord, crate::bignum::Mag)> = None;
         for &owned in &state.tree.bought {
             for n in crate::game::tree::node::neighbors_of(owned) {
                 if state.tree.bought.contains(&n) {
@@ -509,18 +509,14 @@ pub fn build_demo_state() -> GameState {
     let mut s = GameState {
         // Low relative to FPS so the counter clearly grows throughout
         // the clip, and cheap enough to buy early tiers often.
-        cuques: 500_000.0,
-        lifetime_cuques: 500_000_000.0, // unlocks all tiers via the visibility gate
+        cuques: crate::bignum::Mag::from_f64(500_000.0),
+        lifetime_cuques: crate::bignum::Mag::from_f64(500_000_000.0),
         total_clicks: 500,
-        total_play_ticks: 3600 * TICK_HZ as u64, // pretend we've been at this an hour
+        total_play_ticks: 3600 * TICK_HZ as u64,
         prestige: 3,
         golden_caught: 7,
-        // Default seeds each per-kind cooldown from a fresh exponential
-        // sample (60-240s mean depending on kind). For the demo we zero
-        // them all so the first powerup (a Buff, per the cycle in
-        // demo_driver_tick) lands well within the first few seconds.
         powerup_cooldowns: [0; powerup::N_KINDS],
-        best_fps: 50_000.0,
+        best_fps: crate::bignum::Mag::from_f64(50_000.0),
         ..GameState::default()
     };
     // Seed counts/flags BY CATALOG INDEX rather than by hardcoded id strings,

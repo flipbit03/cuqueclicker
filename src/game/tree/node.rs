@@ -14,6 +14,9 @@
 //! `edge_exists(a, b)` from a position-seeded RNG, so the connectivity
 //! pattern is also stable forever.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use super::coord::TreeCoord;
 use super::naming::make_title;
 use super::noise::{fbm_2d, value_noise_2d};
@@ -74,7 +77,7 @@ pub struct NodeSpec {
     pub box_h: u16,
     pub rarity: Rarity,
     pub primitives: Vec<Primitive>,
-    pub cost: f64,
+    pub cost: crate::bignum::Mag,
     pub title: String,
     /// Dominant target hint — used by the renderer for biome-color tinting.
     /// Picked as the target of the first primitive in the rolled stack.
@@ -92,11 +95,11 @@ const SALT_NODE: u64 = 0xA1;
 const SALT_EDGE: u64 = 0xED;
 const SALT_GAP: u64 = 0x6A;
 
-/// Pure-local "is this lot allowed to hold a node?" predicate. Doesn't
-/// recurse, doesn't check neighbors — just the gap roll and the
-/// always-populated origin neighborhood. Composing this with the
-/// has-at-least-one-populated-neighbor check (in `node_at`) is how the
-/// procgen suppresses truly-isolated lots.
+/// Pre-suppression predicate: does the local gap roll for this lot say
+/// "populated"? Origin neighborhood (|x|<=1 AND |y|<=1) is forced
+/// populated regardless of the roll. This is the *raw* "could this lot
+/// hold a node" check — orphan suppression on top of it lives in
+/// `reaches_origin`, which is what `node_at` actually gates on.
 fn passes_gap_roll(x: i32, y: i32) -> bool {
     let is_origin_neighborhood = x.abs() <= 1 && y.abs() <= 1;
     if is_origin_neighborhood {
@@ -132,7 +135,7 @@ fn anchor_spec() -> NodeSpec {
         box_h,
         rarity: Rarity::Small,
         primitives: Vec::new(),
-        cost: 0.0,
+        cost: crate::bignum::Mag::ZERO,
         title: "The Cuque".to_string(),
         dominant_target: Target::Fingerer(0),
         is_anchor: true,
@@ -146,19 +149,16 @@ pub fn node_at(x: i32, y: i32) -> Option<NodeSpec> {
     if x == 0 && y == 0 {
         return Some(anchor_spec());
     }
-    if !passes_gap_roll(x, y) {
-        return None;
-    }
-    // Suppress truly-isolated lots — populated lots that have ZERO
-    // populated king-neighbors. Such nodes would be unreachable forever
-    // (no anchor edge, no procgen edge possible) and are confusing
-    // visual noise. With the 80% population rate this only ever fires
-    // on lots with 8 consecutive gap rolls (P ≈ 2.6 × 10⁻⁶), but those
-    // do appear deep in the canvas — and they look like bugs.
-    let has_pop_neighbor = neighbors_of(TreeCoord::new(x, y))
-        .iter()
-        .any(|n| passes_gap_roll(n.x, n.y));
-    if !has_pop_neighbor {
+    // Orphan suppression: a lot is a real node only if there is a
+    // *strictly-decreasing-manhattan* chain of populated king-neighbors
+    // back to origin. The plain "passes_gap_roll AND has a populated
+    // neighbor" check used previously allowed isolated pairs at the
+    // tree's outskirts to become each other's parent — visible as nodes
+    // disconnected from the rest of the tree that the player can never
+    // reach. See `reaches_origin` for the predicate; `anchor_of` uses
+    // the same reachability check so anchor edges never point at a
+    // suppressed lot.
+    if !reaches_origin(TreeCoord::new(x, y)) {
         return None;
     }
 
@@ -351,7 +351,14 @@ fn roll_magnitude(
     // Base "strength multiplier" scales with rarity AND with manhattan
     // distance from origin: deeper lots roll harder magnitudes.
     let dist = x.unsigned_abs().saturating_add(y.unsigned_abs()) as f64;
-    let depth_scale = 1.0 + (dist / 12.0).min(20.0); // capped so keystones don't run away
+    // depth_scale cap was 20.0; tightened to 10.0 because every per-node
+    // boon stacks across hundreds of bought nodes in the late game, and
+    // a 20× depth multiplier on top of the per-roll range produced
+    // late-game players whose fps overflowed `f64` (cuques shown as `?`
+    // in the HUD, all next-buy costs `?`). The combination of a smaller
+    // cap here plus the 1000× shrink on the per-roll ranges keeps even
+    // a 1000+ node late-game stack bounded.
+    let depth_scale = 1.0 + (dist / 12.0).min(10.0);
     let rarity_scale = match rarity {
         Rarity::Small => 1.0,
         Rarity::Notable => 2.5,
@@ -371,52 +378,85 @@ fn roll_magnitude(
         }
     };
 
+    // Per-node magnitudes are all ~1000× smaller than the first cut of
+    // the tree (which gave keystone-class buffs like ×1.17 Green Coin
+    // spawn rate; two or three stacked turned spawns into a continuous
+    // rain and FPS into `Infinity` after a single long session). The
+    // shape — boons biased positive, banes biased negative, depth and
+    // rarity scale through `s` — is identical; only the absolute scale
+    // has shrunk. Keystones still feel distinct from Smalls because the
+    // 5× rarity_scale stays, and deep regions still hit harder than
+    // origin via depth_scale; both effects just compound much more
+    // gently when 500+ nodes are owned.
     match op {
         Op::AddPercent => {
-            // Small node: 1-5% additive; Keystone boon: up to 40%+.
-            let mag = rng.range_f64(0.01, 0.05) * s;
+            // Per-node boon at d=0 Small: +0.001% to +0.005% additive.
+            // At d=100 Keystone: ~+0.5% per node. Stack of 1000 deep
+            // keystones ≈ +5 total (additive), reasonable late-game.
+            let mag = rng.range_f64(0.00001, 0.00005) * s;
             if bane { -mag * 0.7 } else { mag }
         }
         Op::MulFactor => {
-            // Multiplicative boons: 1.05× small, 2-5× keystone.
-            let boost = rng.range_f64(0.02, 0.10) * s; // additive 'extra'
+            // Multiplicative — compounds across the player's bought set.
+            // Knocked down ANOTHER 100× past the 1000× rebalance because
+            // even ×1.005 per node stacked 10k nodes deep was reaching
+            // ×5e21 total. At ×1.00005 per node, 10k nodes is ×1.65,
+            // 100k is ×148 — game stays long.
+            let boost = rng.range_f64(0.0000002, 0.000001) * s;
             if bane {
-                // Bane mul: 0.5x ... 0.85x (rarer); deeper = more punishing
-                let nerf = rng.range_f64(0.05, 0.40).min(0.50);
-                (1.0 - nerf).max(0.01)
+                let nerf = rng.range_f64(0.0000005, 0.000004).min(0.00001);
+                (1.0 - nerf).max(0.9999)
             } else {
-                1.0 + boost
+                (1.0 + boost).min(1.00005)
             }
         }
         Op::FlatAdd => {
-            let mag = rng.range_f64(0.5, 4.0) * s;
+            // Flat FPS additions are linear (no compounding), so the
+            // 1000× shrink stays — these don't suffer from the runaway
+            // problem MulFactor/EffectMul do. Adding more nodes adds
+            // FPS additively, exactly the linear-grind path we want.
+            let mag = rng.range_f64(0.0005, 0.004) * s;
             if bane { -mag * 0.5 } else { mag }
         }
         Op::CostMul => {
-            // < 1 is boon (discount), > 1 is bane (inflation).
-            let scale = rng.range_f64(0.02, 0.10) * (1.0 + (dist / 30.0));
+            // Multiplicative on fingerer buy cost. Another 100× tighter
+            // so even a deep stack of discounts can't trivialize the
+            // cost ladder we're explicitly stretching.
+            let scale = rng.range_f64(0.0000002, 0.000001) * (1.0 + (dist / 30.0));
             if bane {
-                (1.0 + scale).min(2.0)
+                (1.0 + scale).min(1.00005)
             } else {
-                (1.0 - scale).max(0.50)
+                (1.0 - scale).max(0.99995)
             }
         }
         Op::SpawnRateMul => {
-            // > 1 is boon (more frequent), < 1 is bane (rarer).
-            let scale = rng.range_f64(0.02, 0.12) * (1.0 + (dist / 30.0));
+            // Multiplicative on powerup spawn frequency. The headline
+            // regression that started this thread was a single ×1.17
+            // GreenCoin SpawnRate. After the 1000× shrink the cap was
+            // ×1.005 — still produced ×148 from a 1000-node stack
+            // (constant-spawn territory). Another 100× knocks the cap
+            // to ×1.00005, so 1000 nodes → ×1.05 spawn rate, barely
+            // noticeable. Game wants to be longer; cooldowns stay long.
+            let scale = rng.range_f64(0.0000002, 0.0000012) * (1.0 + (dist / 30.0));
             if bane {
-                (1.0 - scale).max(0.30)
+                (1.0 - scale).max(0.99995)
             } else {
-                (1.0 + scale).min(3.0)
+                (1.0 + scale).min(1.00005)
             }
         }
         Op::EffectMul => {
-            // > 1 is boon, < 1 is bane.
-            let scale = rng.range_f64(0.02, 0.15) * (1.0 + (dist / 24.0));
+            // Multiplicative AND two-stage compounding — amplifies the
+            // catch-time mult that itself gets persisted on a fingerer.
+            // This is the path that produced the 311-trillion-x
+            // PurpleCoin in the wild save. Another 100× tightening to
+            // ×1.0001 cap means 10k deep nodes → ~×2.7 catch amplifier,
+            // not ×1e43. Keeps catch-time mults inside small-integer
+            // territory across any realistic session.
+            let scale = rng.range_f64(0.0000002, 0.0000015) * (1.0 + (dist / 24.0));
             if bane {
-                (1.0 - scale).max(0.10)
+                (1.0 - scale).max(0.9999)
             } else {
-                (1.0 + scale).min(5.0)
+                (1.0 + scale).min(1.0001)
             }
         }
     }
@@ -436,7 +476,14 @@ pub const NODE_COST_MULT: f64 = 5.0;
 /// Reference: fingerers grow at 1.15^count (classic Cookie Clicker
 /// 15%-per-buy). The tree grows much steeper because each "lot step"
 /// gives only ONE upgrade, vs many buys per fingerer.
-pub const NODE_COST_GROWTH: f64 = 1.75;
+///
+/// Bumped 1.75 → 2.5 along with the 1000× shrink in `roll_magnitude`.
+/// Per-node power is now tiny, so the player wants to buy *many*
+/// nodes; a steeper cost ramp keeps the player from sweeping the
+/// entire frontier in a single session and lets the alphabetic-suffix
+/// number range (10^36+ and beyond) become a real late-game milestone
+/// instead of a transient overflow.
+pub const NODE_COST_GROWTH: f64 = 2.5;
 
 /// Base cost at distance 0 (before rarity and jitter). The origin lot
 /// is auto-owned so this never quotes a real purchase, but it anchors
@@ -444,26 +491,32 @@ pub const NODE_COST_GROWTH: f64 = 1.75;
 ///                    * rarity_factor * jitter.
 pub const NODE_BASE_COST: f64 = 50.0;
 
-pub fn roll_cost(x: i32, y: i32, rarity: Rarity) -> f64 {
+pub fn roll_cost(x: i32, y: i32, rarity: Rarity) -> crate::bignum::Mag {
+    use crate::bignum::Mag;
     let dist = x.unsigned_abs().saturating_add(y.unsigned_abs()) as f64;
-    let depth_factor = NODE_COST_GROWTH.powf(dist);
-    let rarity_factor = match rarity {
+    let rarity_factor: f64 = match rarity {
         Rarity::Small => 1.0,
         Rarity::Notable => 5.0,
         Rarity::Keystone => 40.0,
     };
-    // Tiny per-lot jitter so adjacent same-rarity nodes don't all cost
-    // exactly the same.
     let mut rng = SplitMix64::from_coords(TREE_SEED, x, y, 0xC0);
     let jitter = rng.range_f64(0.85, 1.25);
-    // `NODE_COST_GROWTH.powf(dist)` overflows to `f64::INFINITY` around
-    // dist ≈ 1232 (at growth=1.75). Clamp to a safe ceiling so the
-    // info-pane "Cost: ?" path is replaced by a real finite quote — the
-    // player won't ever afford it anyway, but the rendering and the
-    // `affordable_cuques() >= cost` check both behave better with a
-    // concrete number.
-    let raw = NODE_COST_MULT * NODE_BASE_COST * depth_factor * rarity_factor * jitter;
-    raw.min(1e300).floor().max(10.0)
+    // Compute directly in log10 space so very-deep nodes (`dist` in
+    // the thousands) produce a faithful Mag instead of the old
+    // `.min(1e300)`-clamped placeholder. Each multiplicative factor is
+    // log10'd and summed; the result is `10^(sum)`.
+    let log10 = NODE_COST_MULT.log10()
+        + NODE_BASE_COST.log10()
+        + dist * NODE_COST_GROWTH.log10()
+        + rarity_factor.log10()
+        + jitter.log10();
+    // `.max` a small floor so even the cheapest origin-neighborhood node
+    // isn't free: 10 cuques minimum.
+    if log10 < 1.0 {
+        Mag::from_f64(10.0)
+    } else {
+        Mag { log10 }
+    }
 }
 
 /// True when the lots at `a` and `b` are 8-king neighbors (chebyshev
@@ -480,23 +533,25 @@ pub fn is_king_neighbor(a: TreeCoord, b: TreeCoord) -> bool {
 ///
 /// Selection rules, in order:
 ///   1. Prefer an ORTHOGONAL king-neighbor at strictly smaller manhattan
-///      distance from origin. This is what controls the cobweb at
-///      origin: only origin's 4 orthogonal neighbors will anchor to
-///      origin directly, while diagonal neighbors anchor via one of the
-///      orthogonal cousins. Cuts origin's incoming anchor-edge count
-///      from 8 to 4, halving the visual density.
-///   2. Fall back to a DIAGONAL strictly-smaller-manhattan neighbor if
-///      no orthogonal candidate exists (happens when all 4 orth
-///      neighbors are gaps — rare but possible at gap_p=0.35).
-///   3. Last resort: any populated king-neighbor (same/greater
-///      manhattan). Belt-and-suspenders; almost never triggers.
+///      distance from origin that itself reaches origin. This is what
+///      controls the cobweb at origin: only origin's 4 orthogonal
+///      neighbors will anchor to origin directly, while diagonal
+///      neighbors anchor via one of the orthogonal cousins. Cuts
+///      origin's incoming anchor-edge count from 8 to 4.
+///   2. Fall back to a DIAGONAL strictly-smaller-manhattan neighbor
+///      that reaches origin.
 ///
-/// Returns `None` for origin (no parent) and for unpopulated lots.
+/// Returns `None` for origin (no parent) and for lots that fail
+/// `reaches_origin`. There is deliberately no "any populated neighbor"
+/// fallback — that used to exist and was the source of orphan islands:
+/// two adjacent populated lots whose only smaller-manhattan neighbors
+/// were all gaps would each point at the other, forming a closed loop
+/// disconnected from the rest of the tree.
 pub fn anchor_of(lot: TreeCoord) -> Option<TreeCoord> {
     if lot == TreeCoord::ORIGIN {
         return None;
     }
-    if !passes_gap_roll(lot.x, lot.y) {
+    if !reaches_origin(lot) {
         return None;
     }
     let dist = lot.manhattan();
@@ -510,7 +565,7 @@ pub fn anchor_of(lot: TreeCoord) -> Option<TreeCoord> {
         let dy = n.y.wrapping_sub(lot.y).unsigned_abs();
         (dx == 0 || dy == 0) && (dx + dy == 1)
     };
-    // Pass 1: orthogonal + strictly-smaller-manhattan + populated.
+    // Pass 1: orthogonal + strictly-smaller-manhattan + reaches-origin.
     for n in &candidates {
         if n.manhattan() >= dist {
             continue;
@@ -518,28 +573,66 @@ pub fn anchor_of(lot: TreeCoord) -> Option<TreeCoord> {
         if !is_orthogonal(n) {
             continue;
         }
-        if passes_gap_roll(n.x, n.y) {
+        if reaches_origin(*n) {
             return Some(*n);
         }
     }
-    // Pass 2: diagonal + strictly-smaller-manhattan + populated. Lets
-    // a lot whose 4 orthogonal neighbors are all gaps still find a
-    // parent toward origin.
+    // Pass 2: diagonal + strictly-smaller-manhattan + reaches-origin.
+    // Lets a lot whose 4 orthogonal neighbors all fail (gap or orphaned)
+    // still find a parent toward origin.
     for n in &candidates {
         if n.manhattan() >= dist {
             continue;
         }
-        if passes_gap_roll(n.x, n.y) {
-            return Some(*n);
-        }
-    }
-    // Pass 3: any populated neighbor. Last resort.
-    for n in &candidates {
-        if passes_gap_roll(n.x, n.y) {
+        if reaches_origin(*n) {
             return Some(*n);
         }
     }
     None
+}
+
+// Memoized "is this lot connected to origin via a strictly-decreasing-
+// manhattan chain of populated king-neighbors". Pure function of
+// (lot.x, lot.y) — the procgen seed and gap-roll function are both
+// deterministic — so caching results forever is sound. The map only
+// grows as the player explores; in practice it stays in the low
+// thousands of entries (one per lot the renderer ever asks about).
+thread_local! {
+    static REACHES_ORIGIN_MEMO: RefCell<HashMap<TreeCoord, bool>> = RefCell::new(HashMap::new());
+}
+
+/// True iff `lot` admits a path of populated king-neighbors back to
+/// origin where every step strictly *decreases* manhattan distance.
+/// Origin itself returns true; unpopulated lots (gap roll) return false.
+///
+/// The strict-decrease constraint is what makes the procgen orphan-free:
+/// it's impossible to form a cycle among lots if every edge in the
+/// chain reduces a non-negative integer (manhattan distance), so any
+/// successful chain terminates at origin in at most `lot.manhattan()`
+/// steps. Recursion depth is therefore bounded by manhattan distance,
+/// and the thread-local memo collapses overlapping sub-chains across
+/// the many lots the renderer asks about per frame.
+pub fn reaches_origin(lot: TreeCoord) -> bool {
+    if lot == TreeCoord::ORIGIN {
+        return true;
+    }
+    if let Some(v) = REACHES_ORIGIN_MEMO.with(|m| m.borrow().get(&lot).copied()) {
+        return v;
+    }
+    if !passes_gap_roll(lot.x, lot.y) {
+        REACHES_ORIGIN_MEMO.with(|m| m.borrow_mut().insert(lot, false));
+        return false;
+    }
+    let dist = lot.manhattan();
+    let mut result = false;
+    for n in neighbors_of(lot) {
+        if n.manhattan() < dist && reaches_origin(n) {
+            result = true;
+            break;
+        }
+    }
+    REACHES_ORIGIN_MEMO.with(|m| m.borrow_mut().insert(lot, result));
+    result
 }
 
 /// Sample a low-frequency density noise field at the midpoint between
@@ -933,18 +1026,18 @@ mod tests {
         // Walk a large region; for every keystone, assert composition.
         for x in -30..=30 {
             for y in -30..=30 {
-                if let Some(n) = node_at(x, y) {
-                    if n.rarity == Rarity::Keystone {
-                        assert!(
-                            n.primitives.iter().any(|p| p.is_bane()),
-                            "keystone at ({x},{y}) has no bane primitive: {:?}",
-                            n.primitives
-                        );
-                        assert!(
-                            n.primitives.iter().any(|p| !p.is_bane()),
-                            "keystone at ({x},{y}) has no boon primitive"
-                        );
-                    }
+                if let Some(n) = node_at(x, y)
+                    && n.rarity == Rarity::Keystone
+                {
+                    assert!(
+                        n.primitives.iter().any(|p| p.is_bane()),
+                        "keystone at ({x},{y}) has no bane primitive: {:?}",
+                        n.primitives
+                    );
+                    assert!(
+                        n.primitives.iter().any(|p| !p.is_bane()),
+                        "keystone at ({x},{y}) has no boon primitive"
+                    );
                 }
             }
         }
@@ -954,7 +1047,13 @@ mod tests {
     fn cost_grows_with_distance() {
         let near = roll_cost(0, 0, Rarity::Small);
         let far = roll_cost(20, 20, Rarity::Small);
-        assert!(far > near * 100.0, "far ({far}) should be >> near ({near})");
+        // log10(far) - log10(near) >= 2 means far >= 100x near.
+        assert!(
+            far.log10 - near.log10 > 2.0,
+            "far ({}) should be >> near ({})",
+            crate::format::big_mag(far),
+            crate::format::big_mag(near)
+        );
     }
 
     /// Diagnostic table — not a real assertion, prints the live ramp at
@@ -974,21 +1073,21 @@ mod tests {
             "dist", "Small", "Notable", "Keystone"
         );
         for &d in &[1, 2, 3, 5, 7, 10, 12, 15, 18, 20, 25, 30, 35, 40, 50i32] {
-            // Use (d, 0) so manhattan == d. Average over a small sample to
-            // smooth out jitter, since jitter is seeded from (x, y).
+            // Use (d, 0) so manhattan == d.
             let small = roll_cost(d, 0, Rarity::Small);
             let notable = roll_cost(d, 0, Rarity::Notable);
             let keystone = roll_cost(d, 0, Rarity::Keystone);
             eprintln!(
                 "{:>4}  {:>14}  {:>14}  {:>14}",
                 d,
-                format_cost(small),
-                format_cost(notable),
-                format_cost(keystone)
+                crate::format::big_mag(small),
+                crate::format::big_mag(notable),
+                crate::format::big_mag(keystone)
             );
         }
     }
 
+    #[allow(dead_code)]
     fn format_cost(c: f64) -> String {
         if c >= 1e15 {
             format!("{:.2} quad", c / 1e15)
@@ -1024,6 +1123,96 @@ mod tests {
                                 (i as usize) < FINGERERS.len(),
                                 "fingerer target idx {i} out of range"
                             );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_orphan_components_within_visible_radius() {
+        use std::collections::{HashSet, VecDeque};
+        // 40 covers a generous "explore for an hour" radius. Before the
+        // `reaches_origin` orphan check this would surface ~50 orphans;
+        // the player saw them as isolated 2-node islands in the panned
+        // canvas with no path back to The Cuque.
+        let radius: i32 = 40;
+        let mut populated: HashSet<TreeCoord> = HashSet::new();
+        for x in -radius..=radius {
+            for y in -radius..=radius {
+                if node_at(x, y).is_some() {
+                    populated.insert(TreeCoord::new(x, y));
+                }
+            }
+        }
+        let mut reached: HashSet<TreeCoord> = HashSet::new();
+        let mut q: VecDeque<TreeCoord> = VecDeque::new();
+        q.push_back(TreeCoord::ORIGIN);
+        reached.insert(TreeCoord::ORIGIN);
+        while let Some(c) = q.pop_front() {
+            for n in neighbors_of(c) {
+                if !populated.contains(&n) {
+                    continue;
+                }
+                if reached.contains(&n) {
+                    continue;
+                }
+                if edge_exists(c, n) {
+                    reached.insert(n);
+                    q.push_back(n);
+                }
+            }
+        }
+        let orphans: Vec<_> = populated.difference(&reached).copied().collect();
+        if !orphans.is_empty() {
+            for o in orphans.iter().take(20) {
+                eprintln!("orphan at ({}, {}) manhattan={}", o.x, o.y, o.manhattan());
+            }
+        }
+        assert!(
+            orphans.is_empty(),
+            "{} orphan(s) detected in radius {}",
+            orphans.len(),
+            radius
+        );
+    }
+
+    #[test]
+    fn multiplicative_primitives_stay_under_per_node_caps() {
+        // Per-node caps are the load-bearing balance knob for keeping the
+        // game long: every multiplicative op compounds across the bought
+        // set, so a generous cap turns into runaway numbers. Caps were
+        // tightened ANOTHER 100× past the initial rebalance after the
+        // "make the game longer" pass:
+        //   MulFactor / CostMul / SpawnRateMul: ×1.00005
+        //   EffectMul:                          ×1.0001
+        // EffectMul gets a slightly looser ceiling because it's
+        // applied at catch time (once per powerup), not on every fps
+        // tick like the others.
+        const MUL_CAP: f64 = 1.00005;
+        const EFFECT_CAP: f64 = 1.0001;
+        for x in -60..=60 {
+            for y in -60..=60 {
+                if let Some(n) = node_at(x, y) {
+                    for p in &n.primitives {
+                        match p.op {
+                            Op::MulFactor | Op::CostMul | Op::SpawnRateMul => {
+                                assert!(
+                                    p.magnitude <= MUL_CAP + 1e-12,
+                                    "{:?} at ({x},{y}) is {} (cap {MUL_CAP})",
+                                    p.op,
+                                    p.magnitude
+                                );
+                            }
+                            Op::EffectMul => {
+                                assert!(
+                                    p.magnitude <= EFFECT_CAP + 1e-12,
+                                    "EffectMul at ({x},{y}) is {} (cap {EFFECT_CAP})",
+                                    p.magnitude
+                                );
+                            }
+                            _ => {}
                         }
                     }
                 }

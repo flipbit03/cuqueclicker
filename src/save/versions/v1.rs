@@ -103,10 +103,10 @@ mod tests {
         let s = v1.into_current();
 
         assert_eq!(s.version, crate::save::CURRENT_VERSION);
-        assert_eq!(s.cuques, 12345.6);
+        assert_eq!(s.cuques, crate::bignum::Mag::from_f64(12345.6));
         assert_eq!(s.total_clicks, 42);
-        assert_eq!(s.lifetime_cuques, 99999.0);
-        assert_eq!(s.best_fps, 17.5);
+        assert_eq!(s.lifetime_cuques, crate::bignum::Mag::from_f64(99999.0));
+        assert_eq!(s.best_fps, crate::bignum::Mag::from_f64(17.5));
         assert_eq!(s.golden_caught, 3);
         assert_eq!(s.fingerer_count("index_finger"), 9);
         assert_eq!(s.fingerer_count("latex_glove"), 4);
@@ -179,6 +179,6 @@ mod tests {
             crate::game::modifier::ModifierDuration::Ticks(600)
         ));
         // Remaining time and mult survive.
-        assert!((st.aggregate.mul_factor - 7.0).abs() < 1e-9);
+        assert!((st.aggregate.mul_factor.to_f64() - 7.0).abs() < 1e-9);
     }
 }

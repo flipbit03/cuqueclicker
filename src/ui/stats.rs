@@ -40,10 +40,10 @@ pub fn draw(frame: &mut Frame, area: Rect, state: &GameState) {
         ),
         (
             lang.stat_lifetime_cuques,
-            format::big(state.lifetime_cuques),
+            format::big_mag(state.lifetime_cuques),
             neutral,
         ),
-        (lang.stat_best_fps, format::rate(state.best_fps), neutral),
+        (lang.stat_best_fps, format::big_mag(state.best_fps), neutral),
         (
             lang.stat_fingerers_owned,
             format::big(state.fingerers_owned_total() as f64),

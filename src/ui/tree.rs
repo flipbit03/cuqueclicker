@@ -171,7 +171,7 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &GameState) {
     let line = Line::from(vec![
         Span::raw(format!("{}: ", lang.hud_cuques)),
         Span::styled(
-            format::big(state.displayed_cuques),
+            format::big_mag(state.displayed_cuques),
             Style::default()
                 .fg(Color::Rgb(180, 255, 180))
                 .add_modifier(StyleMod::BOLD),
@@ -216,7 +216,7 @@ struct VisibleNode {
     rarity: Rarity,
     lot: TreeCoord,
     dominant_target: Target,
-    cost: f64,
+    cost: crate::bignum::Mag,
     owned: bool,
     reachable: bool,
     affordable: bool,
@@ -493,7 +493,7 @@ fn draw_box(
                     let cost_str = if v.owned {
                         "[ owned ]".to_string()
                     } else {
-                        format::big(v.cost).to_string()
+                        format::big_mag(v.cost)
                     };
                     cost_str.chars().nth((col - 1) as usize).unwrap_or(' ')
                 } else if r_in > 0
@@ -1378,8 +1378,10 @@ fn draw_info_pane(
                         ),
                     ])
                 } else {
-                    let refund = (spec.cost * TREE_REFUND_FRACTION).floor();
-                    let loss = spec.cost - refund;
+                    let refund = spec
+                        .cost
+                        .mul(crate::bignum::Mag::from_f64(TREE_REFUND_FRACTION));
+                    let loss = spec.cost.saturating_sub(refund);
                     let label_len = refund_button_label.chars().count() as u16;
                     action_button = Some((
                         TreeButtonAction::Refund,
@@ -1407,8 +1409,8 @@ fn draw_info_pane(
                             format!(
                                 "  {}",
                                 lang.tree_refund_returns_fmt
-                                    .replacen("{}", &format::big(refund), 1)
-                                    .replacen("{}", &format::big(loss), 1)
+                                    .replacen("{}", &format::big_mag(refund), 1)
+                                    .replacen("{}", &format::big_mag(loss), 1)
                             ),
                             Style::default().fg(Color::Rgb(180, 150, 150)),
                         ),
@@ -1422,20 +1424,20 @@ fn draw_info_pane(
             } else if !affordable {
                 let need_more = lang.tree_cost_need_more_fmt.replacen(
                     "{}",
-                    &format::big(spec.cost - state.affordable_cuques()),
+                    &format::big_mag(spec.cost.saturating_sub(state.affordable_cuques())),
                     1,
                 );
                 Line::styled(
                     format!(
                         "{}{}  {}",
                         cost_label_padded,
-                        format::big(spec.cost),
+                        format::big_mag(spec.cost),
                         need_more
                     ),
                     Style::default().fg(Color::Rgb(220, 100, 100)),
                 )
             } else {
-                let cost_text = format::big(spec.cost);
+                let cost_text = format::big_mag(spec.cost);
                 // Line layout: "{cost_label_padded}{cost}   {buy_button}"
                 let prefix_cols = cost_label_padded.chars().count()
                     + cost_text.chars().count()

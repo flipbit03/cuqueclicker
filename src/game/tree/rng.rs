@@ -106,7 +106,7 @@ mod tests {
         let mut r = SplitMix64::new(1234);
         for _ in 0..1000 {
             let v = r.range_f64(-2.0, 5.0);
-            assert!(v >= -2.0 && v < 5.0, "{}", v);
+            assert!((-2.0..5.0).contains(&v), "{}", v);
         }
     }
 
