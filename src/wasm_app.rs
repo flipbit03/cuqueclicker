@@ -264,6 +264,12 @@ pub fn run() -> Result<(), JsValue> {
         // off and the debug pane / F-key cheats vanish exactly like a
         // shipped native binary.
         let debug = crate::build_info::is_dev_build();
+        // Hoist the `Copy`-bound flag into a local — passing it as a
+        // direct field read alongside `&mut web.ui.tree_render` trips
+        // the wasm32 borrow checker (E0502), which is stricter than
+        // native here about disjoint-field borrows when the function-
+        // call result also writes back into `web` via `web.layout =`.
+        let prestige_confirm_pending = web.ui.prestige_confirm_pending;
         web.layout = ui::draw(
             f,
             &state,
@@ -272,7 +278,7 @@ pub fn run() -> Result<(), JsValue> {
             debug,
             web.ui.last_mouse_pos,
             &mut web.ui.tree_render,
-            web.ui.prestige_confirm_pending,
+            prestige_confirm_pending,
         );
         // Hand the latest biscuit rect to the sim so goldens and auto-
         // particles spawn inside the current layout. Powerup engine pauses
