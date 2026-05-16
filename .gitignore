@@ -1,2 +1,4 @@
 /target
 /dist
+# Claude Code's scheduled-task lock — per-checkout runtime artifact, never code.
+.claude/scheduled_tasks.lock
