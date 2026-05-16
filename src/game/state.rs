@@ -1117,16 +1117,20 @@ impl GameState {
     }
 
     pub fn prestige_earned_total(&self) -> u64 {
-        // Clamp to a sane ceiling so a corrupted / cheat-inflated
-        // `lifetime_cuques` (e.g. f64 near INFINITY) can't saturate to
-        // u64::MAX and blow `prestige_mult` to 1.8e17. 1_000_000 papers
-        // is a 1e16-cuques lifetime — far past anything reachable in
-        // legitimate play.
+        // Guard the only failure modes the math actually has: NaN /
+        // INFINITY from a corrupted `lifetime_cuques`, and negative
+        // values that have no business in a lifetime counter. Past
+        // that, trust the player's number — long-haul legit play can
+        // reach surprisingly high paper counts, and capping the result
+        // would silently truncate their earned progression. The f64-
+        // to-u64 saturation cast only kicks in around `raw > u64::MAX
+        // ≈ 1.8e19` which corresponds to `lifetime_cuques > ~3e44` —
+        // unreachable through any non-corrupted save state.
         let raw = (self.lifetime_cuques / 1_000_000.0).sqrt().floor();
         if !raw.is_finite() || raw < 0.0 {
             0
         } else {
-            (raw as u64).min(1_000_000)
+            raw as u64
         }
     }
 
