@@ -64,37 +64,13 @@ pub struct GameStateV3 {
 }
 
 impl GameStateV3 {
-    /// Convert a V3 snapshot into the live `GameState`. Every persisted
-    /// field is copied verbatim; ephemeral state (`#[serde(skip)]` fields,
-    /// including `powerups`/`next_spawn_id`/`powerup_cooldowns`) stays at
-    /// its `Default` and gets seeded by `migrate_runtime` after the chain
-    /// finishes.
+    /// Convert a V3 snapshot into the live `GameState` by chaining through
+    /// V4. The live shape no longer carries `upgrades_earned`; V4's frozen
+    /// `From<GameStateV3>` impl drops it. (Per `CLAUDE.md`, this delegation
+    /// is the one mutation a frozen file is allowed: keeping the chain
+    /// reachable as later versions land.)
     pub fn into_current(self) -> GameState {
-        let fingerers_state = self
-            .fingerers_state
-            .into_iter()
-            .map(|(id, st)| (id, st.into()))
-            .collect();
-        let buffs = self.buffs.into_iter().map(Into::into).collect();
-        GameState {
-            version: crate::save::CURRENT_VERSION,
-            cuques: self.cuques,
-            total_clicks: self.total_clicks,
-            lifetime_cuques: self.lifetime_cuques,
-            best_fps: self.best_fps,
-            golden_caught: self.golden_caught,
-            lucky_caught: self.lucky_caught,
-            frenzy_caught: self.frenzy_caught,
-            buff_caught: self.buff_caught,
-            green_coin_caught: self.green_coin_caught,
-            fingerers_state,
-            achievements_earned: self.achievements_earned,
-            upgrades_earned: self.upgrades_earned,
-            prestige: self.prestige,
-            total_play_ticks: self.total_play_ticks,
-            buffs,
-            ..GameState::default()
-        }
+        super::v4::GameStateV4::from(self).into_current()
     }
 }
 

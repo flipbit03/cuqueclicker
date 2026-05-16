@@ -10,7 +10,10 @@ use crate::game::modifier::{
     FingererAggregate, Modifier, ModifierDuration, ModifierEffect, ModifierSource,
 };
 use crate::game::powerup::{self, N_KINDS, Powerup, PowerupKind};
-use crate::game::upgrade::{UPGRADES, UpgradeEffect};
+use crate::game::tree::aggregate::TreeAggregate;
+use crate::game::tree::coord::TreeCoord;
+use crate::game::tree::node::{self, NodeSpec};
+use crate::game::tree::state::UpgradeTreeState;
 
 pub const TICK_HZ: u32 = 20;
 pub const TICK_DT: f64 = 1.0 / TICK_HZ as f64;
@@ -37,6 +40,48 @@ pub const ACHIEVEMENT_FLASH_TICKS: u32 = TICK_HZ * 2;
 /// short enough that it's clearly an "announcement," not the longer
 /// purchase flash that fires on actual buy.
 pub const UNLOCK_FLASH_TICKS: u32 = TICK_HZ / 2; // 0.5s
+/// Cells the edge-unlock wavefront advances per tick. At `TICK_HZ = 20`
+/// a value of 2 = 40 cells / sec — a typical 8-cell straight edge fully
+/// energizes in ~0.2 s, a longer diagonal in ~0.4 s. Bumping this is
+/// the right knob when the user says "make it faster"; going below 1
+/// (e.g. tick / 2 cells/tick = slower) needs a different mechanism
+/// since we sample integer cells per tick.
+pub const EDGE_UNLOCK_CELLS_PER_TICK: u32 = 2;
+
+/// In-flight "path lights up" animation when a buy lights an edge.
+/// Lives only at runtime — `#[serde(skip)]`-projected fields don't ever
+/// reach disk.
+///
+/// `gates_destination` is true when the buy newly made the destination
+/// reachable — those destinations are held in "not yet reachable" UX
+/// until the wave arrives, and get the gold unlock_flash on completion.
+/// Edges to already-reachable neighbors animate decoratively (so every
+/// newly-lit edge gets the snake) but DON'T gate the destination, since
+/// the player was free to buy it before this animation started.
+///
+/// Wave geometry (leading_inside / trailing_inside / visible length)
+/// is computed lazily against `node::edge_path_cells(from, to)`, which
+/// returns a canonical lo→hi-ordered path. Caching the offsets on the
+/// anim would couple them to the call-site direction; under a renderer
+/// that iterated the edge in the opposite (a, b) order they pointed at
+/// the wrong end of the line.
+#[derive(Clone, Copy, Debug)]
+pub struct EdgeUnlockAnim {
+    pub from: TreeCoord,
+    pub to: TreeCoord,
+    pub ticks: u32,
+    pub gates_destination: bool,
+}
+
+impl EdgeUnlockAnim {
+    /// Visible-cell offset of the wavefront — how many cells past the
+    /// source-side leading-inside region the head has advanced.
+    pub fn visible_advance(&self) -> usize {
+        self.ticks.saturating_mul(EDGE_UNLOCK_CELLS_PER_TICK) as usize
+    }
+}
+
+use node::{count_leading_in_rect, count_trailing_in_rect};
 /// Per-tick upward drift for a particle, expressed as a fraction of the
 /// biscuit's height. Calibrated to match the original feel before the
 /// switch to fractional anchors: the old code rose 0.18 cells/tick on
@@ -248,9 +293,6 @@ pub struct GameState {
     /// Set of earned achievement ids.
     #[serde(default)]
     pub achievements_earned: HashSet<String>,
-    /// Set of earned upgrade ids.
-    #[serde(default)]
-    pub upgrades_earned: HashSet<String>,
 
     #[serde(default)]
     pub prestige: u64,
@@ -258,6 +300,38 @@ pub struct GameState {
     pub total_play_ticks: u64,
     #[serde(default)]
     pub buffs: Vec<Buff>,
+
+    /// Persistent upgrade-tree state. Source of truth for which procedural
+    /// tree nodes the player has bought; `tree_aggregate` (below, derived,
+    /// `#[serde(skip)]`) is the cache that the FPS / click / powerup hot
+    /// paths actually read.
+    #[serde(default)]
+    pub tree: UpgradeTreeState,
+    /// Pre-folded contributions from every owned tree node. Rebuilt on load
+    /// (`migrate_runtime`) and incrementally updated on buy/refund. O(1)
+    /// reads on the hot path; bought set can be arbitrarily large.
+    #[serde(skip)]
+    pub tree_aggregate: TreeAggregate,
+    /// Brief green pulse on a node when it gets bought. Ephemeral — purely
+    /// render-side feedback, ticks down each frame.
+    #[serde(skip)]
+    pub tree_buy_flash: HashMap<TreeCoord, u32>,
+    /// Brief yellow pulse on nodes that just became reachable as a result
+    /// of a buy elsewhere. Highlights the new shop frontier without
+    /// requiring the player to scan the canvas.
+    #[serde(skip)]
+    pub tree_unlock_flash: HashMap<TreeCoord, u32>,
+    /// Brief red pulse on a node that just got refunded. The lot is now
+    /// unowned so the flash decays on the visible-but-unowned box.
+    #[serde(skip)]
+    pub tree_refund_flash: HashMap<TreeCoord, u32>,
+    /// In-flight "wire energizing" animations from a just-bought node to
+    /// each neighbor that flipped reachable on the buy. The destination
+    /// box stays gated as not-yet-reachable for the duration of its
+    /// incoming anim; when the wavefront reaches the box, the anim is
+    /// removed and `tree_unlock_flash` fires for that lot.
+    #[serde(skip)]
+    pub tree_edge_anims: Vec<EdgeUnlockAnim>,
 
     #[serde(skip)]
     pub clench_ticks: u32,
@@ -341,16 +415,10 @@ pub struct GameState {
     /// it's purely a render-time flash and doesn't need to survive reorders.
     #[serde(skip)]
     pub fingerer_flash_ticks: Vec<u32>,
-    /// Mirror of `fingerer_flash_ticks` for the Upgrades panel. Sized to
-    /// UPGRADES.len() lazily by `migrate()`.
-    #[serde(skip)]
-    pub upgrade_flash_ticks: Vec<u32>,
     /// Negative-feedback flash: red row pulse when a click hit a row but
-    /// `cuques < cost`. One slot per fingerer / upgrade index.
+    /// `cuques < cost`. One slot per fingerer index.
     #[serde(skip)]
     pub fingerer_unaffordable_flash: Vec<u32>,
-    #[serde(skip)]
-    pub upgrade_unaffordable_flash: Vec<u32>,
     /// "Just became affordable" flash: a brief one-shot green shimmer
     /// fired the tick a row's affordability flips false → true. Distinct
     /// from `*_flash_ticks` (purchase) — shorter duration, no panel
@@ -358,8 +426,6 @@ pub struct GameState {
     /// "you just bought."
     #[serde(skip)]
     pub fingerer_unlock_flash: Vec<u32>,
-    #[serde(skip)]
-    pub upgrade_unlock_flash: Vec<u32>,
     /// Brief gold shimmer on a fingerer row when a Green Coin catch
     /// targeted it. Closes the visual loop with the floating
     /// `+10% {fingerer}` particle and the green-tinted title-border
@@ -367,15 +433,13 @@ pub struct GameState {
     /// can see at a glance which row in the sidebar just took the boost.
     #[serde(skip)]
     pub fingerer_green_coin_flash: Vec<u32>,
-    /// Previous-tick affordability per row, used to detect the
-    /// false→true edge that triggers `*_unlock_flash`. Sized to catalog
-    /// length by `migrate()` and seeded at init from the live state, so a
-    /// freshly-loaded save with rows already affordable doesn't fire a
-    /// fake unlock flash on tick 1.
+    /// Previous-tick affordability per fingerer row, used to detect the
+    /// false→true edge that triggers `fingerer_unlock_flash`. Sized to
+    /// catalog length by `migrate()` and seeded at init from the live
+    /// state, so a freshly-loaded save with rows already affordable
+    /// doesn't fire a fake unlock flash on tick 1.
     #[serde(skip)]
     pub prev_fingerer_affordable: Vec<bool>,
-    #[serde(skip)]
-    pub prev_upgrade_affordable: Vec<bool>,
     /// Held-spacebar tracking.
     ///
     /// `space_pressed_this_tick` is set whenever `Action::ClickCenter`
@@ -432,6 +496,13 @@ pub const GREEN_COIN_ROW_FLASH_TICKS: u32 = TICK_HZ * 2; // 2.0s at 20Hz
 /// it changes the long-term power curve significantly so treat with care.
 pub const GREEN_COIN_ADD_PERCENT: f64 = 0.10;
 
+/// Fraction of a tree node's original cost returned on refund. The
+/// remaining fraction is the "exploration tax" — without this gap,
+/// buy/refund is a zero-cost move and the player can spam every
+/// combination for free. 0.70 = 30% loss on each refund, enough to make
+/// reckless paths expensive without punishing genuine course corrections.
+pub const TREE_REFUND_FRACTION: f64 = 0.70;
+
 /// Serde default for `GameState::version`. A direct deserialize of the live
 /// `GameState` from a pre-versioned save (one without the field) still
 /// produces a sensibly-stamped state — though production loads always go
@@ -455,10 +526,23 @@ impl Default for GameState {
             green_coin_caught: 0,
             fingerers_state: HashMap::new(),
             achievements_earned: HashSet::new(),
-            upgrades_earned: HashSet::new(),
             prestige: 0,
             total_play_ticks: 0,
             buffs: Vec::new(),
+            tree: {
+                let mut t = UpgradeTreeState::default();
+                // The (0, 0) lot is the cuque-anchor: rendered as the
+                // ass sprite, no primitives, auto-owned at startup. Its
+                // king-neighbors are reachable from frame 1 because of
+                // the procgen's `anchor_of` guarantee.
+                t.bought.insert(TreeCoord::ORIGIN);
+                t
+            },
+            tree_aggregate: TreeAggregate::default(),
+            tree_buy_flash: HashMap::new(),
+            tree_unlock_flash: HashMap::new(),
+            tree_refund_flash: HashMap::new(),
+            tree_edge_anims: Vec::new(),
             clench_ticks: 0,
             particles: Vec::new(),
             misclick_particles: Vec::new(),
@@ -484,14 +568,10 @@ impl Default for GameState {
             purchase_flash_ticks: 0,
             purchase_flash_strength: 1.0,
             fingerer_flash_ticks: vec![0; fingerer::count()],
-            upgrade_flash_ticks: vec![0; UPGRADES.len()],
             fingerer_unaffordable_flash: vec![0; fingerer::count()],
-            upgrade_unaffordable_flash: vec![0; UPGRADES.len()],
             fingerer_unlock_flash: vec![0; fingerer::count()],
-            upgrade_unlock_flash: vec![0; UPGRADES.len()],
             fingerer_green_coin_flash: vec![0; fingerer::count()],
             prev_fingerer_affordable: vec![false; fingerer::count()],
-            prev_upgrade_affordable: vec![false; UPGRADES.len()],
             space_pressed_this_tick: false,
             ticks_since_last_press: u32::MAX,
             space_hold_ticks: 0,
@@ -519,25 +599,24 @@ impl GameState {
         for st in self.fingerers_state.values_mut() {
             st.aggregate = FingererAggregate::rebuild(&st.modifiers);
         }
+        // Ensure the anchor (origin) is always owned — pre-V4 saves
+        // (and any future shape change that resets `bought`) need it
+        // here so the player's starting frontier exists. The anchor has
+        // no primitives so adding it to `bought` is harmless even if
+        // it's already there.
+        self.tree.bought.insert(TreeCoord::ORIGIN);
+        // `tree_aggregate` is also `#[serde(skip)]` — rebuild from `tree.bought`.
+        self.tree_aggregate.rebuild_from_bought(&self.tree.bought);
         // Per-catalog flash slots are runtime-only — re-size if the catalog
         // grew/shrank since this save was written.
         if self.fingerer_flash_ticks.len() != fingerer::count() {
             self.fingerer_flash_ticks = vec![0; fingerer::count()];
         }
-        if self.upgrade_flash_ticks.len() != UPGRADES.len() {
-            self.upgrade_flash_ticks = vec![0; UPGRADES.len()];
-        }
         if self.fingerer_unaffordable_flash.len() != fingerer::count() {
             self.fingerer_unaffordable_flash = vec![0; fingerer::count()];
         }
-        if self.upgrade_unaffordable_flash.len() != UPGRADES.len() {
-            self.upgrade_unaffordable_flash = vec![0; UPGRADES.len()];
-        }
         if self.fingerer_unlock_flash.len() != fingerer::count() {
             self.fingerer_unlock_flash = vec![0; fingerer::count()];
-        }
-        if self.upgrade_unlock_flash.len() != UPGRADES.len() {
-            self.upgrade_unlock_flash = vec![0; UPGRADES.len()];
         }
         if self.fingerer_green_coin_flash.len() != fingerer::count() {
             self.fingerer_green_coin_flash = vec![0; fingerer::count()];
@@ -548,14 +627,6 @@ impl GameState {
         if self.prev_fingerer_affordable.len() != fingerer::count() {
             self.prev_fingerer_affordable =
                 (0..fingerer::count()).map(|i| self.can_buy(i)).collect();
-        }
-        if self.prev_upgrade_affordable.len() != UPGRADES.len() {
-            self.prev_upgrade_affordable = (0..UPGRADES.len())
-                .map(|i| {
-                    let u = &UPGRADES[i];
-                    !self.has_upgrade(u.id) && u.req.met(&self) && self.cuques >= u.cost
-                })
-                .collect();
         }
         // Re-seed any per-kind cooldown left at 0 (the array is
         // `#[serde(skip)]` so it's already at default after deserialize;
@@ -663,10 +734,6 @@ impl GameState {
         let pick = visible[rand::rng().random_range(0..visible.len())].clone();
         self.attach_modifier(&pick, m);
         Some(pick)
-    }
-
-    pub fn has_upgrade(&self, id: &str) -> bool {
-        self.upgrades_earned.contains(id)
     }
 
     pub fn has_achievement(&self, id: &str) -> bool {
@@ -785,17 +852,15 @@ impl GameState {
     }
 
     pub fn click_power(&self) -> f64 {
-        let mut m = 1.0;
-        for u in UPGRADES.iter() {
-            if self.has_upgrade(u.id)
-                && let UpgradeEffect::ClickMult(f) = u.effect
-            {
-                m *= f;
-            }
-        }
+        // Click contributions come from the tree exclusively (old hardcoded
+        // ClickMult upgrades are retired). Same fold order as the modifier
+        // formula on fingerers: flat first, then (1 + add_percent), then
+        // mul_factor.
+        let t = &self.tree_aggregate;
+        let base = (1.0 + t.click_flat) * (1.0 + t.click_add) * t.click_mul;
         // Per-click Frenzy bonus, FPS-scaled. The legacy `mult: 777.0`
         // on `Buff::ClickFrenzy` is now ignored at click-time (kept on
-        // the struct only for V2/V3 save compatibility); each click
+        // the struct only for V2/V3/V4 save compatibility); each click
         // during Frenzy adds a flat-or-fps-scaled bonus instead. This
         // is what keeps an early-game Frenzy (FPS ≈ 0) capped at the
         // FRENZY_FLAT floor (10 cuques/click) instead of trivializing
@@ -808,32 +873,10 @@ impl GameState {
             .any(|b| matches!(b, Buff::ClickFrenzy { .. }));
         if frenzy_active {
             let bonus = (self.fps() * FRENZY_FPS_SECONDS_PER_CLICK).max(FRENZY_FLAT_PER_CLICK);
-            m + bonus
+            base + bonus
         } else {
-            m
+            base
         }
-    }
-
-    pub fn fingerer_mult(&self, idx: usize) -> f64 {
-        let Some(target) = FINGERERS.get(idx) else {
-            return 1.0;
-        };
-        let mut m = 1.0;
-        for u in UPGRADES.iter() {
-            if !self.has_upgrade(u.id) {
-                continue;
-            }
-            match u.effect {
-                UpgradeEffect::FingererMult(id, f) if id == target.id => m *= f,
-                UpgradeEffect::AllFingerersMult(f) => m *= f,
-                _ => {}
-            }
-        }
-        // Per-fingerer Buff golden contributions used to live here as
-        // `Buff::FingererBoost`. They now flow through the modifier
-        // aggregate (see `fingerer_aggregate`), keeping `fingerer_mult`
-        // strictly about upgrades.
-        m
     }
 
     fn add_cuques(&mut self, amount: f64) {
@@ -879,7 +922,13 @@ impl GameState {
             PowerupKind::Lucky => {
                 self.lucky_caught += 1;
                 let fps = self.fps();
-                let r = (fps * GOLDEN_REWARD_SECONDS).max(GOLDEN_REWARD_FLAT);
+                let reward_mul = self
+                    .tree_aggregate
+                    .powerup_reward_mul
+                    .get(PowerupKind::Lucky as usize)
+                    .copied()
+                    .unwrap_or(1.0);
+                let r = ((fps * GOLDEN_REWARD_SECONDS).max(GOLDEN_REWARD_FLAT)) * reward_mul;
                 self.add_cuques(r);
                 self.lucky_flash_ticks = LUCKY_FLASH_TICKS;
                 self.cuques_flash_ticks = HUD_FLASH_TICKS;
@@ -887,7 +936,13 @@ impl GameState {
             }
             PowerupKind::Frenzy => {
                 self.frenzy_caught += 1;
-                let dur = TICK_HZ * 13;
+                let duration_mul = self
+                    .tree_aggregate
+                    .powerup_duration_mul
+                    .get(PowerupKind::Frenzy as usize)
+                    .copied()
+                    .unwrap_or(1.0);
+                let dur = ((TICK_HZ * 13) as f64 * duration_mul).round() as u32;
                 // `mult: 777.0` is a legacy field — `click_power()` no
                 // longer reads it. The per-click Frenzy bonus is FPS-
                 // scaled via `FRENZY_FPS_SECONDS_PER_CLICK` /
@@ -902,10 +957,22 @@ impl GameState {
             }
             PowerupKind::Buff => {
                 self.buff_caught += 1;
-                let dur = TICK_HZ * 60;
+                let duration_mul = self
+                    .tree_aggregate
+                    .powerup_duration_mul
+                    .get(PowerupKind::Buff as usize)
+                    .copied()
+                    .unwrap_or(1.0);
+                let reward_mul = self
+                    .tree_aggregate
+                    .powerup_reward_mul
+                    .get(PowerupKind::Buff as usize)
+                    .copied()
+                    .unwrap_or(1.0);
+                let dur = ((TICK_HZ * 60) as f64 * duration_mul).round() as u32;
                 let m = Modifier {
                     source: ModifierSource::PurpleCoin,
-                    effects: vec![ModifierEffect::MulFactor(7.0)],
+                    effects: vec![ModifierEffect::MulFactor(7.0 * reward_mul)],
                     duration: ModifierDuration::Ticks(dur),
                     created_at_tick: self.total_play_ticks,
                 };
@@ -922,9 +989,10 @@ impl GameState {
             PowerupKind::GreenCoin => {
                 self.green_coin_caught += 1;
                 self.green_coin_flash_ticks = GREEN_COIN_FLASH_TICKS;
+                let strength = GREEN_COIN_ADD_PERCENT * self.tree_aggregate.green_coin_strength_mul;
                 let m = Modifier {
                     source: ModifierSource::GreenCoin,
-                    effects: vec![ModifierEffect::AddPercent(GREEN_COIN_ADD_PERCENT)],
+                    effects: vec![ModifierEffect::AddPercent(strength)],
                     duration: ModifierDuration::Permanent,
                     created_at_tick: self.total_play_ticks,
                 };
@@ -980,18 +1048,24 @@ impl GameState {
 
     pub fn fps(&self) -> f64 {
         // Per-fingerer formula:
-        //   pre  = (base * count + flat_fps) * upgrades_mult
-        //   post = pre * (1 + add_percent) * mul_factor
-        // Reads use the cached aggregate — never iterate the modifiers Vec.
+        //   flat_total = modifier.flat + tree.per_fingerer.flat + tree.all_fingerers.flat
+        //   add_total  = modifier.add  + tree.per_fingerer.add  + tree.all_fingerers.add
+        //   mul_total  = modifier.mul  * tree.per_fingerer.mul  * tree.all_fingerers.mul
+        //   pre  = base * count + flat_total
+        //   post = pre * (1 + add_total) * mul_total
+        // Both aggregates are pre-folded caches — O(1) reads per fingerer.
         let base: f64 = FINGERERS
             .iter()
             .enumerate()
             .map(|(i, k)| {
                 let count = self.fingerer_count(k.id) as f64;
-                let upgrades_mult = self.fingerer_mult(i);
-                let agg = self.fingerer_aggregate(k.id);
-                let pre = (k.fps_per_unit * count + agg.flat_fps) * upgrades_mult;
-                pre * (1.0 + agg.add_percent) * agg.mul_factor
+                let mod_agg = self.fingerer_aggregate(k.id);
+                let tree = self.tree_aggregate.effective_for_fingerer(i);
+                let flat_total = mod_agg.flat_fps + tree.flat_fps;
+                let add_total = mod_agg.add_percent + tree.add_percent;
+                let mul_total = mod_agg.mul_factor * tree.mul_factor;
+                let pre = k.fps_per_unit * count + flat_total;
+                pre * (1.0 + add_total) * mul_total
             })
             .sum();
         base * self.prestige_mult()
@@ -1037,11 +1111,27 @@ impl GameState {
     }
 
     pub fn prestige_mult(&self) -> f64 {
-        1.0 + 0.01 * self.prestige as f64
+        let base = 1.0 + 0.01 * self.prestige as f64;
+        let t = &self.tree_aggregate;
+        (base + t.prestige_add) * t.prestige_mul
     }
 
     pub fn prestige_earned_total(&self) -> u64 {
-        (self.lifetime_cuques / 1_000_000.0).sqrt().floor() as u64
+        // Guard the only failure modes the math actually has: NaN /
+        // INFINITY from a corrupted `lifetime_cuques`, and negative
+        // values that have no business in a lifetime counter. Past
+        // that, trust the player's number — long-haul legit play can
+        // reach surprisingly high paper counts, and capping the result
+        // would silently truncate their earned progression. The f64-
+        // to-u64 saturation cast only kicks in around `raw > u64::MAX
+        // ≈ 1.8e19` which corresponds to `lifetime_cuques > ~3e44` —
+        // unreachable through any non-corrupted save state.
+        let raw = (self.lifetime_cuques / 1_000_000.0).sqrt().floor();
+        if !raw.is_finite() || raw < 0.0 {
+            0
+        } else {
+            raw as u64
+        }
     }
 
     pub fn prestige_available(&self) -> u64 {
@@ -1063,7 +1153,19 @@ impl GameState {
         // Wipe count AND modifiers — prestige resets the run, which is the
         // whole point. Permanent Green Coin boosts do not survive a prestige.
         self.fingerers_state.clear();
-        self.upgrades_earned.clear();
+        // Tree is also a run-state — prestige resets it fully. Bought set
+        // empties; aggregate snaps back to identity.
+        self.tree.bought.clear();
+        // Re-seed the anchor so the player's frontier exists on the
+        // very next tick of the post-prestige run.
+        self.tree.bought.insert(TreeCoord::ORIGIN);
+        self.tree.cursor = TreeCoord::ORIGIN;
+        self.tree.last_bought = None;
+        self.tree_aggregate.reset();
+        self.tree_buy_flash.clear();
+        self.tree_unlock_flash.clear();
+        self.tree_refund_flash.clear();
+        self.tree_edge_anims.clear();
         self.buffs.clear();
         self.visual_debt = 0.0;
         self.particles.clear();
@@ -1117,23 +1219,110 @@ impl GameState {
         for t in self.fingerer_flash_ticks.iter_mut() {
             *t = t.saturating_sub(1);
         }
-        for t in self.upgrade_flash_ticks.iter_mut() {
-            *t = t.saturating_sub(1);
-        }
         for t in self.fingerer_unaffordable_flash.iter_mut() {
-            *t = t.saturating_sub(1);
-        }
-        for t in self.upgrade_unaffordable_flash.iter_mut() {
             *t = t.saturating_sub(1);
         }
         for t in self.fingerer_unlock_flash.iter_mut() {
             *t = t.saturating_sub(1);
         }
-        for t in self.upgrade_unlock_flash.iter_mut() {
-            *t = t.saturating_sub(1);
-        }
         for t in self.fingerer_green_coin_flash.iter_mut() {
             *t = t.saturating_sub(1);
+        }
+        // Tree-node flash maps. Saturating-sub then drop zeros — keeps
+        // the maps from growing unboundedly over a long session.
+        self.tree_buy_flash.retain(|_, t| {
+            *t = t.saturating_sub(1);
+            *t > 0
+        });
+        self.tree_unlock_flash.retain(|_, t| {
+            *t = t.saturating_sub(1);
+            *t > 0
+        });
+        self.tree_refund_flash.retain(|_, t| {
+            *t = t.saturating_sub(1);
+            *t > 0
+        });
+        // Edge-unlock anims: tick each one's wavefront forward. When the
+        // head reaches the path length, the anim is done — drop it and
+        // fire the destination box's unlock_flash so the player gets the
+        // familiar gold pulse to punctuate arrival.
+        let mut just_unlocked: Vec<TreeCoord> = Vec::new();
+        // Prune anims whose path geometry went stale BEFORE bumping ticks,
+        // so a now-invalid anim doesn't linger one extra tick gating the
+        // destination as `tree_unlock_pending`.
+        self.tree_edge_anims
+            .retain(|a| !node::edge_path_cells(a.from, a.to).is_empty());
+        for anim in &mut self.tree_edge_anims {
+            anim.ticks = anim.ticks.saturating_add(1);
+        }
+        self.tree_edge_anims.retain(|a| {
+            let path = node::edge_path_cells(a.from, a.to);
+            if path.is_empty() {
+                return false;
+            }
+            // `edge_path_cells` returns the canonical lo→hi-ordered path;
+            // figure out which end of it is the anim's source (anim.from)
+            // and count the leading-inside-source / trailing-inside-dest
+            // cells against THIS path. Wave is done when the visible
+            // advance has crossed the visible-cell stretch between the
+            // two box silhouettes.
+            let from_at_start = (a.from.x, a.from.y) <= (a.to.x, a.to.y);
+            let Some(from_spec) = node::node_at(a.from.x, a.from.y) else {
+                return false;
+            };
+            let Some(to_spec) = node::node_at(a.to.x, a.to.y) else {
+                return false;
+            };
+            let (source_leading, dest_trailing) = if from_at_start {
+                (
+                    count_leading_in_rect(
+                        &path,
+                        from_spec.box_x,
+                        from_spec.box_y,
+                        from_spec.box_w,
+                        from_spec.box_h,
+                    ),
+                    count_trailing_in_rect(
+                        &path,
+                        to_spec.box_x,
+                        to_spec.box_y,
+                        to_spec.box_w,
+                        to_spec.box_h,
+                    ),
+                )
+            } else {
+                (
+                    count_trailing_in_rect(
+                        &path,
+                        from_spec.box_x,
+                        from_spec.box_y,
+                        from_spec.box_w,
+                        from_spec.box_h,
+                    ),
+                    count_leading_in_rect(
+                        &path,
+                        to_spec.box_x,
+                        to_spec.box_y,
+                        to_spec.box_w,
+                        to_spec.box_h,
+                    ),
+                )
+            };
+            let visible_len = path
+                .len()
+                .saturating_sub(source_leading)
+                .saturating_sub(dest_trailing);
+            if a.visible_advance() >= visible_len {
+                if a.gates_destination {
+                    just_unlocked.push(a.to);
+                }
+                false
+            } else {
+                true
+            }
+        });
+        for to in just_unlocked {
+            self.tree_unlock_flash.insert(to, UNLOCK_FLASH_TICKS);
         }
         // Held-spacebar streak with a small grace window. Real key-repeat
         // is bursty (~30Hz nominal but with OS-level jitter), so a strict
@@ -1184,13 +1373,9 @@ impl GameState {
         // K7: edge-detect false→true affordability flips and fire a brief
         // unlock flash on the row. Detection runs AFTER `add_cuques(gained)`
         // so an income-driven crossover lights up immediately. Two-pass to
-        // keep the immutable reads (`can_buy`, `req.met`, etc.) cleanly
-        // separated from the mutable writes to the flash + prev vecs.
+        // keep the immutable reads (`can_buy`) cleanly separated from the
+        // mutable writes to the flash + prev vecs.
         let fingerer_now: Vec<bool> = (0..fingerer::count()).map(|i| self.can_buy(i)).collect();
-        let upgrade_now: Vec<bool> = UPGRADES
-            .iter()
-            .map(|u| !self.has_upgrade(u.id) && u.req.met(self) && self.cuques >= u.cost)
-            .collect();
         for (i, &now) in fingerer_now.iter().enumerate() {
             let was = self
                 .prev_fingerer_affordable
@@ -1204,22 +1389,6 @@ impl GameState {
                 *slot = UNLOCK_FLASH_TICKS;
             }
             if let Some(slot) = self.prev_fingerer_affordable.get_mut(i) {
-                *slot = now;
-            }
-        }
-        for (i, &now) in upgrade_now.iter().enumerate() {
-            let was = self
-                .prev_upgrade_affordable
-                .get(i)
-                .copied()
-                .unwrap_or(false);
-            if now
-                && !was
-                && let Some(slot) = self.upgrade_unlock_flash.get_mut(i)
-            {
-                *slot = UNLOCK_FLASH_TICKS;
-            }
-            if let Some(slot) = self.prev_upgrade_affordable.get_mut(i) {
                 *slot = now;
             }
         }
@@ -1342,12 +1511,16 @@ impl GameState {
         // Floor the result so the cost ALWAYS equals what `format::big`
         // shows the player. The price formula scales by 1.15× per owned
         // unit and produces fractional cuques (e.g. 15 × 1.15⁶ = 34.69).
-        // Without flooring, the HUD says "Cuques: 34, cost 34" but the
-        // affordability check `cuques >= 34.69` rejects — the player sees
-        // a lie. Floor here keeps display, gate, and spend consistent at
-        // the integer grain the player actually sees.
+        // Tree cost-mul (procgen `CostMul` primitives) folds in here so
+        // discounts/inflation behave the same for display, gate, and spend.
         let raw = k.base_cost * k.cost_scale.powi(self.fingerer_count_idx(idx) as i32);
-        raw.floor()
+        let cost_mul = self
+            .tree_aggregate
+            .per_fingerer
+            .get(idx)
+            .map(|c| c.cost_mul)
+            .unwrap_or(1.0);
+        (raw * cost_mul).floor().max(1.0)
     }
 
     /// Cuques the player can ACTUALLY spend right now: the lesser of real
@@ -1402,7 +1575,7 @@ impl GameState {
     /// Apply purchase flash + per-row green flash, then optionally pop
     /// confetti. Called once per public buy action with the total bought
     /// count, so the loud bulk-buy feedback only fires once.
-    fn flash_purchase(&mut self, idx: usize, bought: u32, slot_table: PurchaseSlot) {
+    fn flash_purchase_fingerer(&mut self, idx: usize, bought: u32) {
         if bought == 0 {
             return;
         }
@@ -1410,17 +1583,8 @@ impl GameState {
         // a max-buy is dramatic but doesn't blow the eardrums.
         let strength = (1.0 + ((bought as f32) / 10.0).sqrt()).clamp(1.0, 3.0);
         self.trigger_purchase_flash(strength);
-        match slot_table {
-            PurchaseSlot::Fingerer => {
-                if let Some(slot) = self.fingerer_flash_ticks.get_mut(idx) {
-                    *slot = PURCHASE_FLASH_TICKS;
-                }
-            }
-            PurchaseSlot::Upgrade => {
-                if let Some(slot) = self.upgrade_flash_ticks.get_mut(idx) {
-                    *slot = PURCHASE_FLASH_TICKS;
-                }
-            }
+        if let Some(slot) = self.fingerer_flash_ticks.get_mut(idx) {
+            *slot = PURCHASE_FLASH_TICKS;
         }
         // A buy is a SPEND — it always fires the red HUD flash so the
         // counter dropping is visibly acknowledged. Earlier this slot
@@ -1439,15 +1603,9 @@ impl GameState {
         }
     }
 
-    fn flash_unaffordable_upgrade(&mut self, idx: usize) {
-        if let Some(slot) = self.upgrade_unaffordable_flash.get_mut(idx) {
-            *slot = PURCHASE_FLASH_TICKS / 2;
-        }
-    }
-
     pub fn buy(&mut self, idx: usize) -> bool {
         if self.buy_one_quiet(idx) {
-            self.flash_purchase(idx, 1, PurchaseSlot::Fingerer);
+            self.flash_purchase_fingerer(idx, 1);
             true
         } else {
             self.flash_unaffordable_fingerer(idx);
@@ -1466,7 +1624,7 @@ impl GameState {
         if bought == 0 {
             self.flash_unaffordable_fingerer(idx);
         } else {
-            self.flash_purchase(idx, bought, PurchaseSlot::Fingerer);
+            self.flash_purchase_fingerer(idx, bought);
         }
         bought
     }
@@ -1479,35 +1637,203 @@ impl GameState {
         if bought == 0 {
             self.flash_unaffordable_fingerer(idx);
         } else {
-            self.flash_purchase(idx, bought, PurchaseSlot::Fingerer);
+            self.flash_purchase_fingerer(idx, bought);
         }
         bought
     }
 
-    pub fn buy_upgrade(&mut self, idx: usize) -> bool {
-        let Some(u) = UPGRADES.get(idx) else {
+    // -- Tree purchase / refund --------------------------------------------
+
+    /// True iff `lot` is reachable from the player's owned set: either it
+    /// already neighbors an owned node, or `lot` is the origin (the
+    /// player's starting position, always reachable). Used as the
+    /// "prereq met" gate alongside cost affordability.
+    pub fn tree_reachable(&self, lot: TreeCoord) -> bool {
+        if lot == TreeCoord::ORIGIN {
+            return true;
+        }
+        for n in node::neighbors_of(lot) {
+            if self.tree.bought.contains(&n) && node::edge_exists(lot, n) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// True while `lot` has at least one in-flight edge-unlock animation
+    /// converging on it — i.e. a wavefront is still walking the connecting
+    /// path. The render and buy paths gate "is this lot reachable yet?"
+    /// through this so the player can't click through a node before its
+    /// path finishes lighting up.
+    pub fn tree_unlock_pending(&self, lot: TreeCoord) -> bool {
+        self.tree_edge_anims
+            .iter()
+            .any(|a| a.to == lot && a.gates_destination)
+    }
+
+    /// True iff the player can buy the node at `lot` right now: it exists,
+    /// isn't already owned, is reachable, and they can afford it.
+    pub fn can_buy_tree_node(&self, lot: TreeCoord) -> bool {
+        if self.tree.bought.contains(&lot) {
+            return false;
+        }
+        let Some(node) = node::node_at(lot.x, lot.y) else {
             return false;
         };
-        if self.has_upgrade(u.id) {
+        if !self.tree_reachable(lot) {
             return false;
         }
-        // Same min(real, displayed) gate as fingerer buys — see
-        // `affordable_cuques` for why both bounds matter.
-        if !u.req.met(self) || self.affordable_cuques() < u.cost {
-            self.flash_unaffordable_upgrade(idx);
+        if self.tree_unlock_pending(lot) {
             return false;
         }
-        self.cuques -= u.cost;
-        self.upgrades_earned.insert(u.id.to_string());
-        self.flash_purchase(idx, 1, PurchaseSlot::Upgrade);
+        self.affordable_cuques() >= node.cost
+    }
+
+    /// Buy the node at `lot`. Returns the bought `NodeSpec` on success, or
+    /// `None` on any rejection (no node, already owned, not reachable, or
+    /// not affordable). Subtracts cost, marks owned, folds the node's
+    /// primitives into `tree_aggregate`.
+    pub fn buy_tree_node(&mut self, lot: TreeCoord) -> Option<NodeSpec> {
+        let node = node::node_at(lot.x, lot.y)?;
+        if self.tree.bought.contains(&lot) {
+            return None;
+        }
+        if !self.tree_reachable(lot) {
+            return None;
+        }
+        // Reject while the lot still has an in-flight wavefront — the
+        // player must wait for the path to finish energizing before they
+        // can buy the destination.
+        if self.tree_unlock_pending(lot) {
+            return None;
+        }
+        if self.affordable_cuques() < node.cost {
+            return None;
+        }
+        // Snapshot reachability of neighbors BEFORE marking the lot owned,
+        // so post-buy we can flash only the lots that flipped false→true
+        // on this buy (vs. ones that already had another owned pathway).
+        let neighbors = node::neighbors_of(lot);
+        let was_reachable: [bool; 8] = std::array::from_fn(|i| self.tree_reachable(neighbors[i]));
+
+        self.cuques -= node.cost;
+        self.tree.bought.insert(lot);
+        self.tree.last_bought = Some(lot);
+        self.tree_aggregate.fold_in_node(&node);
+        self.trigger_purchase_flash(1.5);
+        self.cuques_spend_flash_ticks = HUD_FLASH_TICKS;
+        self.tree_buy_flash.insert(lot, PURCHASE_FLASH_TICKS);
+
+        // Animate the edge from this lot to EVERY procedural neighbor
+        // that isn't already owned — `gates_destination` distinguishes
+        // newly-reachable neighbors (which gate purchase + fire the
+        // gold unlock_flash on completion) from already-reachable ones
+        // (which just get the decorative wire-up animation).
+        for (i, n) in neighbors.into_iter().enumerate() {
+            if self.tree.bought.contains(&n) {
+                continue;
+            }
+            if node::node_at(n.x, n.y).is_none() {
+                continue;
+            }
+            if !node::edge_exists(lot, n) {
+                continue;
+            }
+            self.tree_edge_anims.push(EdgeUnlockAnim {
+                from: lot,
+                to: n,
+                ticks: 0,
+                gates_destination: !was_reachable[i],
+            });
+        }
+        Some(node)
+    }
+
+    /// True iff refunding `lot` would not orphan any other owned node from
+    /// the origin. A node is orphaned if it can no longer reach the origin
+    /// via owned king-neighbors with existing edges.
+    pub fn can_refund_tree_node(&self, lot: TreeCoord) -> bool {
+        if !self.tree.bought.contains(&lot) {
+            return false;
+        }
+        // Origin itself cannot be refunded — it's the anchor.
+        if lot == TreeCoord::ORIGIN {
+            return false;
+        }
+        // BFS from origin through owned ∖ {lot}; if every other owned node
+        // is reachable, the refund is safe.
+        if self.tree.bought.len() <= 1 {
+            return true;
+        }
+        let mut seen: HashSet<TreeCoord> = HashSet::new();
+        let mut stack: Vec<TreeCoord> = vec![TreeCoord::ORIGIN];
+        seen.insert(TreeCoord::ORIGIN);
+        while let Some(c) = stack.pop() {
+            for n in node::neighbors_of(c) {
+                if n == lot {
+                    continue;
+                }
+                if !self.tree.bought.contains(&n) {
+                    continue;
+                }
+                if seen.contains(&n) {
+                    continue;
+                }
+                if !node::edge_exists(c, n) {
+                    continue;
+                }
+                seen.insert(n);
+                stack.push(n);
+            }
+        }
+        // We need every owned-node-except-lot to be reachable.
+        for owned in &self.tree.bought {
+            if *owned == lot {
+                continue;
+            }
+            if !seen.contains(owned) {
+                return false;
+            }
+        }
         true
     }
-}
 
-#[derive(Clone, Copy)]
-enum PurchaseSlot {
-    Fingerer,
-    Upgrade,
+    /// Refund the node at `lot`. Returns the amount of cuques returned on
+    /// success, or 0.0 on rejection. Refund returns
+    /// `cost * TREE_REFUND_FRACTION` — the remaining fraction is the
+    /// exploration tax (see the constant for rationale). Connectivity
+    /// guard: rejects if it would orphan any other owned node.
+    pub fn refund_tree_node(&mut self, lot: TreeCoord) -> f64 {
+        if !self.can_refund_tree_node(lot) {
+            return 0.0;
+        }
+        let Some(node) = node::node_at(lot.x, lot.y) else {
+            // Ghost lot in `bought` (e.g. survived a procgen change that
+            // moved its spec to `None`). Clean it out of the set so the
+            // user doesn't end up with stuck phantom-owned entries, and
+            // pay no cuques back since we can't compute the refund.
+            self.tree.bought.remove(&lot);
+            if self.tree.last_bought == Some(lot) {
+                self.tree.last_bought = None;
+            }
+            return 0.0;
+        };
+        self.tree.bought.remove(&lot);
+        if self.tree.last_bought == Some(lot) {
+            self.tree.last_bought = None;
+        }
+        self.tree_aggregate.fold_out_node(&node);
+        let refunded = (node.cost * TREE_REFUND_FRACTION).floor();
+        self.cuques += refunded;
+        // Red pulse on the now-unowned lot. The lot still renders (as an
+        // unowned reachable/dotted box depending on connectivity), so the
+        // flash decays visibly there.
+        self.tree_refund_flash.insert(lot, PURCHASE_FLASH_TICKS);
+        // Same green-flash channel as a powerup catch — cuques are flowing
+        // back to the player.
+        self.cuques_flash_ticks = HUD_FLASH_TICKS;
+        refunded
+    }
 }
 
 #[cfg(test)]
@@ -1524,19 +1850,19 @@ mod tests {
 
     #[test]
     fn migrate_is_idempotent_on_current_shape() {
-        let state = GameState {
+        let mut state = GameState {
             fingerers_state: [("index_finger".to_string(), fs_with_count(9))]
                 .into_iter()
                 .collect(),
-            upgrades_earned: ["click_mult_1".to_string()].into_iter().collect(),
             achievements_earned: ["first_finger".to_string()].into_iter().collect(),
             ..GameState::default()
         };
+        state.tree.bought.insert(TreeCoord::ORIGIN);
 
         let m = state.migrate_runtime();
 
         assert_eq!(m.fingerer_count("index_finger"), 9);
-        assert!(m.has_upgrade("click_mult_1"));
+        assert!(m.tree.bought.contains(&TreeCoord::ORIGIN));
         assert!(m.has_achievement("first_finger"));
     }
 
@@ -1556,23 +1882,22 @@ mod tests {
 
         assert_eq!(m.fingerer_count("giga_finger_from_the_future"), 42);
         assert_eq!(m.fingerer_count("index_finger"), 0);
-        assert!(!m.has_upgrade("click_mult_1"));
     }
 
     #[test]
     fn save_roundtrip_is_stable_through_json() {
         // Serialize → deserialize → get the same state back. Catches any
         // accidental rename that would make saves non-idempotent.
-        let state = GameState {
+        let mut state = GameState {
             cuques: 1234.5,
             total_clicks: 99,
             fingerers_state: [("index_finger".to_string(), fs_with_count(7))]
                 .into_iter()
                 .collect(),
-            upgrades_earned: ["click_mult_1".to_string()].into_iter().collect(),
             achievements_earned: ["first_finger".to_string()].into_iter().collect(),
             ..GameState::default()
         };
+        state.tree.bought.insert(TreeCoord::new(2, -1));
 
         let json = serde_json::to_string(&state).expect("serialize");
         let roundtripped: GameState = serde_json::from_str(&json).expect("deserialize");
@@ -1581,7 +1906,7 @@ mod tests {
         assert_eq!(m.cuques, 1234.5);
         assert_eq!(m.total_clicks, 99);
         assert_eq!(m.fingerer_count("index_finger"), 7);
-        assert!(m.has_upgrade("click_mult_1"));
+        assert!(m.tree.bought.contains(&TreeCoord::new(2, -1)));
         assert!(m.has_achievement("first_finger"));
     }
 
@@ -1700,15 +2025,82 @@ mod tests {
     }
 
     #[test]
-    fn buy_upgrade_when_broke_sets_unaffordable_flash() {
-        let mut s = GameState::default();
-        // Pick the cheapest upgrade and try to buy with no money.
-        let cheapest_idx = (0..UPGRADES.len())
-            .min_by(|&a, &b| UPGRADES[a].cost.partial_cmp(&UPGRADES[b].cost).unwrap())
-            .unwrap();
-        let bought = s.buy_upgrade(cheapest_idx);
-        assert!(!bought);
-        assert!(s.upgrade_unaffordable_flash[cheapest_idx] > 0);
+    fn origin_is_auto_owned_on_default() {
+        // The (0, 0) lot is the cuque-anchor — auto-owned at startup so
+        // the player's king-neighbor frontier exists from frame 1. Buying
+        // it is a no-op (no cost, no primitives), refunding it is rejected.
+        let s = GameState::default();
+        assert!(s.tree.bought.contains(&TreeCoord::ORIGIN));
+        let spec = node::node_at(0, 0).expect("anchor always exists");
+        assert!(spec.is_anchor);
+        assert!(spec.primitives.is_empty());
+        assert_eq!(spec.cost, 0.0);
+    }
+
+    #[test]
+    fn buy_tree_node_at_origin_is_noop() {
+        // Origin is auto-owned in Default, so any attempt to buy it
+        // returns None ("already owned"). Cuques aren't spent.
+        let mut s = GameState {
+            cuques: 1_000_000.0,
+            displayed_cuques: 1_000_000.0,
+            ..Default::default()
+        };
+        let pre = s.cuques;
+        let bought = s.buy_tree_node(TreeCoord::ORIGIN);
+        assert!(bought.is_none(), "origin already owned — buy returns None");
+        assert!(s.tree.bought.contains(&TreeCoord::ORIGIN));
+        assert_eq!(s.cuques, pre, "no cuques spent on a no-op buy");
+    }
+
+    #[test]
+    fn refund_origin_is_rejected() {
+        // Origin is the anchor — non-refundable regardless of state.
+        let mut s = GameState {
+            cuques: 1_000_000.0,
+            displayed_cuques: 1_000_000.0,
+            ..Default::default()
+        };
+        let pre = s.cuques;
+        assert_eq!(s.refund_tree_node(TreeCoord::ORIGIN), 0.0);
+        assert!(s.tree.bought.contains(&TreeCoord::ORIGIN));
+        assert_eq!(s.cuques, pre, "no cuques returned on a refund-rejection");
+    }
+
+    #[test]
+    fn refund_returns_only_a_fraction_of_cost() {
+        // The exploration tax means buy + refund is a net loss. Without
+        // this, the player could spam every node combination for free.
+        let mut s = GameState {
+            cuques: 1_000_000.0,
+            displayed_cuques: 1_000_000.0,
+            ..Default::default()
+        };
+        let pre = s.cuques;
+        // Origin is already auto-owned; pick a reachable king-neighbor of
+        // origin to buy + refund. The procgen anchor-edge rule guarantees
+        // every neighbor has an edge to origin, so at least one neighbor
+        // is reachable.
+        let neighbor = node::neighbors_of(TreeCoord::ORIGIN)
+            .into_iter()
+            .find(|n| node::node_at(n.x, n.y).is_some() && node::edge_exists(TreeCoord::ORIGIN, *n))
+            .expect("at least one reachable neighbor in the procgen");
+        let n_node = s
+            .buy_tree_node(neighbor)
+            .expect("affordable with 1M cuques");
+        let after_buy = s.cuques;
+        assert!((after_buy - (pre - n_node.cost)).abs() < 1e-6);
+
+        // Refund: gets back fraction * cost, loses (1 - fraction) * cost.
+        let refunded = s.refund_tree_node(neighbor);
+        let expected = (n_node.cost * TREE_REFUND_FRACTION).floor();
+        assert!((refunded - expected).abs() < 1e-6);
+        let after_refund = s.cuques;
+        assert!(after_refund > after_buy);
+        assert!(
+            after_refund < pre,
+            "refund must NOT restore full state — exploration tax must show up as a net loss"
+        );
     }
 
     #[test]
@@ -1721,14 +2113,10 @@ mod tests {
         let mut s: GameState = serde_json::from_str(&json).unwrap();
         // Simulate stale shape: drop the per-catalog vecs.
         s.fingerer_flash_ticks.clear();
-        s.upgrade_flash_ticks.clear();
         s.fingerer_unaffordable_flash.clear();
-        s.upgrade_unaffordable_flash.clear();
         let m = s.migrate_runtime();
         assert_eq!(m.fingerer_flash_ticks.len(), fingerer::count());
-        assert_eq!(m.upgrade_flash_ticks.len(), UPGRADES.len());
         assert_eq!(m.fingerer_unaffordable_flash.len(), fingerer::count());
-        assert_eq!(m.upgrade_unaffordable_flash.len(), UPGRADES.len());
     }
 
     #[test]

@@ -20,7 +20,7 @@ use crate::game::state::GameState;
 
 /// The version number every fresh save is written as. Bump in lockstep
 /// with adding a new `versions/vN.rs` and routing it in [`load_from_str`].
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 4;
 
 /// Best-effort load from a JSON string. Falls back to a default state if
 /// the input is malformed at any layer of the chain. The result is always
@@ -33,19 +33,27 @@ pub const CURRENT_VERSION: u32 = 3;
 pub fn load_from_str(json: &str) -> GameState {
     match migrate::peek_version(json) {
         1 => match serde_json::from_str::<versions::v1::GameStateV1>(json) {
-            Ok(v1) => versions::v3::GameStateV3::from(versions::v2::GameStateV2::from(v1))
-                .into_current()
-                .migrate_runtime(),
+            Ok(v1) => versions::v4::GameStateV4::from(versions::v3::GameStateV3::from(
+                versions::v2::GameStateV2::from(v1),
+            ))
+            .into_current()
+            .migrate_runtime(),
             Err(_) => GameState::default().migrate_runtime(),
         },
         2 => match serde_json::from_str::<versions::v2::GameStateV2>(json) {
-            Ok(v2) => versions::v3::GameStateV3::from(v2)
+            Ok(v2) => versions::v4::GameStateV4::from(versions::v3::GameStateV3::from(v2))
                 .into_current()
                 .migrate_runtime(),
             Err(_) => GameState::default().migrate_runtime(),
         },
         3 => match serde_json::from_str::<versions::v3::GameStateV3>(json) {
-            Ok(v3) => v3.into_current().migrate_runtime(),
+            Ok(v3) => versions::v4::GameStateV4::from(v3)
+                .into_current()
+                .migrate_runtime(),
+            Err(_) => GameState::default().migrate_runtime(),
+        },
+        4 => match serde_json::from_str::<versions::v4::GameStateV4>(json) {
+            Ok(v4) => v4.into_current().migrate_runtime(),
             Err(_) => GameState::default().migrate_runtime(),
         },
         _ => GameState::default().migrate_runtime(),
@@ -56,8 +64,26 @@ pub fn load_from_str(json: &str) -> GameState {
 /// is whatever the caller has on `state` — `GameState::default()` and the
 /// migration chain both stamp [`CURRENT_VERSION`], so the only way to write
 /// a wrong version is to mutate `state.version` by hand, which nothing does.
+///
+/// Sanitizes non-finite f64 fields (NaN / INFINITY) to 0.0 before
+/// serializing, since `serde_json` refuses to serialize non-finite f64
+/// and historically callers `let _ =`-swallowed the resulting Err — the
+/// player's progress would silently stop being written. Reaching a
+/// non-finite value normally is impossible, but a corrupted save loaded
+/// once can poison `cuques` / `lifetime_cuques` and we'd rather lose
+/// the corruption than lose subsequent saves.
 pub fn save_to_string(state: &GameState) -> serde_json::Result<String> {
-    serde_json::to_string_pretty(state)
+    let mut sanitized = state.clone();
+    if !sanitized.cuques.is_finite() {
+        sanitized.cuques = 0.0;
+    }
+    if !sanitized.lifetime_cuques.is_finite() {
+        sanitized.lifetime_cuques = 0.0;
+    }
+    if !sanitized.best_fps.is_finite() {
+        sanitized.best_fps = 0.0;
+    }
+    serde_json::to_string_pretty(&sanitized)
 }
 
 #[cfg(test)]
@@ -66,8 +92,9 @@ mod tests {
 
     #[test]
     fn pre_versioned_json_loads_through_v1() {
-        // A save written by main (no `version` field, today's shape) must
-        // load without losing data.
+        // A save written by main (no `version` field, V1 shape) must load
+        // without losing data. V4 silently drops `upgrades_earned` (the
+        // 1.0.0 breaking change), so we only assert the surviving fields.
         let legacy = r#"{
             "cuques": 1234.5,
             "total_clicks": 99,
@@ -86,8 +113,16 @@ mod tests {
         assert_eq!(s.cuques, 1234.5);
         assert_eq!(s.total_clicks, 99);
         assert_eq!(s.fingerer_count("index_finger"), 7);
-        assert!(s.has_upgrade("click_mult_1"));
         assert!(s.has_achievement("first_finger"));
+        // V3→V4 dropped the old upgrades_earned. The tree starts with
+        // the anchor (origin) auto-owned — `migrate_runtime` inserts it
+        // for any save that didn't have it.
+        assert_eq!(s.tree.bought.len(), 1);
+        assert!(
+            s.tree
+                .bought
+                .contains(&crate::game::tree::coord::TreeCoord::ORIGIN)
+        );
     }
 
     #[test]

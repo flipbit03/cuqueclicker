@@ -125,7 +125,9 @@ const BISCUIT_SMALL: &[&str] = &[
     r"     `-,,_________,,-'    ",
 ];
 
-const BISCUIT_TINY: &[&str] = &[
+/// 16 cols × 8 rows. Borrowed by the tree-modal anchor (the (0, 0) lot)
+/// to render the cuque-as-anchor instead of a regular upgrade box.
+pub(crate) const BISCUIT_TINY: &[&str] = &[
     r"     ______     ",
     r"   ,~      ~,   ",
     r"  /          \  ",
@@ -135,6 +137,10 @@ const BISCUIT_TINY: &[&str] = &[
     r"  \          /  ",
     r"   `-,____,-'   ",
 ];
+/// Focal cell ("the asshole") of `BISCUIT_TINY`, expressed in art-local
+/// (col, row) coords. Anchor render in the tree modal paints an `O` at
+/// this cell so it reads as a cuque, not just an outline.
+pub(crate) const BISCUIT_TINY_FOCAL: (u16, u16) = (7, 4);
 
 /// One zoom level. `(asshole_col, asshole_row)` are the exact in-art
 /// coordinates of the focal cell — declared at author time, never searched
