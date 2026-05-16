@@ -106,7 +106,7 @@ pub struct UiState {
     pub last_mouse_pos: Option<(u16, u16)>,
     pub tree_render: TreeRenderState,
     /// True after the player invoked the prestige-reset trigger
-    /// (keyboard `[r]` or click on the "Press [r]..." line) but
+    /// (keyboard `[r]` or click on the `"Press [r]..."` line) but
     /// has not yet confirmed. While set, the Prestige panel shows
     /// a yes/no confirmation block instead of the bare hint, and the
     /// `[r]` / Yes-button paths run the actual reset. Cleared on

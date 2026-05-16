@@ -40,7 +40,7 @@ pub struct Lang {
     /// modal is open.
     pub help_tree: &'static str,
     /// Localized rarity tags shown in the info pane next to the focused
-    /// node's title (e.g. "[Small]" / "[Pequeno]").
+    /// node's title (e.g. `[Small]` / `[Pequeno]`).
     pub tree_rarity_small: &'static str,
     pub tree_rarity_notable: &'static str,
     pub tree_rarity_keystone: &'static str,
