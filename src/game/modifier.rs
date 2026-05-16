@@ -40,6 +40,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::bignum::Mag;
+
 /// Stable identifier for the *kind* of buff or debuff a modifier represents.
 /// Used for de-duping in the UI ("3× Green Coin" instead of three identical
 /// chips), for save serialization, and for future per-source rules.
@@ -71,6 +73,14 @@ impl ModifierSource {
 /// One contribution from a modifier. A single [`Modifier`] may carry
 /// multiple effects — e.g. a future debuff could combine
 /// `[FlatFps(-10.0), MulFactor(0.5)]`.
+///
+/// `MulFactor` carries a [`Mag`] (log-magnitude) so the catch-time
+/// product `7.0 × tree.powerup_reward_mul[Buff]` can grow truly
+/// unboundedly across late-game stacks without overflowing `f64`. The
+/// `Mag` (de)serializer accepts both raw JSON numbers (legacy V4 saves
+/// stored `"MulFactor": 7.0`) and the explicit `{"log10": …}` form (new
+/// huge values), so the change is wire-compatible — no save version
+/// bump.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub enum ModifierEffect {
     /// Flat additive contribution to the fingerer's per-tier output.
@@ -81,7 +91,7 @@ pub enum ModifierEffect {
     AddPercent(f64),
     /// Multiplicative factor. Multiplies across all modifiers on the
     /// fingerer (two x2 = x4). Applied after [`Self::AddPercent`].
-    MulFactor(f64),
+    MulFactor(Mag),
 }
 
 /// Lifetime of a modifier. Permanent modifiers stick for the rest of the
@@ -148,7 +158,7 @@ impl Modifier {
 pub struct FingererAggregate {
     pub flat_fps: f64,
     pub add_percent: f64,
-    pub mul_factor: f64,
+    pub mul_factor: Mag,
 }
 
 impl Default for FingererAggregate {
@@ -156,7 +166,7 @@ impl Default for FingererAggregate {
         Self {
             flat_fps: 0.0,
             add_percent: 0.0,
-            mul_factor: 1.0,
+            mul_factor: Mag::ONE,
         }
     }
 }
@@ -171,7 +181,7 @@ impl FingererAggregate {
                 match *e {
                     ModifierEffect::FlatFps(v) => a.flat_fps += v,
                     ModifierEffect::AddPercent(v) => a.add_percent += v,
-                    ModifierEffect::MulFactor(v) => a.mul_factor *= v,
+                    ModifierEffect::MulFactor(v) => a.mul_factor = a.mul_factor.mul(v),
                 }
             }
         }
@@ -192,17 +202,20 @@ mod tests {
         }
     }
 
+    fn mul(v: f64) -> ModifierEffect {
+        ModifierEffect::MulFactor(Mag::from_f64(v))
+    }
+
     #[test]
     fn empty_aggregate_is_identity() {
         let a = FingererAggregate::rebuild(&[]);
         assert_eq!(a.flat_fps, 0.0);
         assert_eq!(a.add_percent, 0.0);
-        assert_eq!(a.mul_factor, 1.0);
+        assert_eq!(a.mul_factor, Mag::ONE);
     }
 
     #[test]
     fn add_percent_sums_across_modifiers() {
-        // Two +10% Green Coins → +20%, NOT compounded into +21%.
         let mods = vec![
             perm(vec![ModifierEffect::AddPercent(0.10)]),
             perm(vec![ModifierEffect::AddPercent(0.10)]),
@@ -213,13 +226,9 @@ mod tests {
 
     #[test]
     fn mul_factor_multiplies_across_modifiers() {
-        // Two x2 buffs → x4.
-        let mods = vec![
-            perm(vec![ModifierEffect::MulFactor(2.0)]),
-            perm(vec![ModifierEffect::MulFactor(2.0)]),
-        ];
+        let mods = vec![perm(vec![mul(2.0)]), perm(vec![mul(2.0)])];
         let a = FingererAggregate::rebuild(&mods);
-        assert!((a.mul_factor - 4.0).abs() < 1e-9);
+        assert!((a.mul_factor.to_f64() - 4.0).abs() < 1e-9);
     }
 
     #[test]
@@ -237,12 +246,23 @@ mod tests {
         let mods = vec![perm(vec![
             ModifierEffect::FlatFps(50.0),
             ModifierEffect::AddPercent(0.10),
-            ModifierEffect::MulFactor(2.0),
+            mul(2.0),
         ])];
         let a = FingererAggregate::rebuild(&mods);
         assert!((a.flat_fps - 50.0).abs() < 1e-9);
         assert!((a.add_percent - 0.10).abs() < 1e-9);
-        assert!((a.mul_factor - 2.0).abs() < 1e-9);
+        assert!((a.mul_factor.to_f64() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mul_factor_stack_survives_billions() {
+        // Stack 10k MulFactor(1.5) modifiers — under the old f64 path
+        // this overflows to Infinity around the 1740th. With Mag it
+        // produces a precise log10 ≈ 1761 (= 10000 * log10(1.5)).
+        let mods: Vec<_> = (0..10_000).map(|_| perm(vec![mul(1.5)])).collect();
+        let a = FingererAggregate::rebuild(&mods);
+        let expected = (1.5_f64).log10() * 10_000.0;
+        assert!((a.mul_factor.log10 - expected).abs() < 1e-6);
     }
 
     #[test]

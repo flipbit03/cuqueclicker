@@ -9,6 +9,7 @@
 //! `InstanceLock` are re-exported with the same struct/method shape on
 //! both sides, so caller code outside `platform::` is portable.
 
+pub mod bignum;
 pub mod build_info;
 pub mod format;
 pub mod game;

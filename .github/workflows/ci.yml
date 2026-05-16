@@ -34,7 +34,11 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        # `--all-targets` so test-only code is linted too — without it,
+        # warnings inside `#[cfg(test)]` blocks slip past CI and only
+        # surface on developers' machines when they happen to run
+        # `cargo clippy --all-targets` locally.
+        run: cargo clippy --all-targets -- -D warnings
         env:
           RUSTFLAGS: -Dwarnings
 

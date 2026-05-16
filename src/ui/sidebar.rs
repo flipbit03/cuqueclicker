@@ -40,7 +40,13 @@ pub fn draw(
     let lang = t();
     let mut lines: Vec<Line> = Vec::new();
     let visible: Vec<usize> = (0..FINGERERS.len())
-        .filter(|&i| fingerer::visible(i, state.fingerer_count_idx(i), state.lifetime_cuques))
+        .filter(|&i| {
+            fingerer::visible(
+                i,
+                state.fingerer_count_idx(i),
+                state.lifetime_cuques.to_f64(),
+            )
+        })
         .collect();
 
     for (slot, &i) in visible.iter().enumerate() {
@@ -75,7 +81,10 @@ pub fn draw(
         ]));
         lines.push(Line::from(vec![
             Span::raw(format!("    {}: {}  ", lang.owned, owned)),
-            Span::styled(format!("{} {}", lang.cost, format::big(cost)), cost_style),
+            Span::styled(
+                format!("{} {}", lang.cost, format::big_mag(cost)),
+                cost_style,
+            ),
         ]));
         // Per-fingerer mul factor from the tree (folds in any
         // `AllFingerers` contributions). The badge mirrors what the FPS
@@ -83,9 +92,16 @@ pub fn draw(
         // here that drives their income.
         let tree_contrib = state.tree_aggregate.effective_for_fingerer(i);
         let mult = tree_contrib.mul_factor;
-        let effective = k.fps_per_unit * mult;
-        let mult_tag = if mult > 1.0001 {
-            format!(" (x{:.1})", mult)
+        // For the per-row badge we want the multiplier as an f64 — the
+        // display threshold "show the badge once mult > 1.0001" makes
+        // sense in linear space and is bounded by the per-node tree
+        // caps. Pull through `to_f64`; the boundary clamp is a non-issue
+        // since the badge only renders when the value is small enough
+        // to read anyway.
+        let mult_f = mult.to_f64();
+        let effective = k.fps_per_unit * mult_f;
+        let mult_tag = if mult_f > 1.0001 {
+            format!(" (x{:.1})", mult_f)
         } else {
             String::new()
         };

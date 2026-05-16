@@ -47,7 +47,9 @@ impl From<ModifierEffectV2> for ModifierEffect {
         match e {
             ModifierEffectV2::FlatFps(v) => ModifierEffect::FlatFps(v),
             ModifierEffectV2::AddPercent(v) => ModifierEffect::AddPercent(v),
-            ModifierEffectV2::MulFactor(v) => ModifierEffect::MulFactor(v),
+            ModifierEffectV2::MulFactor(v) => {
+                ModifierEffect::MulFactor(crate::bignum::Mag::from_f64(v))
+            }
         }
     }
 }
@@ -489,7 +491,7 @@ mod tests {
         assert_eq!(st.count, 5);
         assert_eq!(st.modifiers.len(), 2);
         assert!((st.aggregate.add_percent - 0.10).abs() < 1e-9);
-        assert!((st.aggregate.mul_factor - 2.0).abs() < 1e-9);
+        assert!((st.aggregate.mul_factor.to_f64() - 2.0).abs() < 1e-9);
     }
 
     #[test]

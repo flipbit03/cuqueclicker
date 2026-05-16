@@ -205,10 +205,14 @@ fn maybe_idle_clench(state: &mut GameState) {
 
 fn maybe_spawn_auto_particle(state: &mut GameState, geom: &SimGeometry) {
     let fps = state.fps();
-    if fps <= 0.0 || geom.biscuit.width < 4 || geom.biscuit.height < 4 {
+    if fps.is_zero() || geom.biscuit.width < 4 || geom.biscuit.height < 4 {
         return;
     }
-    let target_rate = fps.sqrt().clamp(0.5, 8.0);
+    // `target_rate` paces the particle spawner; once FPS is in the
+    // "many cuques per second" range it caps at 8/s and we don't care
+    // about precise sqrt math. Compute via f64 (saturating) and clamp.
+    let fps_f = fps.to_f64();
+    let target_rate = fps_f.sqrt().clamp(0.5, 8.0);
     let prob = target_rate * TICK_DT;
     let mut rng = rand::rng();
     if rng.random::<f64>() >= prob {

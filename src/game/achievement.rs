@@ -17,15 +17,15 @@ pub const ACHIEVEMENTS: &[AchievementKind] = &[
     },
     AchievementKind {
         id: "warming_up",
-        unlocked: |s| s.lifetime_cuques >= 100.0,
+        unlocked: |s| s.lifetime_cuques >= crate::bignum::Mag::from_f64(100.0),
     },
     AchievementKind {
         id: "seasoned_fingerer",
-        unlocked: |s| s.lifetime_cuques >= 10_000.0,
+        unlocked: |s| s.lifetime_cuques >= crate::bignum::Mag::from_f64(10_000.0),
     },
     AchievementKind {
         id: "cuque_mogul",
-        unlocked: |s| s.lifetime_cuques >= 1_000_000.0,
+        unlocked: |s| s.lifetime_cuques >= crate::bignum::Mag::from_f64(1_000_000.0),
     },
     AchievementKind {
         id: "automation",

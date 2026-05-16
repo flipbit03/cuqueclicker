@@ -4,6 +4,7 @@ use rand::RngExt;
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 
+use crate::bignum::Mag;
 use crate::game::achievement::ACHIEVEMENTS;
 use crate::game::fingerer::{self, FINGERERS};
 use crate::game::modifier::{
@@ -264,13 +265,13 @@ pub struct GameState {
     #[serde(default = "default_save_version")]
     pub version: u32,
     #[serde(default)]
-    pub cuques: f64,
+    pub cuques: Mag,
     #[serde(default)]
     pub total_clicks: u64,
     #[serde(default)]
-    pub lifetime_cuques: f64,
+    pub lifetime_cuques: Mag,
     #[serde(default)]
-    pub best_fps: f64,
+    pub best_fps: Mag,
     /// Lifetime grand total of every powerup caught (Lucky, Frenzy, Buff,
     /// Green Coin). Stays a strict rollup so existing achievements that
     /// gate on it continue to work, and pre-V3 saves whose breakdown was
@@ -377,8 +378,12 @@ pub struct GameState {
     pub active_unlock_id: Option<String>,
     #[serde(skip)]
     pub active_unlock_ticks: u32,
+    /// Per-tick cuque income waiting to be shown via a `+N` auto-particle.
+    /// `Mag` so a late-game FPS that produces astronomical per-tick income
+    /// stays representable; the particle text is rendered through
+    /// `format::big_mag`.
     #[serde(skip)]
-    pub visual_debt: f64,
+    pub visual_debt: Mag,
     #[serde(skip)]
     pub lucky_flash_ticks: u32,
     #[serde(skip)]
@@ -464,7 +469,7 @@ pub struct GameState {
     /// Initialized to the live values on load so the first frame doesn't
     /// look like a count-up from zero.
     #[serde(skip)]
-    pub displayed_cuques: f64,
+    pub displayed_cuques: Mag,
     #[serde(skip)]
     pub displayed_fps: f64,
     /// Brief green flash on the HUD digits when cuques jump UP — golden
@@ -515,10 +520,10 @@ impl Default for GameState {
     fn default() -> Self {
         Self {
             version: crate::save::CURRENT_VERSION,
-            cuques: 0.0,
+            cuques: Mag::ZERO,
             total_clicks: 0,
-            lifetime_cuques: 0.0,
-            best_fps: 0.0,
+            lifetime_cuques: Mag::ZERO,
+            best_fps: Mag::ZERO,
             golden_caught: 0,
             lucky_caught: 0,
             frenzy_caught: 0,
@@ -559,7 +564,7 @@ impl Default for GameState {
             newly_unlocked: Vec::new(),
             active_unlock_id: None,
             active_unlock_ticks: 0,
-            visual_debt: 0.0,
+            visual_debt: Mag::ZERO,
             lucky_flash_ticks: 0,
             achievement_flash_ticks: 0,
             green_coin_flash_ticks: 0,
@@ -575,7 +580,7 @@ impl Default for GameState {
             space_pressed_this_tick: false,
             ticks_since_last_press: u32::MAX,
             space_hold_ticks: 0,
-            displayed_cuques: 0.0,
+            displayed_cuques: Mag::ZERO,
             displayed_fps: 0.0,
             cuques_flash_ticks: 0,
             cuques_spend_flash_ticks: 0,
@@ -724,7 +729,7 @@ impl GameState {
             .enumerate()
             .filter(|(idx, f)| {
                 let owned = self.fingerer_count(f.id);
-                fingerer::visible(*idx, owned, self.lifetime_cuques)
+                fingerer::visible(*idx, owned, self.lifetime_cuques.to_f64())
             })
             .map(|(_, f)| f.id.to_string())
             .collect();
@@ -757,7 +762,8 @@ impl GameState {
         // digits — a single +1 doesn't deserve the green tint, but a
         // Frenzy click (FPS-scaled bonus, often hundreds-to-millions) or
         // any bulk jump does.
-        if power >= 50.0 {
+        let power_threshold = Mag::from_f64(50.0);
+        if power >= power_threshold {
             self.cuques_flash_ticks = HUD_FLASH_TICKS;
         }
         let mut rng = rand::rng();
@@ -782,7 +788,7 @@ impl GameState {
         // Small numbers stay subtle; big ones (Frenzy, Cosmic mults) get a
         // bold ClickBig style so they read as "this matters" against the
         // chatter of auto-particles.
-        let kind = if power >= 50.0 || frenzy_active {
+        let kind = if power >= power_threshold || frenzy_active {
             ParticleKind::ClickBig
         } else {
             ParticleKind::Click
@@ -791,7 +797,7 @@ impl GameState {
             frac_x,
             frac_y,
             life: PARTICLE_LIFE,
-            text: format!("+{}", crate::format::big(power)),
+            text: format!("+{}", crate::format::big_mag(power)),
             kind,
             drift_x,
         });
@@ -851,43 +857,42 @@ impl GameState {
         }
     }
 
-    pub fn click_power(&self) -> f64 {
+    pub fn click_power(&self) -> Mag {
         // Click contributions come from the tree exclusively (old hardcoded
         // ClickMult upgrades are retired). Same fold order as the modifier
         // formula on fingerers: flat first, then (1 + add_percent), then
         // mul_factor.
         let t = &self.tree_aggregate;
-        let base = (1.0 + t.click_flat) * (1.0 + t.click_add) * t.click_mul;
+        let base_scalar = (1.0 + t.click_flat) * (1.0 + t.click_add);
+        let base = Mag::from_f64(base_scalar.max(0.0)).mul(t.click_mul);
         // Per-click Frenzy bonus, FPS-scaled. The legacy `mult: 777.0`
         // on `Buff::ClickFrenzy` is now ignored at click-time (kept on
         // the struct only for V2/V3/V4 save compatibility); each click
-        // during Frenzy adds a flat-or-fps-scaled bonus instead. This
-        // is what keeps an early-game Frenzy (FPS ≈ 0) capped at the
-        // FRENZY_FLAT floor (10 cuques/click) instead of trivializing
-        // the cost ladder via ×777, while a late-game Frenzy still
-        // delivers a ~12× income-rate boost during the buff via the
-        // FRENZY_FPS_SECONDS_PER_CLICK term.
+        // during Frenzy adds a flat-or-fps-scaled bonus instead.
         let frenzy_active = self
             .buffs
             .iter()
             .any(|b| matches!(b, Buff::ClickFrenzy { .. }));
         if frenzy_active {
-            let bonus = (self.fps() * FRENZY_FPS_SECONDS_PER_CLICK).max(FRENZY_FLAT_PER_CLICK);
-            base + bonus
+            let fps = self.fps();
+            let scaled = fps.mul(Mag::from_f64(FRENZY_FPS_SECONDS_PER_CLICK));
+            let floor = Mag::from_f64(FRENZY_FLAT_PER_CLICK);
+            let bonus = if scaled > floor { scaled } else { floor };
+            base.add(bonus)
         } else {
             base
         }
     }
 
-    fn add_cuques(&mut self, amount: f64) {
-        self.cuques += amount;
-        self.lifetime_cuques += amount;
+    fn add_cuques(&mut self, amount: Mag) {
+        self.cuques = self.cuques.add(amount);
+        self.lifetime_cuques = self.lifetime_cuques.add(amount);
     }
 
     /// Dev-build cheat. Bypasses normal flow; not reachable in release builds
     /// because the F-key that triggers it is gated behind `App::debug`.
     pub fn dev_add_cuques(&mut self, amount: f64) {
-        self.add_cuques(amount);
+        self.add_cuques(Mag::from_f64(amount));
         self.cuques_flash_ticks = HUD_FLASH_TICKS;
     }
 
@@ -912,9 +917,9 @@ impl GameState {
     ///
     /// Per-kind cooldown is NOT touched here — it ticks independently
     /// from spawns; a catch just removes the on-screen instance.
-    pub fn catch_powerup(&mut self, spawn_id: u64) -> f64 {
+    pub fn catch_powerup(&mut self, spawn_id: u64) -> Mag {
         let Some(idx) = self.powerups.iter().position(|p| p.spawn_id == spawn_id) else {
-            return 0.0;
+            return Mag::ZERO;
         };
         let p = self.powerups.swap_remove(idx);
         self.golden_caught += 1;
@@ -927,12 +932,16 @@ impl GameState {
                     .powerup_reward_mul
                     .get(PowerupKind::Lucky as usize)
                     .copied()
-                    .unwrap_or(1.0);
-                let r = ((fps * GOLDEN_REWARD_SECONDS).max(GOLDEN_REWARD_FLAT)) * reward_mul;
+                    .unwrap_or(Mag::ONE);
+                let secs = Mag::from_f64(GOLDEN_REWARD_SECONDS);
+                let flat = Mag::from_f64(GOLDEN_REWARD_FLAT);
+                let scaled = fps.mul(secs);
+                let big = if scaled > flat { scaled } else { flat };
+                let r = big.mul(reward_mul);
                 self.add_cuques(r);
                 self.lucky_flash_ticks = LUCKY_FLASH_TICKS;
                 self.cuques_flash_ticks = HUD_FLASH_TICKS;
-                (r, format!("+{}", crate::format::big(r)))
+                (r, format!("+{}", crate::format::big_mag(r)))
             }
             PowerupKind::Frenzy => {
                 self.frenzy_caught += 1;
@@ -941,19 +950,17 @@ impl GameState {
                     .powerup_duration_mul
                     .get(PowerupKind::Frenzy as usize)
                     .copied()
-                    .unwrap_or(1.0);
-                let dur = ((TICK_HZ * 13) as f64 * duration_mul).round() as u32;
-                // `mult: 777.0` is a legacy field — `click_power()` no
-                // longer reads it. The per-click Frenzy bonus is FPS-
-                // scaled via `FRENZY_FPS_SECONDS_PER_CLICK` /
-                // `FRENZY_FLAT_PER_CLICK`. Kept on the struct so V2/V3
-                // saves with this field deserialize cleanly.
+                    .unwrap_or(Mag::ONE);
+                // Duration scales by a Mag — convert at the boundary
+                // and clamp to u32 so the tick counter doesn't wrap.
+                let raw = (TICK_HZ * 13) as f64 * duration_mul.to_f64();
+                let dur = raw.round().clamp(0.0, u32::MAX as f64) as u32;
                 self.buffs.push(Buff::ClickFrenzy {
                     ticks_remaining: dur,
                     initial_ticks: dur,
                     mult: 777.0,
                 });
-                (0.0, "FRENZY!".into())
+                (Mag::ZERO, "FRENZY!".into())
             }
             PowerupKind::Buff => {
                 self.buff_caught += 1;
@@ -962,17 +969,22 @@ impl GameState {
                     .powerup_duration_mul
                     .get(PowerupKind::Buff as usize)
                     .copied()
-                    .unwrap_or(1.0);
+                    .unwrap_or(Mag::ONE);
                 let reward_mul = self
                     .tree_aggregate
                     .powerup_reward_mul
                     .get(PowerupKind::Buff as usize)
                     .copied()
-                    .unwrap_or(1.0);
-                let dur = ((TICK_HZ * 60) as f64 * duration_mul).round() as u32;
+                    .unwrap_or(Mag::ONE);
+                let raw_dur = (TICK_HZ * 60) as f64 * duration_mul.to_f64();
+                let dur = raw_dur.round().clamp(0.0, u32::MAX as f64) as u32;
+                // Persisted MulFactor stays a Mag so a 10k-deep tree
+                // stack's reward_mul doesn't get clamped at f64::MAX
+                // when it's serialized into the fingerer's modifier list.
+                let mul_factor = Mag::from_f64(7.0).mul(reward_mul);
                 let m = Modifier {
                     source: ModifierSource::PurpleCoin,
-                    effects: vec![ModifierEffect::MulFactor(7.0 * reward_mul)],
+                    effects: vec![ModifierEffect::MulFactor(mul_factor)],
                     duration: ModifierDuration::Ticks(dur),
                     created_at_tick: self.total_play_ticks,
                 };
@@ -984,12 +996,19 @@ impl GameState {
                     let pick = FINGERERS[0].id;
                     self.attach_modifier(pick, m);
                 }
-                (0.0, "BOOSTED x7!".into())
+                (Mag::ZERO, "BOOSTED x7!".into())
             }
             PowerupKind::GreenCoin => {
                 self.green_coin_caught += 1;
                 self.green_coin_flash_ticks = GREEN_COIN_FLASH_TICKS;
-                let strength = GREEN_COIN_ADD_PERCENT * self.tree_aggregate.green_coin_strength_mul;
+                // The catch-time amplifier is a Mag, but the resulting
+                // AddPercent we persist is still an `f64`: GreenCoins are
+                // ADDITIVE (sum across modifiers), not multiplicative,
+                // and per-node EffectMul caps keep `green_coin_strength_mul`
+                // at sane sizes for any session length that produces a
+                // meaningful AddPercent before fp precision washes out.
+                let strength_mul = self.tree_aggregate.green_coin_strength_mul.to_f64();
+                let strength = GREEN_COIN_ADD_PERCENT * strength_mul;
                 let m = Modifier {
                     source: ModifierSource::GreenCoin,
                     effects: vec![ModifierEffect::AddPercent(strength)],
@@ -1032,7 +1051,7 @@ impl GameState {
                     // dev.
                     None => "+10% ???".to_string(),
                 };
-                (0.0, label)
+                (Mag::ZERO, label)
             }
         };
         self.particles.push(Particle {
@@ -1046,29 +1065,33 @@ impl GameState {
         reward
     }
 
-    pub fn fps(&self) -> f64 {
+    pub fn fps(&self) -> Mag {
         // Per-fingerer formula:
         //   flat_total = modifier.flat + tree.per_fingerer.flat + tree.all_fingerers.flat
         //   add_total  = modifier.add  + tree.per_fingerer.add  + tree.all_fingerers.add
         //   mul_total  = modifier.mul  * tree.per_fingerer.mul  * tree.all_fingerers.mul
         //   pre  = base * count + flat_total
-        //   post = pre * (1 + add_total) * mul_total
-        // Both aggregates are pre-folded caches — O(1) reads per fingerer.
-        let base: f64 = FINGERERS
-            .iter()
-            .enumerate()
-            .map(|(i, k)| {
-                let count = self.fingerer_count(k.id) as f64;
-                let mod_agg = self.fingerer_aggregate(k.id);
-                let tree = self.tree_aggregate.effective_for_fingerer(i);
-                let flat_total = mod_agg.flat_fps + tree.flat_fps;
-                let add_total = mod_agg.add_percent + tree.add_percent;
-                let mul_total = mod_agg.mul_factor * tree.mul_factor;
-                let pre = k.fps_per_unit * count + flat_total;
-                pre * (1.0 + add_total) * mul_total
-            })
-            .sum();
-        base * self.prestige_mult()
+        //   post = pre * (1 + add_total) * mul_total   (kept as Mag from here)
+        // Multiplicative aggregates live in log-magnitude so the
+        // late-late-game stack (thousands of bought nodes × hundreds of
+        // caught Buffs) can't overflow the way it did with `f64`.
+        let mut total = Mag::ZERO;
+        for (i, k) in FINGERERS.iter().enumerate() {
+            let count = self.fingerer_count(k.id) as f64;
+            let mod_agg = self.fingerer_aggregate(k.id);
+            let tree = self.tree_aggregate.effective_for_fingerer(i);
+            let flat_total = mod_agg.flat_fps + tree.flat_fps;
+            let add_total = mod_agg.add_percent + tree.add_percent;
+            let mul_total = mod_agg.mul_factor.mul(tree.mul_factor);
+            let pre_scalar = (k.fps_per_unit * count + flat_total) * (1.0 + add_total);
+            // `pre_scalar` can theoretically be negative if a stack of
+            // banes outweighs the base; clamp at zero — there's no
+            // honest log10 for a negative quantity and "no contribution"
+            // is the right gameplay reading.
+            let pre_scalar = pre_scalar.max(0.0);
+            total = total.add(Mag::from_f64(pre_scalar).mul(mul_total));
+        }
+        total.mul(self.prestige_mult())
     }
 
     pub fn border_speed(&self) -> u32 {
@@ -1110,28 +1133,53 @@ impl GameState {
         self.purchase_flash_strength = self.purchase_flash_strength.max(strength).clamp(1.0, 3.0);
     }
 
-    pub fn prestige_mult(&self) -> f64 {
+    pub fn prestige_mult(&self) -> Mag {
         let base = 1.0 + 0.01 * self.prestige as f64;
         let t = &self.tree_aggregate;
-        (base + t.prestige_add) * t.prestige_mul
+        // `t.prestige_mul` is `Mag`; the additive `prestige_add` and
+        // base contribution stay `f64` (small, bounded) and fold in
+        // before crossing into log space.
+        Mag::from_f64((base + t.prestige_add).max(0.0)).mul(t.prestige_mul)
     }
 
     pub fn prestige_earned_total(&self) -> u64 {
-        // Guard the only failure modes the math actually has: NaN /
-        // INFINITY from a corrupted `lifetime_cuques`, and negative
-        // values that have no business in a lifetime counter. Past
-        // that, trust the player's number — long-haul legit play can
-        // reach surprisingly high paper counts, and capping the result
-        // would silently truncate their earned progression. The f64-
-        // to-u64 saturation cast only kicks in around `raw > u64::MAX
-        // ≈ 1.8e19` which corresponds to `lifetime_cuques > ~3e44` —
-        // unreachable through any non-corrupted save state.
-        let raw = (self.lifetime_cuques / 1_000_000.0).sqrt().floor();
-        if !raw.is_finite() || raw < 0.0 {
-            0
-        } else {
-            raw as u64
+        // Old formula: `floor(sqrt(lifetime / 1e6))`. Naively rewriting
+        // it in log10 space as `floor(10^((log10(lifetime) - 6) / 2))`
+        // is *algebraically* equal but numerically not — the
+        // `log10 → pow` round-trip can land just below an integer
+        // boundary at ~⅓ of exact tier values, dropping a player's
+        // earned prestige by 1 the moment they upgrade. So: stay in
+        // the original f64 sqrt path for any lifetime that fits in
+        // f64 (which covers any realistic player), and only fall
+        // through to the log-space formula past `log10 ≈ 300` where
+        // f64 starts losing precision.
+        if self.lifetime_cuques.log10 < 6.0 {
+            return 0;
         }
+        if self.lifetime_cuques.log10 < 300.0 {
+            // `Mag::to_f64` is `10^log10` and isn't bit-exact (pow ∘ log
+            // composes two correctly-rounded ops into one slightly-wrong
+            // one), so a tier-boundary value like `25_000_000` arrives
+            // as `24.999_999_999_999_996` and `sqrt.floor()` drops the
+            // earned tier by 1. Add a few-ulp nudge before the floor to
+            // absorb the round-trip noise; legitimate between-tier
+            // values are far enough from an integer that the nudge
+            // doesn't false-positive them upward.
+            let lifetime = self.lifetime_cuques.to_f64();
+            let raw = (lifetime / 1_000_000.0).sqrt();
+            if !raw.is_finite() || raw < 0.0 {
+                return 0;
+            }
+            return (raw + 1e-9).floor() as u64;
+        }
+        // Truly-huge range: stay in log-magnitude space. At this scale
+        // an integer-boundary slop is invisible — the player already
+        // has astronomical prestige.
+        let earned_log10 = (self.lifetime_cuques.log10 - 6.0) * 0.5;
+        Mag {
+            log10: earned_log10,
+        }
+        .floor_u64()
     }
 
     pub fn prestige_available(&self) -> u64 {
@@ -1144,7 +1192,7 @@ impl GameState {
             return false;
         }
         self.prestige = self.prestige_earned_total();
-        self.cuques = 0.0;
+        self.cuques = Mag::ZERO;
         // Don't snap `displayed_cuques` to 0 — let it tween down from
         // its pre-reset value over the next ~1s for a "draining"
         // feel. Same for FPS. The red spend-flash is fired below to
@@ -1167,7 +1215,7 @@ impl GameState {
         self.tree_refund_flash.clear();
         self.tree_edge_anims.clear();
         self.buffs.clear();
-        self.visual_debt = 0.0;
+        self.visual_debt = Mag::ZERO;
         self.particles.clear();
         self.misclick_particles.clear();
         self.powerups.clear();
@@ -1353,9 +1401,9 @@ impl GameState {
         if fps > self.best_fps {
             self.best_fps = fps;
         }
-        let gained = fps * TICK_DT;
+        let gained = fps.mul(Mag::from_f64(TICK_DT));
         self.add_cuques(gained);
-        self.visual_debt += gained;
+        self.visual_debt = self.visual_debt.add(gained);
         self.clench_ticks = self.clench_ticks.saturating_sub(1);
         for p in self.particles.iter_mut() {
             p.life = p.life.saturating_sub(1);
@@ -1405,17 +1453,35 @@ impl GameState {
         // from buying a single fingerer, not worth a tween.
         const SNAP_BELOW: f64 = 5.0;
         let tween = 0.18_f64;
-        let dc = self.cuques - self.displayed_cuques;
-        if dc.abs() < SNAP_BELOW {
+        // Cuques tween: compute the gap in log space. For values past
+        // ~1e15 we just snap to the target — sub-unit precision on the
+        // display tween isn't perceptible up there, and a Mag-space
+        // exponential tween would be visually weird anyway.
+        let cuques_log = self.cuques.log10;
+        let disp_log = self.displayed_cuques.log10;
+        if cuques_log > 15.0 || disp_log > 15.0 {
             self.displayed_cuques = self.cuques;
         } else {
-            self.displayed_cuques += dc * tween;
+            let dc = self.cuques.to_f64() - self.displayed_cuques.to_f64();
+            if dc.abs() < SNAP_BELOW {
+                self.displayed_cuques = self.cuques;
+            } else {
+                self.displayed_cuques = Mag::from_f64(self.displayed_cuques.to_f64() + dc * tween);
+            }
         }
-        let df = fps - self.displayed_fps;
-        if df.abs() < SNAP_BELOW {
-            self.displayed_fps = fps;
+        // FPS tween stays in f64 — `displayed_fps` is f64 (used for HUD
+        // text only, where Mag's display is fine but f64-space tweens
+        // are simpler). For huge FPS we snap.
+        let fps_f64 = fps.to_f64();
+        if fps.log10 > 15.0 {
+            self.displayed_fps = fps_f64;
         } else {
-            self.displayed_fps += df * tween;
+            let df = fps_f64 - self.displayed_fps;
+            if df.abs() < SNAP_BELOW {
+                self.displayed_fps = fps_f64;
+            } else {
+                self.displayed_fps += df * tween;
+            }
         }
 
         self.session_ticks += 1;
@@ -1490,37 +1556,56 @@ impl GameState {
     /// The shown amount is always real cuques that just accrued into
     /// `visual_debt`.
     pub fn spawn_auto_particle(&mut self, frac_x: f32, frac_y: f32) {
-        let amount = self.visual_debt.floor() as u64;
-        if amount == 0 {
+        // The auto-particle shows the WHOLE accrued cuques since the last
+        // particle. Drain visual_debt entirely (no fractional remainder
+        // to subtract — the next tick re-accrues from FPS).
+        if self.visual_debt.log10 < 0.0 {
+            // Less than 1 cuque accrued; skip the particle.
             return;
         }
-        self.visual_debt -= amount as f64;
+        let amount = self.visual_debt;
+        self.visual_debt = Mag::ZERO;
         let drift_x = rand::rng().random_range(-0.008_f32..=0.008);
         self.particles.push(Particle {
             frac_x,
             frac_y,
             life: PARTICLE_LIFE,
-            text: format!("+{}", crate::format::big(amount as f64)),
+            text: format!("+{}", crate::format::big_mag(amount)),
             kind: ParticleKind::Auto,
             drift_x,
         });
     }
 
-    pub fn cost(&self, idx: usize) -> f64 {
+    pub fn cost(&self, idx: usize) -> Mag {
         let k = &FINGERERS[idx];
         // Floor the result so the cost ALWAYS equals what `format::big`
         // shows the player. The price formula scales by 1.15× per owned
         // unit and produces fractional cuques (e.g. 15 × 1.15⁶ = 34.69).
         // Tree cost-mul (procgen `CostMul` primitives) folds in here so
         // discounts/inflation behave the same for display, gate, and spend.
-        let raw = k.base_cost * k.cost_scale.powi(self.fingerer_count_idx(idx) as i32);
+        //
+        // `raw` is computed in log10 space (`log10(b * s^n) = log10(b) + n*log10(s)`)
+        // so fingerer counts well past the f64 overflow point still
+        // produce a finite Mag price. The tree's per-fingerer cost_mul
+        // (a Mag) folds in via multiplication = addition of logs.
+        let n = self.fingerer_count_idx(idx) as f64;
+        let log_raw = k.base_cost.log10() + n * k.cost_scale.log10();
+        let raw = Mag { log10: log_raw };
         let cost_mul = self
             .tree_aggregate
             .per_fingerer
             .get(idx)
             .map(|c| c.cost_mul)
-            .unwrap_or(1.0);
-        (raw * cost_mul).floor().max(1.0)
+            .unwrap_or(Mag::ONE);
+        let combined = raw.mul(cost_mul);
+        // Floor + clamp-to-1 for the small-number range; once we're in
+        // truly-big territory the player can't perceive sub-unit
+        // precision anyway.
+        if combined.log10 < 18.0 {
+            Mag::from_f64(combined.to_f64().floor().max(1.0))
+        } else {
+            combined
+        }
     }
 
     /// Cuques the player can ACTUALLY spend right now: the lesser of real
@@ -1540,8 +1625,21 @@ impl GameState {
     /// equally binding: row turns green only when the visible counter
     /// AND the underlying balance both reach the cost; click succeeds
     /// only when both still hold. No overspend, no visual lie.
-    pub fn affordable_cuques(&self) -> f64 {
-        self.cuques.min(self.displayed_cuques.floor())
+    pub fn affordable_cuques(&self) -> Mag {
+        // `Mag` lacks `.floor()` in log space; mirror the original
+        // f64 behavior by flooring the displayed counter at its f64
+        // boundary (the player can never perceive sub-unit precision
+        // up there anyway).
+        let disp_floor = if self.displayed_cuques.log10 < 18.0 {
+            Mag::from_f64(self.displayed_cuques.to_f64().floor())
+        } else {
+            self.displayed_cuques
+        };
+        if self.cuques < disp_floor {
+            self.cuques
+        } else {
+            disp_floor
+        }
     }
 
     pub fn can_buy(&self, idx: usize) -> bool {
@@ -1561,7 +1659,7 @@ impl GameState {
         if self.affordable_cuques() >= c
             && let Some(f) = FINGERERS.get(idx)
         {
-            self.cuques -= c;
+            self.cuques = self.cuques.saturating_sub(c);
             self.fingerers_state
                 .entry(f.id.to_string())
                 .or_default()
@@ -1716,7 +1814,7 @@ impl GameState {
         let neighbors = node::neighbors_of(lot);
         let was_reachable: [bool; 8] = std::array::from_fn(|i| self.tree_reachable(neighbors[i]));
 
-        self.cuques -= node.cost;
+        self.cuques = self.cuques.saturating_sub(node.cost);
         self.tree.bought.insert(lot);
         self.tree.last_bought = Some(lot);
         self.tree_aggregate.fold_in_node(&node);
@@ -1803,9 +1901,9 @@ impl GameState {
     /// `cost * TREE_REFUND_FRACTION` — the remaining fraction is the
     /// exploration tax (see the constant for rationale). Connectivity
     /// guard: rejects if it would orphan any other owned node.
-    pub fn refund_tree_node(&mut self, lot: TreeCoord) -> f64 {
+    pub fn refund_tree_node(&mut self, lot: TreeCoord) -> Mag {
         if !self.can_refund_tree_node(lot) {
-            return 0.0;
+            return Mag::ZERO;
         }
         let Some(node) = node::node_at(lot.x, lot.y) else {
             // Ghost lot in `bought` (e.g. survived a procgen change that
@@ -1816,15 +1914,15 @@ impl GameState {
             if self.tree.last_bought == Some(lot) {
                 self.tree.last_bought = None;
             }
-            return 0.0;
+            return Mag::ZERO;
         };
         self.tree.bought.remove(&lot);
         if self.tree.last_bought == Some(lot) {
             self.tree.last_bought = None;
         }
         self.tree_aggregate.fold_out_node(&node);
-        let refunded = (node.cost * TREE_REFUND_FRACTION).floor();
-        self.cuques += refunded;
+        let refunded = node.cost.mul(Mag::from_f64(TREE_REFUND_FRACTION));
+        self.cuques = self.cuques.add(refunded);
         // Red pulse on the now-unowned lot. The lot still renders (as an
         // unowned reachable/dotted box depending on connectivity), so the
         // flash decays visibly there.
@@ -1885,11 +1983,40 @@ mod tests {
     }
 
     #[test]
+    fn prestige_earned_matches_legacy_sqrt_at_tier_boundaries() {
+        // Old formula was `floor(sqrt(lifetime / 1e6))`. The naive
+        // log-space rewrite `floor(10^((log10(lifetime) - 6) / 2))`
+        // rounds differently at ~⅓ of integer-tier boundaries, dropping
+        // a player's earned prestige by 1 on next launch. Pin the
+        // boundary values that used to misbehave so the regression
+        // can't slip back in.
+        // Each value is checked against the legacy `floor(sqrt(x/1e6))`.
+        let cases: &[(f64, u64)] = &[
+            (0.0, 0),
+            (999_999.0, 0),          // just under 1 tier
+            (1_000_000.0, 1),        // exactly 1 tier
+            (4_000_000.0, 2),        // 2 tiers
+            (25_000_000.0, 5),       // 5 tiers — regression case
+            (81_000_000.0, 9),       // 9 tiers — regression case
+            (1_000_000_000.0, 31),   // sqrt(1000) ≈ 31.62
+            (10_000_000_000.0, 100), // sqrt(10000) = 100
+            (1e18, 1_000_000),       // sqrt(1e12) = 1e6
+        ];
+        for &(lifetime, expected) in cases {
+            let s = GameState {
+                lifetime_cuques: Mag::from_f64(lifetime),
+                ..GameState::default()
+            };
+            assert_eq!(s.prestige_earned_total(), expected, "lifetime={lifetime}");
+        }
+    }
+
+    #[test]
     fn save_roundtrip_is_stable_through_json() {
         // Serialize → deserialize → get the same state back. Catches any
         // accidental rename that would make saves non-idempotent.
         let mut state = GameState {
-            cuques: 1234.5,
+            cuques: Mag::from_f64(1234.5),
             total_clicks: 99,
             fingerers_state: [("index_finger".to_string(), fs_with_count(7))]
                 .into_iter()
@@ -1903,7 +2030,7 @@ mod tests {
         let roundtripped: GameState = serde_json::from_str(&json).expect("deserialize");
         let m = roundtripped.migrate_runtime();
 
-        assert_eq!(m.cuques, 1234.5);
+        assert!((m.cuques.to_f64() - 1234.5).abs() < 1e-9);
         assert_eq!(m.total_clicks, 99);
         assert_eq!(m.fingerer_count("index_finger"), 7);
         assert!(m.tree.bought.contains(&TreeCoord::new(2, -1)));
@@ -2002,8 +2129,8 @@ mod tests {
         // counter on the HUD) — a default-constructed test state has
         // displayed=0 and would otherwise reject every buy.
         let mut s = GameState {
-            cuques: 1_000_000.0,
-            displayed_cuques: 1_000_000.0,
+            cuques: Mag::from_f64(1_000_000.0),
+            displayed_cuques: Mag::from_f64(1_000_000.0),
             ..Default::default()
         };
         s.buy(0);
@@ -2011,8 +2138,8 @@ mod tests {
         assert!((1.0..=3.0).contains(&single));
 
         let mut s = GameState {
-            cuques: 1_000_000.0,
-            displayed_cuques: 1_000_000.0,
+            cuques: Mag::from_f64(1_000_000.0),
+            displayed_cuques: Mag::from_f64(1_000_000.0),
             ..Default::default()
         };
         s.buy_n(0, 50);
@@ -2034,7 +2161,7 @@ mod tests {
         let spec = node::node_at(0, 0).expect("anchor always exists");
         assert!(spec.is_anchor);
         assert!(spec.primitives.is_empty());
-        assert_eq!(spec.cost, 0.0);
+        assert_eq!(spec.cost, Mag::ZERO);
     }
 
     #[test]
@@ -2042,8 +2169,8 @@ mod tests {
         // Origin is auto-owned in Default, so any attempt to buy it
         // returns None ("already owned"). Cuques aren't spent.
         let mut s = GameState {
-            cuques: 1_000_000.0,
-            displayed_cuques: 1_000_000.0,
+            cuques: Mag::from_f64(1_000_000.0),
+            displayed_cuques: Mag::from_f64(1_000_000.0),
             ..Default::default()
         };
         let pre = s.cuques;
@@ -2057,12 +2184,12 @@ mod tests {
     fn refund_origin_is_rejected() {
         // Origin is the anchor — non-refundable regardless of state.
         let mut s = GameState {
-            cuques: 1_000_000.0,
-            displayed_cuques: 1_000_000.0,
+            cuques: Mag::from_f64(1_000_000.0),
+            displayed_cuques: Mag::from_f64(1_000_000.0),
             ..Default::default()
         };
         let pre = s.cuques;
-        assert_eq!(s.refund_tree_node(TreeCoord::ORIGIN), 0.0);
+        assert_eq!(s.refund_tree_node(TreeCoord::ORIGIN), Mag::ZERO);
         assert!(s.tree.bought.contains(&TreeCoord::ORIGIN));
         assert_eq!(s.cuques, pre, "no cuques returned on a refund-rejection");
     }
@@ -2072,8 +2199,8 @@ mod tests {
         // The exploration tax means buy + refund is a net loss. Without
         // this, the player could spam every node combination for free.
         let mut s = GameState {
-            cuques: 1_000_000.0,
-            displayed_cuques: 1_000_000.0,
+            cuques: Mag::from_f64(1_000_000.0),
+            displayed_cuques: Mag::from_f64(1_000_000.0),
             ..Default::default()
         };
         let pre = s.cuques;
@@ -2089,12 +2216,16 @@ mod tests {
             .buy_tree_node(neighbor)
             .expect("affordable with 1M cuques");
         let after_buy = s.cuques;
-        assert!((after_buy - (pre - n_node.cost)).abs() < 1e-6);
+        // `pre - n_node.cost` in Mag-space, compared against `after_buy`.
+        // Both should be within float-rounding distance; compare in
+        // log10 space.
+        let expected_after = pre.saturating_sub(n_node.cost);
+        assert!((after_buy.log10 - expected_after.log10).abs() < 1e-6);
 
         // Refund: gets back fraction * cost, loses (1 - fraction) * cost.
         let refunded = s.refund_tree_node(neighbor);
-        let expected = (n_node.cost * TREE_REFUND_FRACTION).floor();
-        assert!((refunded - expected).abs() < 1e-6);
+        let expected = n_node.cost.mul(Mag::from_f64(TREE_REFUND_FRACTION));
+        assert!((refunded.log10 - expected.log10).abs() < 1e-6);
         let after_refund = s.cuques;
         assert!(after_refund > after_buy);
         assert!(
@@ -2124,11 +2255,11 @@ mod tests {
         // J5 contract: a freshly-loaded save shows the live counters at full
         // value, not "tweening up from zero".
         let s = GameState {
-            cuques: 5_000.0,
+            cuques: Mag::from_f64(5_000.0),
             ..Default::default()
         };
         let m = s.migrate_runtime();
-        assert_eq!(m.displayed_cuques, 5_000.0);
+        assert_eq!(m.displayed_cuques, Mag::from_f64(5_000.0));
         // displayed_fps starts at 0 and converges over the first few ticks
         // (otherwise we'd snap-show the FPS before any tick has run).
         assert_eq!(m.displayed_fps, 0.0);
@@ -2164,7 +2295,7 @@ mod tests {
     fn timed_mul(mult: f64, ticks: u32) -> Modifier {
         Modifier {
             source: ModifierSource::PurpleCoin,
-            effects: vec![ModifierEffect::MulFactor(mult)],
+            effects: vec![ModifierEffect::MulFactor(Mag::from_f64(mult))],
             duration: ModifierDuration::Ticks(ticks),
             created_at_tick: 0,
         }
@@ -2254,7 +2385,7 @@ mod tests {
         s.tick();
         let st = s.fingerers_state.get("index_finger").unwrap();
         assert_eq!(st.modifiers.len(), 0);
-        assert!((st.aggregate.mul_factor - 1.0).abs() < 1e-9);
+        assert!((st.aggregate.mul_factor.to_f64() - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2281,7 +2412,7 @@ mod tests {
         // survive. Otherwise a prestiged player would carry +N% on tier-1
         // forever.
         let mut s = GameState {
-            lifetime_cuques: 1_000_000_000.0,
+            lifetime_cuques: Mag::from_f64(1_000_000_000.0),
             ..Default::default()
         };
         s.fingerers_state
@@ -2306,8 +2437,9 @@ mod tests {
         boosted.attach_modifier("index_finger", perm_add_percent(0.10));
         let boosted_fps = boosted.fps();
 
-        assert!(bare_fps > 0.0);
-        assert!((boosted_fps - bare_fps * 1.10).abs() < 1e-9);
+        assert!(!bare_fps.is_zero());
+        let expected = bare_fps.mul(Mag::from_f64(1.10));
+        assert!((boosted_fps.log10 - expected.log10).abs() < 1e-9);
     }
 
     #[test]
@@ -2403,7 +2535,7 @@ mod tests {
     #[test]
     fn attach_modifier_random_visible_can_pick_unowned_when_lifetime_unlocks_it() {
         let mut s = GameState {
-            lifetime_cuques: 60.0,
+            lifetime_cuques: Mag::from_f64(60.0),
             ..Default::default()
         };
         let m = perm_add_percent(0.10);
@@ -2413,7 +2545,8 @@ mod tests {
             .iter()
             .enumerate()
             .filter(|(idx, f)| {
-                fingerer::visible(*idx, 0, s.lifetime_cuques) && (*idx == 0 || f.id == "whole_hand")
+                fingerer::visible(*idx, 0, s.lifetime_cuques.to_f64())
+                    && (*idx == 0 || f.id == "whole_hand")
             })
             .map(|(_, f)| f.id)
             .collect();
@@ -2423,7 +2556,7 @@ mod tests {
     #[test]
     fn catch_powerup_returns_zero_when_id_unknown() {
         let mut s = GameState::default();
-        assert_eq!(s.catch_powerup(9_999), 0.0);
+        assert_eq!(s.catch_powerup(9_999), Mag::ZERO);
     }
 
     #[test]
@@ -2468,7 +2601,7 @@ mod tests {
     #[test]
     fn prestige_reset_clears_powerup_state() {
         let mut s = GameState {
-            lifetime_cuques: 1_000_000_000.0,
+            lifetime_cuques: Mag::from_f64(1_000_000_000.0),
             ..Default::default()
         };
         s.fingerers_state
@@ -2511,7 +2644,7 @@ mod tests {
         }
         let st = s.fingerers_state.get("index_finger").unwrap();
         assert_eq!(st.modifiers.len(), 2);
-        assert!((st.aggregate.mul_factor - 49.0).abs() < 1e-9);
+        assert!((st.aggregate.mul_factor.to_f64() - 49.0).abs() < 1e-9);
     }
 
     #[test]
@@ -2583,16 +2716,16 @@ mod tests {
             s.tick();
         }
         assert!(
-            s.cuques < 2_000.0,
+            s.cuques < Mag::from_f64(2_000.0),
             "early-game Frenzy must not blow past ~1k cuques; got {}",
-            s.cuques
+            crate::format::big_mag(s.cuques)
         );
         // Sanity: the buff did boost something (more than zero clicks
         // worth of base power = 1).
         assert!(
-            s.cuques > clicks as f64,
+            s.cuques > Mag::from_f64(clicks as f64),
             "Frenzy should still meaningfully boost clicks; got {} from {} clicks",
-            s.cuques,
+            crate::format::big_mag(s.cuques),
             clicks
         );
     }
@@ -2613,8 +2746,9 @@ mod tests {
             .insert("whole_hand".into(), fs_with_count(2000));
         let fps = s.fps();
         assert!(
-            fps > 100.0,
-            "test setup expected fps>100, got {fps} — adjust the count if fingerer base changed"
+            fps > Mag::from_f64(100.0),
+            "test setup expected fps>100, got {} — adjust the count if fingerer base changed",
+            crate::format::big_mag(fps)
         );
         // Activate Frenzy and click once.
         s.buffs.push(Buff::ClickFrenzy {
@@ -2625,14 +2759,19 @@ mod tests {
         let cuques_before = s.cuques;
         let biscuit = r(0, 0, 40, 20);
         s.click((20, 10), biscuit);
-        let yield_per_click = s.cuques - cuques_before;
+        let yield_per_click = s.cuques.saturating_sub(cuques_before);
         // Should be roughly fps * 5.0 + base click_power (no upgrades = 1).
-        let expected = fps * FRENZY_FPS_SECONDS_PER_CLICK + 1.0;
+        let expected = fps
+            .mul(Mag::from_f64(FRENZY_FPS_SECONDS_PER_CLICK))
+            .add(Mag::ONE);
         // Floor of FRENZY_FLAT_PER_CLICK doesn't kick in here because
         // fps * 5 > 10.
         assert!(
-            (yield_per_click - expected).abs() < expected * 0.01,
-            "expected ~{expected}/click at fps={fps}, got {yield_per_click}"
+            (yield_per_click.log10 - expected.log10).abs() < 0.01,
+            "expected ~{}/click at fps={}, got {}",
+            crate::format::big_mag(expected),
+            crate::format::big_mag(fps),
+            crate::format::big_mag(yield_per_click)
         );
     }
 
@@ -2642,7 +2781,7 @@ mod tests {
         // just the base × upgrades — no FPS-scaled bonus added.
         let s = GameState::default();
         // No upgrades, no Frenzy.
-        assert_eq!(s.click_power(), 1.0);
+        assert_eq!(s.click_power(), Mag::ONE);
     }
 
     #[test]

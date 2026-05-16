@@ -70,7 +70,10 @@ impl GameStateV3 {
     /// is the one mutation a frozen file is allowed: keeping the chain
     /// reachable as later versions land.)
     pub fn into_current(self) -> GameState {
-        super::v4::GameStateV4::from(self).into_current()
+        // Walk through V4 → V5 → GameState. V5 introduced Mag-typed
+        // counters; the previous "v4.into_current" shortcut moved its
+        // body into v5.
+        super::v5::GameStateV5::from(super::v4::GameStateV4::from(self)).into_current()
     }
 }
 

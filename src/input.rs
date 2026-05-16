@@ -905,7 +905,7 @@ mod tests {
         // prestige_available() square-roots `lifetime_cuques / 1e9` and
         // floors. 4e9 → 2 prestige tokens.
         GameState {
-            lifetime_cuques: 4_000_000_000.0,
+            lifetime_cuques: crate::bignum::Mag::from_f64(4_000_000_000.0),
             ..GameState::default()
         }
     }
