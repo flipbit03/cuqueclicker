@@ -439,19 +439,15 @@ fn try_help_click(
                 push_grab_most_urgent(ctx, out);
             }
             HelpAction::PrestigeReset => {
-                // Help-bar `[r] reset & claim` click. Routes through the
-                // same confirm-pending gate as the in-panel button —
-                // first click arms, second click (or Yes button)
-                // confirms.
-                if ctx.current.prestige_available() > 0 {
-                    if ui.prestige_confirm_pending {
-                        out.push(Action::PrestigeReset);
-                        ui.prestige_confirm_pending = false;
-                        ui.mode = Mode::Game;
-                    } else {
-                        ui.prestige_confirm_pending = true;
-                        ui.mode = Mode::Prestige;
-                    }
+                // Help-bar `[r] reset & claim` click. Mirrors the
+                // keyboard `[r]` behavior: only ARMS the pending state.
+                // The user must explicitly click the Yes button (or
+                // press `[y]` / Enter) to confirm — clicking `[r]` a
+                // second time is a no-op so a double-click can't
+                // accidentally wipe progress.
+                if ctx.current.prestige_available() > 0 && !ui.prestige_confirm_pending {
+                    ui.prestige_confirm_pending = true;
+                    ui.mode = Mode::Prestige;
                 }
             }
             HelpAction::Quit => {
@@ -700,20 +696,18 @@ fn handle_key(
         }
         // Prestige confirm: check the snapshot for available prestige before
         // Prestige reset is gated behind an explicit two-step confirm:
-        // first `[r]` arms `prestige_confirm_pending`, second `[r]` (or
-        // `[y]` / Enter) actually fires the reset. Wipes years of
-        // progress in one mistyped keystroke unless you have to type
-        // it twice on purpose.
+        // `[r]` ONLY arms `prestige_confirm_pending` — confirming requires
+        // a deliberately-different keystroke (`[y]` / Enter) or a click on
+        // the Yes button. Holding / double-tapping `[r]` is the easiest
+        // way to fat-finger a run wipe, so the second `[r]` is a no-op
+        // (it doesn't re-arm or cancel; the player keeps their pending
+        // state and has to actually pick Yes or No).
         KeyCode::Char('r') | KeyCode::Char('R')
-            if ui.mode == Mode::Prestige && ctx.current.prestige_available() > 0 =>
+            if ui.mode == Mode::Prestige
+                && !ui.prestige_confirm_pending
+                && ctx.current.prestige_available() > 0 =>
         {
-            if ui.prestige_confirm_pending {
-                out.push(Action::PrestigeReset);
-                ui.prestige_confirm_pending = false;
-                ui.mode = Mode::Game;
-            } else {
-                ui.prestige_confirm_pending = true;
-            }
+            ui.prestige_confirm_pending = true;
         }
         // Confirm the pending prestige reset. `y` / `Y` / Enter all
         // work as the affirmative. `s` (pt_BR "Sim") is NOT accepted
