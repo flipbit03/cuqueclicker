@@ -29,14 +29,35 @@ pub fn draw(
     confirm_pending: bool,
 ) -> PrestigeRects {
     let lang = t();
-    let mut lines: Vec<Line> = Vec::new();
-
     let owned = state.prestige;
     let available = state.prestige_available();
-    let bonus_pct = state.prestige as f64 * 1.0;
-    let next_threshold = (owned + 1).pow(2) * 1_000_000;
+    let bonus_pct = state.prestige as f64;
+    // Saturating arithmetic — with the prestige cap removed,
+    // `(owned + 1).pow(2) * 1_000_000` would overflow u64 around
+    // owned > 1.36e7 (debug-panic, release-wrap). Saturating keeps
+    // the displayed-only number sane at extreme values.
+    let next_threshold = owned
+        .saturating_add(1)
+        .saturating_mul(owned.saturating_add(1))
+        .saturating_mul(1_000_000);
 
-    lines.push(Line::from(vec![
+    // Render the bordered panel chrome first; we paint into its inner
+    // area below using independent sub-rects so the click rects for
+    // the action buttons don't depend on a single Paragraph's wrap
+    // behavior — earlier off-by-one bugs all stemmed from line-index
+    // math drifting under soft-wrap.
+    let block = Block::bordered().title(lang.prestige_title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut rects = PrestigeRects::default();
+    if inner.width == 0 || inner.height == 0 {
+        return rects;
+    }
+
+    // ---- Info section (top): cuques owned, fps bonus, available ----
+    let mut info_lines: Vec<Line> = Vec::new();
+    info_lines.push(Line::from(vec![
         Span::raw(format!("  {}: ", lang.prestige_owned_label)),
         Span::styled(
             format::big(owned as f64),
@@ -46,24 +67,17 @@ pub fn draw(
         ),
         Span::raw(format!("  ({})", lang.prestige_currency)),
     ]));
-    lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
+    info_lines.push(Line::raw(""));
+    info_lines.push(Line::from(vec![
         Span::raw(format!("  {}: ", lang.prestige_bonus_label)),
         Span::styled(
             format!("+{:.0}% {}", bonus_pct, lang.fps_unit),
             Style::default().fg(Color::Rgb(120, 230, 120)),
         ),
     ]));
-    lines.push(Line::raw(""));
-
-    // Track which lines carry click targets so we can rebuild their
-    // screen rects after rendering. Different layouts depending on
-    // whether the player is mid-confirmation.
-    let mut reset_line_idx: Option<usize> = None;
-    let mut yes_line_idx: Option<usize> = None;
-    let mut no_line_idx: Option<usize> = None;
     if available > 0 {
-        lines.push(Line::from(vec![
+        info_lines.push(Line::raw(""));
+        info_lines.push(Line::from(vec![
             Span::raw(format!("  {}: ", lang.prestige_available_label)),
             Span::styled(
                 format!("+{}", format::big(available as f64)),
@@ -72,62 +86,16 @@ pub fn draw(
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
-        lines.push(Line::raw(""));
-        if confirm_pending {
-            // Confirmation block: question + warning + Y/N buttons.
-            // The question line is loud red so the player can't miss it.
-            lines.push(Line::from(Span::styled(
-                format!("  {}", lang.prestige_confirm_question),
-                Style::default()
-                    .fg(Color::Rgb(255, 90, 90))
-                    .add_modifier(Modifier::BOLD),
-            )));
-            // Pre-split the warning so each chunk is one Vec line == one
-            // visual row. Single-Line text would soft-wrap inside the
-            // bordered block and the Y/N click rects (whose y is computed
-            // from Vec index) would land one row above the rendered
-            // button text — the off-by-one bug the user caught.
-            for chunk in lang.prestige_confirm_warning.lines() {
-                lines.push(Line::from(Span::styled(
-                    format!("  {chunk}"),
-                    Style::default().fg(Color::Rgb(220, 180, 120)),
-                )));
-            }
-            lines.push(Line::raw(""));
-            yes_line_idx = Some(lines.len());
-            lines.push(Line::from(Span::styled(
-                format!("  {}", lang.prestige_confirm_yes),
-                Style::default()
-                    .fg(Color::Rgb(255, 100, 100))
-                    .add_modifier(Modifier::BOLD),
-            )));
-            // Blank row between Yes / No so a touch / mouse player has
-            // a forgiving gap between the two click targets — easy to
-            // misfire on adjacent rows otherwise.
-            lines.push(Line::raw(""));
-            no_line_idx = Some(lines.len());
-            lines.push(Line::from(Span::styled(
-                format!("  {}", lang.prestige_confirm_no),
-                Style::default()
-                    .fg(Color::Rgb(120, 220, 120))
-                    .add_modifier(Modifier::BOLD),
-            )));
-        } else {
-            reset_line_idx = Some(lines.len());
-            lines.push(Line::from(Span::styled(
-                format!("  {}", lang.prestige_confirm_hint),
-                Style::default().fg(Color::Rgb(220, 140, 255)),
-            )));
-        }
     } else {
+        info_lines.push(Line::raw(""));
         for l in lang.prestige_not_enough.lines() {
-            lines.push(Line::from(Span::styled(
-                format!("  {}", l),
+            info_lines.push(Line::from(Span::styled(
+                format!("  {l}"),
                 Style::default().fg(Color::DarkGray),
             )));
         }
-        lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
+        info_lines.push(Line::raw(""));
+        info_lines.push(Line::from(vec![
             Span::raw(format!("  {}: ", lang.prestige_lifetime_needed)),
             Span::styled(
                 format::big(next_threshold as f64),
@@ -136,39 +104,114 @@ pub fn draw(
         ]));
     }
 
-    let p = Paragraph::new(lines)
-        .block(Block::bordered().title(lang.prestige_title))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(p, area);
+    // ---- Action section (bottom): reset hint OR yes/no buttons ----
+    // Reserve a fixed-height bottom strip whose lines we render WITHOUT
+    // wrap so each Vec line maps 1:1 to a visual row inside the strip.
+    // Click rects are computed from the strip's `(y, height)`, never
+    // from the Paragraph above it. That decoupling was the structural
+    // fix for the off-by-one bug where wrap on any earlier line shifted
+    // the buttons one row away from their click rects.
+    let action_lines: Vec<(Line, Option<ActionTarget>)> = if available == 0 {
+        Vec::new()
+    } else if confirm_pending {
+        let mut v: Vec<(Line, Option<ActionTarget>)> = Vec::new();
+        v.push((
+            Line::from(Span::styled(
+                format!("  {}", lang.prestige_confirm_question),
+                Style::default()
+                    .fg(Color::Rgb(255, 90, 90))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            None,
+        ));
+        for chunk in lang.prestige_confirm_warning.lines() {
+            v.push((
+                Line::from(Span::styled(
+                    format!("  {chunk}"),
+                    Style::default().fg(Color::Rgb(220, 180, 120)),
+                )),
+                None,
+            ));
+        }
+        v.push((Line::raw(""), None));
+        v.push((
+            Line::from(Span::styled(
+                format!("  {}", lang.prestige_confirm_yes),
+                Style::default()
+                    .fg(Color::Rgb(255, 100, 100))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Some(ActionTarget::Yes),
+        ));
+        // Blank row between Yes / No so a touch / mouse player has a
+        // forgiving gap between the two click targets.
+        v.push((Line::raw(""), None));
+        v.push((
+            Line::from(Span::styled(
+                format!("  {}", lang.prestige_confirm_no),
+                Style::default()
+                    .fg(Color::Rgb(120, 220, 120))
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Some(ActionTarget::No),
+        ));
+        v
+    } else {
+        vec![(
+            Line::from(Span::styled(
+                format!("  {}", lang.prestige_confirm_hint),
+                Style::default().fg(Color::Rgb(220, 140, 255)),
+            )),
+            Some(ActionTarget::Reset),
+        )]
+    };
 
-    // Project each line-index into a screen rect within the bordered
-    // block's interior (`area.x + 1, area.y + 1 + idx`, inner width).
-    // Then apply a hover lift on whichever rect the mouse is over so
-    // the mouse-first player sees it as a button.
-    let project = |idx: Option<usize>| -> Rect {
-        let Some(idx) = idx else {
-            return Rect::default();
-        };
-        if area.width < 2 || area.height < 2 {
-            return Rect::default();
-        }
-        let inner_w = area.width - 2;
-        let y = area.y + 1 + idx as u16;
-        if y >= area.y + area.height - 1 {
-            return Rect::default();
-        }
-        Rect {
-            x: area.x + 1,
-            y,
-            width: inner_w,
+    let action_h = action_lines.len() as u16;
+    let chunks = if action_h > 0 && action_h < inner.height {
+        Layout::vertical([Constraint::Min(1), Constraint::Length(action_h)]).split(inner)
+    } else {
+        // Action strip would overflow the panel — fall back to drawing
+        // info only. The action buttons can't render so click rects
+        // stay default.
+        Layout::vertical([Constraint::Min(1), Constraint::Length(0)]).split(inner)
+    };
+    let info_area = chunks[0];
+    let action_area = chunks[1];
+
+    // Info section uses Wrap { trim: false } so long lines (e.g. pt_BR
+    // currency name) wrap inside the info strip without affecting the
+    // action strip below.
+    let info_para = Paragraph::new(info_lines).wrap(Wrap { trim: false });
+    frame.render_widget(info_para, info_area);
+
+    if action_h == 0 || action_area.height == 0 {
+        return rects;
+    }
+    // Action section: NO wrap — each Line is exactly one visual row.
+    // Click rects derive from `action_area.y + offset` where `offset`
+    // is the Vec index (which equals the visual row because wrap is
+    // off).
+    let mut action_para_lines: Vec<Line> = Vec::with_capacity(action_lines.len());
+    for (line, target) in action_lines.iter() {
+        let row_y = action_area.y + action_para_lines.len() as u16;
+        let rect = Rect {
+            x: action_area.x,
+            y: row_y,
+            width: action_area.width,
             height: 1,
+        };
+        match target {
+            Some(ActionTarget::Reset) => rects.reset = rect,
+            Some(ActionTarget::Yes) => rects.yes = rect,
+            Some(ActionTarget::No) => rects.no = rect,
+            None => {}
         }
-    };
-    let rects = PrestigeRects {
-        reset: project(reset_line_idx),
-        yes: project(yes_line_idx),
-        no: project(no_line_idx),
-    };
+        action_para_lines.push(line.clone());
+    }
+    let action_para = Paragraph::new(action_para_lines);
+    frame.render_widget(action_para, action_area);
+
+    // Hover lift on whichever click rect the mouse is over.
     if let Some((mx, my)) = mouse_pos {
         let buf = frame.buffer_mut();
         for r in [rects.reset, rects.yes, rects.no] {
@@ -191,4 +234,11 @@ pub fn draw(
         }
     }
     rects
+}
+
+#[derive(Copy, Clone)]
+enum ActionTarget {
+    Reset,
+    Yes,
+    No,
 }

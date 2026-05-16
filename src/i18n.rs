@@ -211,7 +211,7 @@ pub const EN: Lang = Lang {
     prestige_confirm_warning: "Wipes ALL fingerers, tree, buffs.\nCannot be undone.",
     prestige_confirm_yes: "[Y/Enter] Yes, reset",
     prestige_confirm_no: "[N/Esc] No, cancel",
-    prestige_not_enough: "Earn more lifetime cuques to claim.\nFormula: sqrt(lifetime / 1,000,000)",
+    prestige_not_enough: "Earn more lifetime cuques.\nFormula: sqrt(lifetime / 1M)",
     help_prestige: "[p/Esc] back  [r] reset & claim  [q] quit",
 };
 
@@ -313,7 +313,7 @@ pub const PT_BR: Lang = Lang {
     tree_no_refund_fmt: "(sem reembolso: {})",
     prestige_title: " Prestígio ",
     prestige_currency: "Papel de Seda",
-    prestige_owned_label: "Possui atualmente",
+    prestige_owned_label: "Possui",
     prestige_bonus_label: "Bônus de DPS",
     prestige_available_label: "Disponível para resgatar",
     prestige_lifetime_needed: "Próximo papel em",
@@ -322,7 +322,7 @@ pub const PT_BR: Lang = Lang {
     prestige_confirm_warning: "Apaga TODOS dedos, árvore, bônus.\nNão pode ser desfeito.",
     prestige_confirm_yes: "[Y/Enter] Sim, resetar",
     prestige_confirm_no: "[N/Esc] Não, cancelar",
-    prestige_not_enough: "Acumule mais cuques totais para resgatar.\nFórmula: raiz(total / 1.000.000)",
+    prestige_not_enough: "Acumule mais cuques totais.\nFórmula: raiz(total / 1M)",
     help_prestige: "[p/Esc] voltar  [r] resetar & resgatar  [q] sair",
 };
 

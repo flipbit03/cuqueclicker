@@ -64,8 +64,26 @@ pub fn load_from_str(json: &str) -> GameState {
 /// is whatever the caller has on `state` — `GameState::default()` and the
 /// migration chain both stamp [`CURRENT_VERSION`], so the only way to write
 /// a wrong version is to mutate `state.version` by hand, which nothing does.
+///
+/// Sanitizes non-finite f64 fields (NaN / INFINITY) to 0.0 before
+/// serializing, since `serde_json` refuses to serialize non-finite f64
+/// and historically callers `let _ =`-swallowed the resulting Err — the
+/// player's progress would silently stop being written. Reaching a
+/// non-finite value normally is impossible, but a corrupted save loaded
+/// once can poison `cuques` / `lifetime_cuques` and we'd rather lose
+/// the corruption than lose subsequent saves.
 pub fn save_to_string(state: &GameState) -> serde_json::Result<String> {
-    serde_json::to_string_pretty(state)
+    let mut sanitized = state.clone();
+    if !sanitized.cuques.is_finite() {
+        sanitized.cuques = 0.0;
+    }
+    if !sanitized.lifetime_cuques.is_finite() {
+        sanitized.lifetime_cuques = 0.0;
+    }
+    if !sanitized.best_fps.is_finite() {
+        sanitized.best_fps = 0.0;
+    }
+    serde_json::to_string_pretty(&sanitized)
 }
 
 #[cfg(test)]
