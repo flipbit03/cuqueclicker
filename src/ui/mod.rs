@@ -198,7 +198,16 @@ pub fn draw(
         Mode::Stats => lang.help_stats,
         Mode::Achievements => lang.help_ach,
         Mode::Tree => lang.help_tree,
-        Mode::Prestige => lang.help_prestige,
+        // Drop the `[r] reset & claim` token when nothing's actually
+        // claimable — pressing `r` would silently no-op, so advertising
+        // it as available is misleading.
+        Mode::Prestige => {
+            if state.prestige_available() > 0 {
+                lang.help_prestige
+            } else {
+                lang.help_prestige_no_claim
+            }
+        }
     };
     let help_height = wrapped_height(help_text, cols[0].width).max(1);
     let left = Layout::vertical([
