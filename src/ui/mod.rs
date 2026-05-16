@@ -384,8 +384,11 @@ pub fn draw(
         Mode::Tree => {
             // Full-screen modal — the tree renderer takes the WHOLE frame
             // area, not just the sidebar column, so the player gets the
-            // full canvas to pan around.
-            let out = tree::draw(frame, area, state, mouse_pos, tree_render);
+            // full canvas to pan around. Pass the live `help_height` so
+            // the modal covers exactly down to the help bar; hardcoding
+            // a `2` here used to leak a one-row strip of biscuit when
+            // the help text wrapped to a single row.
+            let out = tree::draw(frame, area, state, mouse_pos, tree_render, help_height);
             tree_node_rects = out.node_rects;
             tree_action_button = out.action_button;
         }

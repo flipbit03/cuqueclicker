@@ -55,10 +55,6 @@ const PAN_SNAP_EPSILON: f32 = 0.5;
 /// of edges.
 const VISIBLE_RADIUS_LOTS: i32 = 6;
 
-/// Help bar height reserved at the bottom — `ui::mod.rs` rendered the help
-/// text there before we got the frame, so we leave those rows alone.
-const HELP_BAR_HEIGHT: u16 = 2;
-
 const INFO_PANE_HEIGHT: u16 = 8;
 const HEADER_HEIGHT: u16 = 3;
 
@@ -68,8 +64,16 @@ pub fn draw(
     state: &GameState,
     mouse_pos: Option<(u16, u16)>,
     tree_render: &mut TreeRenderState,
+    help_bar_height: u16,
 ) -> TreeDrawOutput {
-    let modal_h = area.height.saturating_sub(HELP_BAR_HEIGHT);
+    // `help_bar_height` is the actual `wrapped_height(help_text, ...)`
+    // ui::mod.rs reserved for the bottom help row(s). When the help
+    // text fits in a single row it's 1, otherwise 2; passing the live
+    // value lets the modal hug exactly the row above the help bar,
+    // so the biscuit + hands rendered into `left[1]` underneath stay
+    // fully covered. A previous hardcoded `2` left a one-row strip
+    // exposed whenever `help_bar_height == 1`.
+    let modal_h = area.height.saturating_sub(help_bar_height);
     if modal_h < HEADER_HEIGHT + INFO_PANE_HEIGHT + 4 {
         // Terminal too small; bail out gracefully.
         return TreeDrawOutput {
