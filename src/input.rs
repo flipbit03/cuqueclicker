@@ -438,18 +438,6 @@ fn try_help_click(
                 // currently on screen, identical to the keyboard 'g'.
                 push_grab_most_urgent(ctx, out);
             }
-            HelpAction::PrestigeReset => {
-                // Help-bar `[r] reset & claim` click. Mirrors the
-                // keyboard `[r]` behavior: only ARMS the pending state.
-                // The user must explicitly click the Yes button (or
-                // press `[y]` / Enter) to confirm — clicking `[r]` a
-                // second time is a no-op so a double-click can't
-                // accidentally wipe progress.
-                if ctx.current.prestige_available() > 0 && !ui.prestige_confirm_pending {
-                    ui.prestige_confirm_pending = true;
-                    ui.mode = Mode::Prestige;
-                }
-            }
             HelpAction::Quit => {
                 ui.running = false;
             }

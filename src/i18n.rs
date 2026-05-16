@@ -97,10 +97,6 @@ pub struct Lang {
     pub prestige_confirm_no: &'static str,
     pub prestige_not_enough: &'static str,
     pub help_prestige: &'static str,
-    /// Help-bar variant used in Prestige mode when `prestige_available()
-    /// == 0` — drops the `[r] reset & claim` token since there's
-    /// nothing to claim and pressing `r` would silently no-op.
-    pub help_prestige_no_claim: &'static str,
 }
 
 pub const EN: Lang = Lang {
@@ -216,8 +212,7 @@ pub const EN: Lang = Lang {
     prestige_confirm_yes: "[Y/Enter] Yes, reset",
     prestige_confirm_no: "[N/Esc] No, cancel",
     prestige_not_enough: "Earn more lifetime cuques.\nFormula: sqrt(lifetime / 1M)",
-    help_prestige: "[p/Esc] back  [r] reset & claim  [q] quit",
-    help_prestige_no_claim: "[p/Esc] back  [q] quit",
+    help_prestige: "[p/Esc] back  [q] quit",
 };
 
 pub const PT_BR: Lang = Lang {
@@ -328,8 +323,7 @@ pub const PT_BR: Lang = Lang {
     prestige_confirm_yes: "[Y/Enter] Sim, resetar",
     prestige_confirm_no: "[N/Esc] Não, cancelar",
     prestige_not_enough: "Acumule mais cuques totais.\nFórmula: raiz(total / 1M)",
-    help_prestige: "[p/Esc] voltar  [r] resetar & resgatar  [q] sair",
-    help_prestige_no_claim: "[p/Esc] voltar  [q] sair",
+    help_prestige: "[p/Esc] voltar  [q] sair",
 };
 
 static LANG: OnceLock<&'static Lang> = OnceLock::new();

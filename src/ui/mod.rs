@@ -67,8 +67,6 @@ pub enum HelpAction {
     OpenMode(Mode),
     /// Catch whatever golden is on screen.
     GrabGolden,
-    /// Confirm-and-claim prestige reset (only when prestige_available > 0).
-    PrestigeReset,
     /// Quit the program.
     Quit,
     /// Tree modal: jump the cursor to the origin (the cuque anchor).
@@ -198,16 +196,7 @@ pub fn draw(
         Mode::Stats => lang.help_stats,
         Mode::Achievements => lang.help_ach,
         Mode::Tree => lang.help_tree,
-        // Drop the `[r] reset & claim` token when nothing's actually
-        // claimable — pressing `r` would silently no-op, so advertising
-        // it as available is misleading.
-        Mode::Prestige => {
-            if state.prestige_available() > 0 {
-                lang.help_prestige
-            } else {
-                lang.help_prestige_no_claim
-            }
-        }
+        Mode::Prestige => lang.help_prestige,
     };
     let help_height = wrapped_height(help_text, cols[0].width).max(1);
     let left = Layout::vertical([
@@ -555,7 +544,6 @@ fn map_help_token(token: &str, mode: Mode) -> Option<HelpAction> {
         (Mode::Game, "s") | (Mode::Game, "S") => Some(HelpAction::OpenMode(Mode::Stats)),
         (Mode::Game, "a") | (Mode::Game, "A") => Some(HelpAction::OpenMode(Mode::Achievements)),
         (Mode::Game, "g") | (Mode::Game, "G") => Some(HelpAction::GrabGolden),
-        (Mode::Prestige, "r") | (Mode::Prestige, "R") => Some(HelpAction::PrestigeReset),
         (Mode::Tree, "0") => Some(HelpAction::TreeFocusOrigin),
         (Mode::Tree, "1") => Some(HelpAction::TreeFocusLastBought),
         _ => None,
