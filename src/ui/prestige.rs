@@ -92,16 +92,18 @@ pub fn draw(
                 format!("  {}", lang.prestige_confirm_yes),
                 Style::default()
                     .fg(Color::Rgb(255, 100, 100))
-                    .add_modifier(Modifier::BOLD)
-                    .add_modifier(Modifier::UNDERLINED),
+                    .add_modifier(Modifier::BOLD),
             )));
+            // Blank row between Yes / No so a touch / mouse player has
+            // a forgiving gap between the two click targets — easy to
+            // misfire on adjacent rows otherwise.
+            lines.push(Line::raw(""));
             no_line_idx = Some(lines.len());
             lines.push(Line::from(Span::styled(
                 format!("  {}", lang.prestige_confirm_no),
                 Style::default()
                     .fg(Color::Rgb(120, 220, 120))
-                    .add_modifier(Modifier::BOLD)
-                    .add_modifier(Modifier::UNDERLINED),
+                    .add_modifier(Modifier::BOLD),
             )));
         } else {
             reset_line_idx = Some(lines.len());
