@@ -105,6 +105,14 @@ pub struct UiState {
     pub running: bool,
     pub last_mouse_pos: Option<(u16, u16)>,
     pub tree_render: TreeRenderState,
+    /// True after the player invoked the prestige-reset trigger
+    /// (keyboard `[r]` or click on the "Press [r]..." line) but
+    /// has not yet confirmed. While set, the Prestige panel shows
+    /// a yes/no confirmation block instead of the bare hint, and the
+    /// `[r]` / Yes-button paths run the actual reset. Cleared on
+    /// successful reset, on No-button / Esc / `[n]`, and on any
+    /// mode change away from Prestige.
+    pub prestige_confirm_pending: bool,
 }
 
 impl UiState {
@@ -115,6 +123,7 @@ impl UiState {
             running: true,
             last_mouse_pos: None,
             tree_render: TreeRenderState::default(),
+            prestige_confirm_pending: false,
         }
     }
 }
@@ -195,6 +204,8 @@ pub struct InputContext<'a> {
     pub powerup_rects: &'a [(u64, Rect)],
     pub play_area: Rect,
     pub prestige_reset_rect: Rect,
+    pub prestige_confirm_yes_rect: Rect,
+    pub prestige_confirm_no_rect: Rect,
     pub debug: bool,
     pub current: &'a GameState,
 }
@@ -224,6 +235,8 @@ impl<'a> InputContext<'a> {
             powerup_rects: &layout.powerup_rects,
             play_area: layout.play_area,
             prestige_reset_rect: layout.prestige_reset_rect,
+            prestige_confirm_yes_rect: layout.prestige_confirm_yes_rect,
+            prestige_confirm_no_rect: layout.prestige_confirm_no_rect,
             debug,
             current,
         }
@@ -383,12 +396,24 @@ fn try_help_click(
     ctx: &InputContext,
     out: &mut Vec<Action>,
 ) -> bool {
-    // Prestige-reset confirm: in-panel button. Match BEFORE help-bar so
-    // the confirm "wins" if the help bar happens to overlap it (it
-    // shouldn't, but defensive).
-    if rect_contains(ctx.prestige_reset_rect, col, row) && ctx.current.prestige_available() > 0 {
-        out.push(Action::PrestigeReset);
+    // Prestige confirmation: click the Yes button → run the reset and
+    // close back to Game; click the No button → cancel the pending
+    // confirmation. The reset rect (only populated when NOT yet pending)
+    // flips into pending state — a single click can't run the reset.
+    if rect_contains(ctx.prestige_confirm_yes_rect, col, row) {
+        if ctx.current.prestige_available() > 0 {
+            out.push(Action::PrestigeReset);
+        }
+        ui.prestige_confirm_pending = false;
         ui.mode = Mode::Game;
+        return true;
+    }
+    if rect_contains(ctx.prestige_confirm_no_rect, col, row) {
+        ui.prestige_confirm_pending = false;
+        return true;
+    }
+    if rect_contains(ctx.prestige_reset_rect, col, row) && ctx.current.prestige_available() > 0 {
+        ui.prestige_confirm_pending = true;
         return true;
     }
     for &(action, rect) in ctx.help_hits {
@@ -398,7 +423,10 @@ fn try_help_click(
         match action {
             HelpAction::OpenMode(target) => {
                 // Same toggle semantics the keyboard uses: tapping the
-                // hint for the active mode returns to Game.
+                // hint for the active mode returns to Game. Clear any
+                // pending prestige confirm so navigating away cancels
+                // cleanly.
+                ui.prestige_confirm_pending = false;
                 ui.mode = if ui.mode == target {
                     Mode::Game
                 } else {
@@ -411,9 +439,19 @@ fn try_help_click(
                 push_grab_most_urgent(ctx, out);
             }
             HelpAction::PrestigeReset => {
+                // Help-bar `[r] reset & claim` click. Routes through the
+                // same confirm-pending gate as the in-panel button —
+                // first click arms, second click (or Yes button)
+                // confirms.
                 if ctx.current.prestige_available() > 0 {
-                    out.push(Action::PrestigeReset);
-                    ui.mode = Mode::Game;
+                    if ui.prestige_confirm_pending {
+                        out.push(Action::PrestigeReset);
+                        ui.prestige_confirm_pending = false;
+                        ui.mode = Mode::Game;
+                    } else {
+                        ui.prestige_confirm_pending = true;
+                        ui.mode = Mode::Prestige;
+                    }
                 }
             }
             HelpAction::Quit => {
@@ -573,11 +611,24 @@ fn handle_key(
         // Game itself. Quit is `q` only — Esc-to-quit was an aggressive
         // default that surprised playtesters who reflex-pressed it to
         // "deselect" with no panel open.
-        KeyCode::Esc => match ui.mode {
-            Mode::Game => {}
-            _ => ui.mode = Mode::Game,
-        },
+        KeyCode::Esc => {
+            // Esc inside a pending prestige confirm should cancel
+            // (NOT close the panel) so the player doesn't accidentally
+            // wipe progress AND lose the panel context in one keypress.
+            if ui.mode == Mode::Prestige && ui.prestige_confirm_pending {
+                ui.prestige_confirm_pending = false;
+            } else {
+                match ui.mode {
+                    Mode::Game => {}
+                    _ => {
+                        ui.prestige_confirm_pending = false;
+                        ui.mode = Mode::Game;
+                    }
+                }
+            }
+        }
         KeyCode::Char('s') | KeyCode::Char('S') => {
+            ui.prestige_confirm_pending = false;
             ui.mode = if matches!(ui.mode, Mode::Stats) {
                 Mode::Game
             } else {
@@ -585,6 +636,7 @@ fn handle_key(
             };
         }
         KeyCode::Char('a') | KeyCode::Char('A') => {
+            ui.prestige_confirm_pending = false;
             ui.mode = if matches!(ui.mode, Mode::Achievements) {
                 Mode::Game
             } else {
@@ -592,6 +644,7 @@ fn handle_key(
             };
         }
         KeyCode::Char('t') | KeyCode::Char('T') => {
+            ui.prestige_confirm_pending = false;
             ui.mode = if matches!(ui.mode, Mode::Tree) {
                 Mode::Game
             } else {
@@ -635,6 +688,10 @@ fn handle_key(
             ));
         }
         KeyCode::Char('p') | KeyCode::Char('P') => {
+            // Toggling the panel resets any in-flight confirmation so
+            // closing and reopening Prestige doesn't preserve a stale
+            // pending state.
+            ui.prestige_confirm_pending = false;
             ui.mode = if matches!(ui.mode, Mode::Prestige) {
                 Mode::Game
             } else {
@@ -642,14 +699,42 @@ fn handle_key(
             };
         }
         // Prestige confirm: check the snapshot for available prestige before
-        // firing. Optimistically close the panel — if the sim rejects the
-        // reset (raced against a simultaneous lifetime-cuque drop) nothing
-        // bad happens.
+        // Prestige reset is gated behind an explicit two-step confirm:
+        // first `[r]` arms `prestige_confirm_pending`, second `[r]` (or
+        // `[y]` / Enter) actually fires the reset. Wipes years of
+        // progress in one mistyped keystroke unless you have to type
+        // it twice on purpose.
         KeyCode::Char('r') | KeyCode::Char('R')
             if ui.mode == Mode::Prestige && ctx.current.prestige_available() > 0 =>
         {
+            if ui.prestige_confirm_pending {
+                out.push(Action::PrestigeReset);
+                ui.prestige_confirm_pending = false;
+                ui.mode = Mode::Game;
+            } else {
+                ui.prestige_confirm_pending = true;
+            }
+        }
+        // Confirm the pending prestige reset. `y` / `Y` / Enter all
+        // work as the affirmative. `s` (pt_BR "Sim") is NOT accepted
+        // because it collides with the Stats-mode toggle handler above
+        // — the pt_BR label still says "[Y/Enter]" so the player learns
+        // the keybinding directly.
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter
+            if ui.mode == Mode::Prestige
+                && ui.prestige_confirm_pending
+                && ctx.current.prestige_available() > 0 =>
+        {
             out.push(Action::PrestigeReset);
+            ui.prestige_confirm_pending = false;
             ui.mode = Mode::Game;
+        }
+        // Cancel the pending prestige reset. `n` / `N` works for both
+        // English ("No") and pt_BR ("Não").
+        KeyCode::Char('n') | KeyCode::Char('N')
+            if ui.mode == Mode::Prestige && ui.prestige_confirm_pending =>
+        {
+            ui.prestige_confirm_pending = false;
         }
         // Tree-mode controls. Pan via hjkl or arrow keys; Enter buys the
         // focused node; R refunds the focused node; `0` jumps to the
@@ -795,6 +880,8 @@ mod tests {
             powerup_rects,
             play_area,
             prestige_reset_rect,
+            prestige_confirm_yes_rect: Rect::default(),
+            prestige_confirm_no_rect: Rect::default(),
             debug,
             current,
         }
@@ -1613,11 +1700,14 @@ mod tests {
     }
 
     #[test]
-    fn prestige_reset_rect_available_emits_action() {
+    fn prestige_reset_rect_arms_confirmation_then_yes_emits_action() {
+        // Two-step confirm: first click on the in-panel reset rect just
+        // arms `prestige_confirm_pending`; the reset only fires on the
+        // second click (the explicit Yes button).
         let s = state_with_prestige();
         let mut ui = UiState::new();
         ui.mode = Mode::Prestige;
-        let c = ctx(
+        let mut c = ctx(
             Rect::default(),
             &[],
             rect(0, 0, 100, 30),
@@ -1628,6 +1718,7 @@ mod tests {
             false,
             &s,
         );
+        // First click: arms.
         let mut out = Vec::new();
         process_input_event(
             mouse_down(50, 15, MouseButton::Left, Modifiers::default()),
@@ -1635,12 +1726,35 @@ mod tests {
             &c,
             &mut out,
         );
+        assert!(
+            !out.iter().any(|a| matches!(a, Action::PrestigeReset)),
+            "first click on reset rect must not emit PrestigeReset; got {:?}",
+            out
+        );
+        assert!(
+            ui.prestige_confirm_pending,
+            "first click should arm the confirmation"
+        );
+        assert_eq!(ui.mode, Mode::Prestige, "panel stays open while confirming");
+        // Second click: hits the Yes-rect — actual reset fires.
+        c.prestige_confirm_yes_rect = rect(40, 18, 30, 1);
+        let mut out = Vec::new();
+        process_input_event(
+            mouse_down(50, 18, MouseButton::Left, Modifiers::default()),
+            &mut ui,
+            &c,
+            &mut out,
+        );
         assert_eq!(out.len(), 1);
-        assert_eq!(discriminant(&out[0]), discriminant(&Action::PrestigeReset),);
+        assert_eq!(discriminant(&out[0]), discriminant(&Action::PrestigeReset));
+        assert!(
+            !ui.prestige_confirm_pending,
+            "pending cleared after confirm"
+        );
         assert_eq!(
             ui.mode,
             Mode::Game,
-            "panel auto-closes after prestige confirm",
+            "panel auto-closes after prestige confirm"
         );
     }
 

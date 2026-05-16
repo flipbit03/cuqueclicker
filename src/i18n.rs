@@ -91,6 +91,10 @@ pub struct Lang {
     pub prestige_available_label: &'static str,
     pub prestige_lifetime_needed: &'static str,
     pub prestige_confirm_hint: &'static str,
+    pub prestige_confirm_question: &'static str,
+    pub prestige_confirm_warning: &'static str,
+    pub prestige_confirm_yes: &'static str,
+    pub prestige_confirm_no: &'static str,
     pub prestige_not_enough: &'static str,
     pub help_prestige: &'static str,
 }
@@ -198,6 +202,10 @@ pub const EN: Lang = Lang {
     prestige_available_label: "Available to claim",
     prestige_lifetime_needed: "Next papel at",
     prestige_confirm_hint: "Press [r] to reset and claim",
+    prestige_confirm_question: "Are you SURE you want to reset?",
+    prestige_confirm_warning: "This wipes ALL fingerers, tree, and buffs. Cannot be undone.",
+    prestige_confirm_yes: "[Y/Enter] Yes, reset",
+    prestige_confirm_no: "[N/Esc] No, cancel",
     prestige_not_enough: "Earn more lifetime cuques to claim.\nFormula: sqrt(lifetime / 1,000,000)",
     help_prestige: "[p/Esc] back  [r] reset & claim  [q] quit",
 };
@@ -305,6 +313,10 @@ pub const PT_BR: Lang = Lang {
     prestige_available_label: "Disponível para resgatar",
     prestige_lifetime_needed: "Próximo papel em",
     prestige_confirm_hint: "Pressione [r] para resetar e resgatar",
+    prestige_confirm_question: "Tem CERTEZA que quer resetar?",
+    prestige_confirm_warning: "Apaga TODOS os dedos, árvore e bônus. Não pode ser desfeito.",
+    prestige_confirm_yes: "[Y/Enter] Sim, resetar",
+    prestige_confirm_no: "[N/Esc] Não, cancelar",
     prestige_not_enough: "Acumule mais cuques totais para resgatar.\nFórmula: raiz(total / 1.000.000)",
     help_prestige: "[p/Esc] voltar  [r] resetar & resgatar  [q] sair",
 };

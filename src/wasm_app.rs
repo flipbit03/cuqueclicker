@@ -272,6 +272,7 @@ pub fn run() -> Result<(), JsValue> {
             debug,
             web.ui.last_mouse_pos,
             &mut web.ui.tree_render,
+            web.ui.prestige_confirm_pending,
         );
         // Hand the latest biscuit rect to the sim so goldens and auto-
         // particles spawn inside the current layout. Powerup engine pauses

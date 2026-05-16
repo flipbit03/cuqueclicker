@@ -155,6 +155,7 @@ impl App {
                     debug,
                     ui.last_mouse_pos,
                     &mut ui.tree_render,
+                    ui.prestige_confirm_pending,
                 );
             })?;
 

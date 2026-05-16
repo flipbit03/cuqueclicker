@@ -125,10 +125,16 @@ pub struct DrawOutput {
     /// keyboard-only. Empty rects when the hint is non-actionable
     /// (e.g. `[Space/Click] finger` is informational, not a click target).
     pub help_hits: Vec<(HelpAction, Rect)>,
-    /// Click rect for the `Press [r] to reset and claim` confirm line in
-    /// the Prestige panel. Default rect when not in Prestige mode or no
-    /// prestige is available.
+    /// Click rect for the `Press [r] to reset and claim` line in the
+    /// Prestige panel — flips the player into the confirm-pending state.
+    /// Default when not in Prestige mode, prestige unavailable, or
+    /// already mid-confirmation.
     pub prestige_reset_rect: Rect,
+    /// Click rect for the Yes / No buttons in the prestige-reset
+    /// confirmation block. Both default unless `prestige_confirm_pending`
+    /// is set on `UiState` and prestige is available.
+    pub prestige_confirm_yes_rect: Rect,
+    pub prestige_confirm_no_rect: Rect,
 }
 
 fn wrapped_height(text: &str, width: u16) -> u16 {
@@ -172,6 +178,7 @@ fn draw_zoom_indicator(frame: &mut Frame, area: Rect, label: &str) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
     state: &GameState,
@@ -180,6 +187,7 @@ pub fn draw(
     debug: bool,
     mouse_pos: Option<(u16, u16)>,
     tree_render: &mut crate::input::TreeRenderState,
+    prestige_confirm_pending: bool,
 ) -> DrawOutput {
     let lang = t();
     let area = frame.area();
@@ -369,6 +377,8 @@ pub fn draw(
     )> = None;
     let mut fingerer_rows: Vec<(usize, Rect)> = Vec::new();
     let mut prestige_reset_rect = Rect::default();
+    let mut prestige_confirm_yes_rect = Rect::default();
+    let mut prestige_confirm_no_rect = Rect::default();
     match mode {
         Mode::Game => fingerer_rows = sidebar::draw(frame, cols[1], state, mouse_pos),
         Mode::Stats => stats::draw(frame, cols[1], state),
@@ -381,7 +391,12 @@ pub fn draw(
             tree_node_rects = out.node_rects;
             tree_action_button = out.action_button;
         }
-        Mode::Prestige => prestige_reset_rect = prestige::draw(frame, cols[1], state, mouse_pos),
+        Mode::Prestige => {
+            let rects = prestige::draw(frame, cols[1], state, mouse_pos, prestige_confirm_pending);
+            prestige_reset_rect = rects.reset;
+            prestige_confirm_yes_rect = rects.yes;
+            prestige_confirm_no_rect = rects.no;
+        }
     }
 
     DrawOutput {
@@ -394,6 +409,8 @@ pub fn draw(
         fingerer_rows,
         help_hits,
         prestige_reset_rect,
+        prestige_confirm_yes_rect,
+        prestige_confirm_no_rect,
     }
 }
 
