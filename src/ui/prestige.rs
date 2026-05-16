@@ -82,10 +82,17 @@ pub fn draw(
                     .fg(Color::Rgb(255, 90, 90))
                     .add_modifier(Modifier::BOLD),
             )));
-            lines.push(Line::from(Span::styled(
-                format!("  {}", lang.prestige_confirm_warning),
-                Style::default().fg(Color::Rgb(220, 180, 120)),
-            )));
+            // Pre-split the warning so each chunk is one Vec line == one
+            // visual row. Single-Line text would soft-wrap inside the
+            // bordered block and the Y/N click rects (whose y is computed
+            // from Vec index) would land one row above the rendered
+            // button text — the off-by-one bug the user caught.
+            for chunk in lang.prestige_confirm_warning.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {chunk}"),
+                    Style::default().fg(Color::Rgb(220, 180, 120)),
+                )));
+            }
             lines.push(Line::raw(""));
             yes_line_idx = Some(lines.len());
             lines.push(Line::from(Span::styled(
