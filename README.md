@@ -39,7 +39,7 @@ cargo install cuqueclicker
 | `1`–`9`, `0` | Buy that fingerer |
 | `Shift` + digit | Buy 10 |
 | `Alt` + digit | Buy max affordable |
-| `u` | Upgrades panel |
+| `t` | Upgrade tree |
 | `p` | Prestige panel |
 | `s` | Stats panel |
 | `a` | Achievements panel |
@@ -54,15 +54,6 @@ caffeinate -i cuqueclicker
 ```
 
 The `-i` flag prevents idle sleep without overriding lid-close sleep, so closing the lid still puts the Mac to sleep normally.
-
-## Features
-
-- **Ten fingerer tiers** — starts with your own Index Finger and climbs past Latex Gloves, Robotic Fingers, Tentacles, and a Dimensional Hole, ending at the Hand of God
-- **Upgrades** that double the output of what you already own — sharper nails, chrome phalanges, wetter tongues, holy lubrication
-- **Prestige** — once you've fingered enough, wipe the run for a meta-currency that permanently boosts every future run
-- **Golden Cuques** — rare pop-up bonuses in three flavors: instant cash, a short clicking frenzy, or a long boost on one of your fingerers
-- **Achievements**, **English + Brazilian Portuguese** (auto-detected from `$LANG`), smooth zoom, and a ring of hands around the cuque that grows as you accumulate them
-- **Autosaved progress** under `~/.config/cuqueclicker/`, with a single-instance file lock so two copies of the game can't stomp each other
 
 ## License
 
